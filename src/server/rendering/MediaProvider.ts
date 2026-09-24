@@ -444,7 +444,7 @@ export class CompliantMediaProvider implements IMediaProvider {
     const rawUrl = (sourceVideo.youtubeUrl || sourceVideo.sourceUrl || sourceVideo.mediaUrl || '').trim();
     console.log(`[CompliantMediaProvider] Media acquisition started for ID ${sourceVideo.id}. URL: ${rawUrl}`);
 
-    const isExplicitDevTest = sourceVideo.isDevTest || rawUrl === 'dev' || sourceVideo.id === 'dev' || rawUrl.includes('dev_moving_test') || rawUrl.includes('carD3hvum64') || !!(sourceVideo.id && sourceVideo.id.includes('carD3hvum64'));
+    const isExplicitDevTest = !!sourceVideo.isDevTest || rawUrl === 'dev';
 
     // 1. Route to Development provider ONLY if explicitly requested/flagged as development test
     if (isExplicitDevTest) {

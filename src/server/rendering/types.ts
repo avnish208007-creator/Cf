@@ -82,7 +82,7 @@ export interface RenderJobState {
   id: string;
   workspaceId: string;
   candidateId: string;
-  status: 'queued' | 'acquiring_media' | 'media_acquired' | 'validating_media' | 'rendering' | 'validating_output' | 'uploading' | 'completed' | 'failed' | 'processing';
+  status: 'queued' | 'acquiring_media' | 'media_acquired' | 'validating_media' | 'rendering' | 'validating_output' | 'uploading' | 'persisting' | 'completed' | 'failed' | 'processing';
   stage: string;
   progress?: number;
   errorCode?: string;

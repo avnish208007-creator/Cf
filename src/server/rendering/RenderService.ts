@@ -183,7 +183,7 @@ export class RenderService {
       }
 
       // 3.5. STRICT MEDIA PROVENANCE CONTRACT
-      const isDevRender = request.isDevTest === true || !!(resolvedYoutubeUrl && resolvedYoutubeUrl.includes('carD3hvum64')) || !!(request.candidateId && request.candidateId.includes('carD3hvum64'));
+      const isDevRender = request.isDevTest === true;
       const isDevMedia = media.mediaOrigin === 'DEVELOPMENT_TEST';
       if (!isDevRender && isDevMedia) {
         const errorReason = 'Security Contract Violation: DEVELOPMENT_TEST media origin is forbidden for normal production candidates.';
@@ -575,6 +575,11 @@ export class RenderService {
         }
       }
 
+      // Stage: persisting
+      jobState.status = 'persisting';
+      jobState.stage = 'Persisting vertical clip data in database...';
+      jobState.updatedAt = new Date().toISOString();
+
       if (this.supabase) {
         try {
           const insertPayload: Record<string, any> = {
@@ -596,7 +601,10 @@ export class RenderService {
             scheduled_slot: null,
           };
 
-          await this.supabase.from('clips').insert(insertPayload);
+          const { error: insertErr } = await this.supabase.from('clips').insert(insertPayload);
+          if (insertErr) {
+            throw new Error(`DATABASE_PERSISTENCE_FAILED: Failed to insert rendered clip: ${insertErr.message}`);
+          }
 
           if (request.candidateId.length === 36) {
             const { data: currentCand } = await this.supabase
@@ -606,7 +614,7 @@ export class RenderService {
               .maybeSingle();
 
             const existingFactors = (currentCand?.factors || {}) as any;
-            await this.supabase
+            const { error: updateErr } = await this.supabase
               .from('clip_candidates')
               .update({
                 status: 'rendered',
@@ -626,9 +634,14 @@ export class RenderService {
                 },
               })
               .eq('id', request.candidateId);
+
+            if (updateErr) {
+              throw new Error(`DATABASE_PERSISTENCE_FAILED: Failed to update candidate status: ${updateErr.message}`);
+            }
           }
         } catch (dbErr: any) {
-          console.warn('[Render] Database insert warning:', dbErr?.message);
+          console.error('[Render] Database persistence failed:', dbErr?.message);
+          throw dbErr;
         }
       }
 
@@ -667,6 +680,7 @@ export class RenderService {
       else if (errorMsg.includes('OUTPUT_UPLOAD_MISMATCH')) errorCode = 'OUTPUT_UPLOAD_MISMATCH';
       else if (errorMsg.includes('OUTPUT_MEDIA_INVALID')) errorCode = 'OUTPUT_MEDIA_INVALID';
       else if (errorMsg.includes('OUTPUT_MEDIA_STATIC')) errorCode = 'OUTPUT_MEDIA_STATIC';
+      else if (errorMsg.includes('DATABASE_PERSISTENCE_FAILED')) errorCode = 'DATABASE_PERSISTENCE_FAILED';
 
       jobState.status = 'failed';
       jobState.stage = errorMsg;
@@ -686,7 +700,7 @@ export class RenderService {
           await this.supabase
             .from('clip_candidates')
             .update({
-              status: 'new', // Return to new state so it can be re-tried honestly
+              status: 'failed', // Keep failed status so user sees error detail in UI
               factors: {
                 ...existingFactors,
                 renderStatus: 'failed',

@@ -80,7 +80,7 @@ export async function handleRenderRequest(req: Request, res: Response) {
       reframeMode,
       subtitles,
       branding,
-      isDevTest: !!((sourceYoutubeUrl && sourceYoutubeUrl.includes('carD3hvum64')) || (candidateId && candidateId.includes('carD3hvum64'))),
+      isDevTest: false,
     };
 
     const result = await renderService.renderCandidateToVerticalClip(renderRequest);

@@ -449,7 +449,6 @@ export const ClipsPage: React.FC = () => {
                       preload="auto"
                       controls
                       muted={isMuted}
-                      crossOrigin="anonymous"
                       className="w-full h-full object-contain block relative z-10"
                       onPlay={() => setIsPlaying(true)}
                       onPlaying={() => setIsPlaying(true)}
