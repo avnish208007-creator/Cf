@@ -502,9 +502,95 @@ export class CompliantMediaProvider implements IMediaProvider {
 
   private async downloadYoutubeVideo(ytUrl: string, destPath: string): Promise<boolean> {
     return new Promise(async (resolve) => {
-      const tempDownloadPath = path.join(path.dirname(destPath), `yt_temp_${Date.now()}`);
+      const tempDownloadPath = path.join(path.dirname(destPath), `yt_temp_${Date.now()}.mp4`);
       try {
-        console.log(`[CompliantMediaProvider] Attempting YouTube stream download for ${ytUrl}...`);
+        console.log(`[CompliantMediaProvider] Attempting YouTube stream download via yt-dlp for ${ytUrl}...`);
+        
+        const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
+        const ytdlpArgs = [
+          '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+          '--no-playlist',
+          '--merge-output-format', 'mp4',
+          '-o', tempDownloadPath,
+          ytUrl
+        ];
+
+        const proc = spawn(ytdlpPath, ytdlpArgs);
+        let stderr = '';
+        let stdout = '';
+        
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+        proc.on('close', (code) => {
+          if (code === 0 && fs.existsSync(tempDownloadPath) && fs.statSync(tempDownloadPath).size > 100000) {
+            console.log(`[CompliantMediaProvider] YouTube stream downloaded successfully via yt-dlp. Standardizing container to MP4 via FFmpeg...`);
+            
+            // Standardize to pristine MP4 container via FFmpeg
+            const ffmpegArgs = [
+              '-y',
+              '-i', tempDownloadPath,
+              '-c:v', 'libx264',
+              '-preset', 'superfast',
+              '-pix_fmt', 'yuv420p',
+              '-c:a', 'aac',
+              '-b:a', '128k',
+              destPath
+            ];
+
+            const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+            let ffmpegStderr = '';
+            ffmpegProc.stderr.on('data', (d) => { ffmpegStderr += d.toString(); });
+            
+            ffmpegProc.on('close', (ffmpegCode) => {
+              // Clean up temp file
+              try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
+
+              if (ffmpegCode === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 100000) {
+                console.log(`[CompliantMediaProvider] YouTube stream successfully standardized to MP4.`);
+                resolve(true);
+              } else {
+                console.error(`[CompliantMediaProvider] FFmpeg standardization failed with code ${ffmpegCode}. Stderr: ${ffmpegStderr}`);
+                resolve(false);
+              }
+            });
+
+            ffmpegProc.on('error', (err) => {
+              console.error(`[CompliantMediaProvider] FFmpeg process spawn error during standardization:`, err);
+              try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
+              resolve(false);
+            });
+          } else {
+            console.error(`[CompliantMediaProvider] yt-dlp download failed with code ${code}. Stdout: ${stdout} Stderr: ${stderr}`);
+            try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
+            
+            // If yt-dlp failed, fall back to ytdl-core as a resilient secondary option
+            console.log(`[CompliantMediaProvider] Falling back to ytdl-core...`);
+            this.downloadYoutubeVideoFallback(ytUrl, destPath).then(resolve);
+          }
+        });
+
+        proc.on('error', (err) => {
+          console.error(`[CompliantMediaProvider] Failed to spawn yt-dlp:`, err);
+          try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
+          
+          // Fall back to ytdl-core
+          this.downloadYoutubeVideoFallback(ytUrl, destPath).then(resolve);
+        });
+
+      } catch (err: any) {
+        console.log(`[CompliantMediaProvider] YouTube downloader exception: (${err.message}).`);
+        try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
+        resolve(false);
+      }
+    });
+  }
+
+  private async downloadYoutubeVideoFallback(ytUrl: string, destPath: string): Promise<boolean> {
+    return new Promise(async (resolve) => {
+      const tempDownloadPath = path.join(path.dirname(destPath), `yt_temp_fallback_${Date.now()}`);
+      try {
+        console.log(`[CompliantMediaProvider] Attempting YouTube fallback stream download for ${ytUrl}...`);
         
         // Use relaxed filter (any container containing both video and audio) and mock real browser headers
         const videoStream = ytdl(ytUrl, {
@@ -528,7 +614,7 @@ export class CompliantMediaProvider implements IMediaProvider {
 
         videoStream.on('end', () => {
           if (fs.existsSync(tempDownloadPath) && fs.statSync(tempDownloadPath).size > 100000) {
-            console.log(`[CompliantMediaProvider] YouTube stream downloaded to temp file. Standardizing container to MP4 via FFmpeg...`);
+            console.log(`[CompliantMediaProvider] YouTube fallback stream downloaded to temp file. Standardizing container to MP4 via FFmpeg...`);
             
             // Standardize to pristine MP4 container via FFmpeg
             const ffmpegArgs = [
@@ -551,7 +637,7 @@ export class CompliantMediaProvider implements IMediaProvider {
               try { fs.unlinkSync(tempDownloadPath); } catch (_) {}
 
               if (code === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 100000) {
-                console.log(`[CompliantMediaProvider] YouTube stream successfully standardized to MP4.`);
+                console.log(`[CompliantMediaProvider] YouTube fallback stream successfully standardized to MP4.`);
                 resolve(true);
               } else {
                 console.error(`[CompliantMediaProvider] FFmpeg standardization failed with code ${code}. Stderr: ${stderr}`);

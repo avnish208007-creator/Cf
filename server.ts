@@ -9,6 +9,7 @@ import { handleAnalyzeRequest } from './src/server/moment-detection/analyzeHandl
 import { handleCandidatesRequest } from './src/server/moment-detection/candidatesHandler';
 import { handleCandidateSelectRequest } from './src/server/moment-detection/selectHandler';
 import { handleClipsRequest } from './src/server/rendering/clipsHandler';
+import { handleValidateExistingClipsRequest } from './src/server/rendering/adminHandler';
 import {
   handleRenderRequest,
   handleRenderJobStatus,
@@ -84,6 +85,12 @@ async function startServer() {
   app.options('/.netlify/functions/clips', (req, res) => res.sendStatus(204));
   app.get('/api/clips', handleClipsRequest);
   app.get('/.netlify/functions/clips', handleClipsRequest);
+
+  // Admin endpoints
+  app.options('/api/admin/validate-clips', (req, res) => res.sendStatus(204));
+  app.options('/.netlify/functions/admin/validate-clips', (req, res) => res.sendStatus(204));
+  app.get('/api/admin/validate-clips', handleValidateExistingClipsRequest);
+  app.get('/.netlify/functions/admin/validate-clips', handleValidateExistingClipsRequest);
 
   // Vertical Render endpoints (Real Modular Rendering Pipeline)
   app.options('/api/render', (req, res) => res.sendStatus(204));

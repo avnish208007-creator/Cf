@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { getSupabaseServerClient } from '../discovery/pipeline';
 import {
@@ -194,12 +195,16 @@ export class RenderService {
       const validation = validateRealVideo(media.mediaPath);
       if (!validation.valid || !validation.inspection) {
         const validationError = validation.reason || 'Input media validation failed.';
-        const failMsg = `MEDIA_VALIDATION_FAILED: ${validationError}`;
+        let errorCode = 'SOURCE_MEDIA_INVALID';
+        if (validationError.includes('SOURCE_MEDIA_STATIC')) {
+          errorCode = 'SOURCE_MEDIA_STATIC';
+        }
+        const failMsg = `${errorCode}: ${validationError}`;
         console.error(`[Render] ${failMsg}`);
 
         jobState.status = 'failed';
         jobState.stage = failMsg;
-        jobState.errorCode = 'MEDIA_VALIDATION_FAILED';
+        jobState.errorCode = errorCode;
         jobState.errorMessage = failMsg;
         jobState.updatedAt = new Date().toISOString();
 
@@ -214,7 +219,7 @@ export class RenderService {
           aspectRatio: '9:16',
           width: 1080,
           height: 1920,
-          errorCode: 'MEDIA_VALIDATION_FAILED',
+          errorCode: errorCode,
           errorMessage: failMsg,
         };
       }
@@ -326,13 +331,63 @@ export class RenderService {
               upsert: true,
             });
 
-          if (!mp4UploadError) {
-            const { data: pubVideoData } = this.supabase.storage
-              .from(storageBucket)
-              .getPublicUrl(storageObjectPath);
-            if (pubVideoData?.publicUrl) {
-              finalVideoUrl = pubVideoData.publicUrl;
+          if (mp4UploadError) {
+            throw new Error(`STORAGE_UPLOAD_FAILED: Video upload to Supabase Storage failed: ${mp4UploadError.message}`);
+          }
+
+          // Fetch public URL
+          const { data: pubVideoData } = this.supabase.storage
+            .from(storageBucket)
+            .getPublicUrl(storageObjectPath);
+          if (pubVideoData?.publicUrl) {
+            finalVideoUrl = pubVideoData.publicUrl;
+          }
+
+          // 9. VERIFY UPLOADED FILE == RENDERED FILE (SHA-256 HASH VERIFICATION)
+          console.log('[Render] Verifying uploaded video file integrity...');
+          const localSha256 = crypto.createHash('sha256').update(mp4Buffer).digest('hex');
+
+          // Download the uploaded Supabase object
+          const { data: downloadBlob, error: downloadError } = await this.supabase.storage
+            .from(storageBucket)
+            .download(storageObjectPath);
+
+          if (downloadError || !downloadBlob) {
+            throw new Error(`STORAGE_UPLOAD_FAILED: Failed to download uploaded video object for validation: ${downloadError?.message || 'Empty response'}`);
+          }
+
+          const arrayBuffer = await downloadBlob.arrayBuffer();
+          const downloadedBuffer = Buffer.from(arrayBuffer);
+
+          if (downloadedBuffer.length === 0) {
+            throw new Error('STORAGE_UPLOAD_FAILED: Downloaded storage object content is empty.');
+          }
+
+          const uploadedSha256 = crypto.createHash('sha256').update(downloadedBuffer).digest('hex');
+
+          if (localSha256 !== uploadedSha256) {
+            throw new Error(`OUTPUT_UPLOAD_MISMATCH: SHA-256 hash mismatch! Local: ${localSha256}, Stored: ${uploadedSha256}`);
+          }
+
+          console.log('[Render] SHA-256 integrity check passed. Verifying actual content of uploaded file...');
+
+          // Save downloaded bytes to a temp file and run full real video validation
+          const downloadedTempPath = rendered.outputMp4Path + '.downloaded.mp4';
+          fs.writeFileSync(downloadedTempPath, downloadedBuffer);
+
+          try {
+            const finalObjectValidation = validateRealVideo(downloadedTempPath);
+            if (!finalObjectValidation.valid) {
+              const reason = finalObjectValidation.reason || 'Invalid media content';
+              if (reason.includes('SOURCE_MEDIA_STATIC')) {
+                throw new Error(`OUTPUT_MEDIA_STATIC: The uploaded video is detected as a static thumbnail/image-only loop.`);
+              } else {
+                throw new Error(`OUTPUT_MEDIA_INVALID: The uploaded video format or container is invalid: ${reason}`);
+              }
             }
+            console.log('[Render] Uploaded video file validation complete. Motion and codec criteria verified.');
+          } finally {
+            try { fs.unlinkSync(downloadedTempPath); } catch (_) {}
           }
 
           const thumbStoragePath = `${request.workspaceId}/${thumbFilename}`;
@@ -354,13 +409,23 @@ export class RenderService {
             }
           }
         } catch (storageErr: any) {
-          console.warn('[Render] Storage upload exception:', storageErr?.message);
+          console.error('[Render] Storage / verification exception:', storageErr?.message);
+          throw storageErr; // Propagate down to fail pipeline honestly
         }
       }
 
       if (this.supabase) {
         try {
-          await this.supabase.from('clips').insert({
+          // Check if table contains video_url column dynamically to prevent crashes on non-migrated instances
+          let hasVideoUrlColumn = false;
+          try {
+            const { error: colErr } = await this.supabase.from('clips').select('video_url').limit(1);
+            hasVideoUrlColumn = !colErr || colErr.code !== '42703';
+          } catch (_) {
+            hasVideoUrlColumn = false;
+          }
+
+          const insertPayload: Record<string, any> = {
             workspace_id: request.workspaceId,
             candidate_id: request.candidateId.length === 36 ? request.candidateId : null,
             title: request.hook.split(':')[0] || request.hook.slice(0, 48),
@@ -375,8 +440,16 @@ export class RenderService {
             captions_sample: [request.hook, request.summary || 'Key highlights.'],
             hashtags: ['#shorts', '#vertical'],
             progress: 100,
-            scheduled_slot: finalVideoUrl,
-          });
+          };
+
+          if (hasVideoUrlColumn) {
+            insertPayload.video_url = finalVideoUrl;
+            insertPayload.scheduled_slot = null;
+          } else {
+            insertPayload.scheduled_slot = finalVideoUrl;
+          }
+
+          await this.supabase.from('clips').insert(insertPayload);
 
           if (request.candidateId.length === 36) {
             const { data: currentCand } = await this.supabase
@@ -436,12 +509,47 @@ export class RenderService {
       };
     } catch (err: any) {
       console.error('[Render] Pipeline exception:', err);
-      const errorMsg = err.message || 'Rendering failed.';
+      
+      let errorMsg = err.message || 'Rendering failed.';
+      let errorCode = 'RENDER_FAILED';
+
+      if (errorMsg.includes('MEDIA_ACQUISITION_FAILED')) errorCode = 'MEDIA_ACQUISITION_FAILED';
+      else if (errorMsg.includes('SOURCE_MEDIA_INVALID')) errorCode = 'SOURCE_MEDIA_INVALID';
+      else if (errorMsg.includes('SOURCE_MEDIA_STATIC')) errorCode = 'SOURCE_MEDIA_STATIC';
+      else if (errorMsg.includes('STORAGE_UPLOAD_FAILED')) errorCode = 'STORAGE_UPLOAD_FAILED';
+      else if (errorMsg.includes('OUTPUT_UPLOAD_MISMATCH')) errorCode = 'OUTPUT_UPLOAD_MISMATCH';
+      else if (errorMsg.includes('OUTPUT_MEDIA_INVALID')) errorCode = 'OUTPUT_MEDIA_INVALID';
+      else if (errorMsg.includes('OUTPUT_MEDIA_STATIC')) errorCode = 'OUTPUT_MEDIA_STATIC';
 
       jobState.status = 'failed';
       jobState.stage = errorMsg;
+      jobState.errorCode = errorCode;
       jobState.errorMessage = errorMsg;
       jobState.updatedAt = new Date().toISOString();
+
+      if (this.supabase && request.candidateId.length === 36) {
+        try {
+          const { data: currentCand } = await this.supabase
+            .from('clip_candidates')
+            .select('factors')
+            .eq('id', request.candidateId)
+            .maybeSingle();
+
+          const existingFactors = (currentCand?.factors || {}) as any;
+          await this.supabase
+            .from('clip_candidates')
+            .update({
+              status: 'new', // Return to new state so it can be re-tried honestly
+              factors: {
+                ...existingFactors,
+                renderStatus: 'failed',
+                renderErrorCode: errorCode,
+                renderErrorMessage: errorMsg,
+              },
+            })
+            .eq('id', request.candidateId);
+        } catch (_) {}
+      }
 
       return {
         success: false,
@@ -453,6 +561,7 @@ export class RenderService {
         aspectRatio: '9:16',
         width: 1080,
         height: 1920,
+        errorCode,
         errorMessage: errorMsg,
       };
     }

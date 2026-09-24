@@ -130,21 +130,34 @@ export function validateRealVideo(filePath: string): { valid: boolean; reason?: 
     return { valid: false, reason: 'Frame rate is 0 or invalid', inspection };
   }
 
-  // To distinguish REAL VIDEO from a STATIC IMAGE LOOP, decode frames at two distinct timestamps and compare.
-  const duration = inspection.durationSeconds;
-  if (duration > 1.5) {
-    const t1 = Math.min(1.0, duration * 0.15);
-    const t2 = Math.min(duration - 0.5, duration * 0.75);
-    if (t2 > t1) {
-      const h1 = getFrameMd5(filePath, t1);
-      const h2 = getFrameMd5(filePath, t2);
+  // To distinguish REAL VIDEO from a STATIC IMAGE LOOP, decode frames at distinct timestamps (0s, 1s, 2s, 5s) and compare.
+  const duration = inspection.durationSeconds || 0;
+  if (duration > 0) {
+    const testTimes = [0, 1, 2, 5].filter(t => t < duration);
+    if (testTimes.length < 2) {
+      testTimes.push(0);
+      testTimes.push(duration / 2);
+    }
 
-      if (!h1 || !h2) {
-        return { valid: false, reason: 'Failed to decode video frames at test intervals', inspection };
+    const hashes: string[] = [];
+    for (const time of testTimes) {
+      const h = getFrameMd5(filePath, time);
+      if (h) {
+        hashes.push(h);
       }
-      if (h1 === h2) {
-        return { valid: false, reason: 'Static image loop detected (no actual motion/changing video frames found)', inspection };
+    }
+
+    if (hashes.length >= 2) {
+      const allIdentical = hashes.every(h => h === hashes[0]);
+      if (allIdentical) {
+        return { 
+          valid: false, 
+          reason: 'SOURCE_MEDIA_STATIC: Extracted frames at 0s, 1s, 2s, 5s intervals are completely identical. Static image loop/thumbnail detected.', 
+          inspection 
+        };
       }
+    } else {
+      return { valid: false, reason: 'Failed to decode sufficient video frames for motion validation', inspection };
     }
   }
 

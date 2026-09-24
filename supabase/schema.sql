@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS public.clips (
   progress integer DEFAULT 100,
   in_queue boolean NOT NULL DEFAULT false,
   queue_status text DEFAULT 'needs_review' CHECK (queue_status IN ('needs_review', 'approved', 'scheduled', 'exported')),
+  video_url text,
   scheduled_slot text,
   created_at timestamptz DEFAULT now() NOT NULL,
   updated_at timestamptz DEFAULT now() NOT NULL

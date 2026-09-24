@@ -862,7 +862,8 @@ export const SupabaseContentRepo = {
 
     return rawClips.map((cl: DbClip) => {
       const rawThumb = cl.thumbnail_bg || (cl as any).thumbnail_url;
-      const rawVideo = cl.scheduled_slot || (cl as any).output_url || (cl as any).video_url || (cl as any).media_url;
+      // Map straightforwardly to video_url, utilizing backward-compatible fallback only if video_url column doesn't exist on the db record yet
+      const rawVideo = ('video_url' in cl) ? (cl as any).video_url : cl.scheduled_slot;
 
       const isThumbUrl = rawThumb && typeof rawThumb === 'string' && (rawThumb.startsWith('/') || rawThumb.startsWith('http'));
       const isVideoUrl = rawVideo && typeof rawVideo === 'string' && (rawVideo.startsWith('/') || rawVideo.startsWith('http'));
@@ -893,27 +894,44 @@ export const SupabaseContentRepo = {
   async insertClip(workspaceId: string, clip: Omit<Clip, 'id'> & { inQueue?: boolean }): Promise<string | null> {
     if (!isSupabaseConfigured) return null;
     try {
+      // Robustly check if database has video_url column
+      let hasVideoUrl = false;
+      try {
+        const { error: testErr } = await supabase.from('clips').select('video_url').limit(1);
+        hasVideoUrl = !testErr || testErr.code !== '42703';
+      } catch (_) {
+        hasVideoUrl = false;
+      }
+
+      const insertPayload: Record<string, any> = {
+        workspace_id: workspaceId,
+        candidate_id: clip.candidateId || null,
+        title: clip.title,
+        hook: clip.hook,
+        source_title: clip.sourceTitle,
+        channel_title: clip.channelTitle,
+        duration: clip.duration,
+        aspect_ratio: clip.aspectRatio,
+        style: clip.style,
+        status: clip.status,
+        thumbnail_bg: clip.thumbnailUrl || clip.thumbnailBg,
+        captions_sample: clip.captionsSample,
+        hashtags: clip.hashtags,
+        progress: clip.progress ?? 100,
+        in_queue: clip.inQueue ?? false,
+        queue_status: 'needs_review',
+      };
+
+      if (hasVideoUrl) {
+        insertPayload.video_url = clip.videoUrl || null;
+        insertPayload.scheduled_slot = null;
+      } else {
+        insertPayload.scheduled_slot = clip.videoUrl || null;
+      }
+
       const { data, error } = await supabase
         .from('clips')
-        .insert({
-          workspace_id: workspaceId,
-          candidate_id: clip.candidateId || null,
-          title: clip.title,
-          hook: clip.hook,
-          source_title: clip.sourceTitle,
-          channel_title: clip.channelTitle,
-          duration: clip.duration,
-          aspect_ratio: clip.aspectRatio,
-          style: clip.style,
-          status: clip.status,
-          thumbnail_bg: clip.thumbnailUrl || clip.thumbnailBg,
-          captions_sample: clip.captionsSample,
-          hashtags: clip.hashtags,
-          progress: clip.progress ?? 100,
-          in_queue: clip.inQueue ?? false,
-          queue_status: 'needs_review',
-          scheduled_slot: clip.videoUrl || null,
-        })
+        .insert(insertPayload)
         .select('id')
         .single();
 
