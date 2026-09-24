@@ -8,45 +8,35 @@ export interface GeneratedSubtitleFile {
   cues: SubtitleCue[];
 }
 
-export interface ISubtitleGenerator {
-  generateSubtitles(
-    rawText: string,
-    startOffsetSec: number,
-    durationSec: number,
-    config?: SubtitleConfig,
-    tempDir?: string
-  ): Promise<GeneratedSubtitleFile>;
-}
-
-export class TranscriptSubtitleGenerator implements ISubtitleGenerator {
+export class SubtitleGenerator {
   /**
-   * Generates clean, mobile-optimized synchronized subtitles from real transcript text.
-   * Splits into short, punchy 1-2 line segments (4-8 words each) distributed evenly across the clip duration.
+   * Generates clean, mobile-optimized synchronized subtitles (.ass and .srt formats) from candidate transcript text.
+   * Splitting words into short, punchy, high-retention subtitle cues.
    */
-  public async generateSubtitles(
+  public async generate(
     rawText: string,
-    startOffsetSec: number,
     durationSec: number,
-    config?: SubtitleConfig,
-    tempDir?: string
+    config?: SubtitleConfig
   ): Promise<GeneratedSubtitleFile> {
-    const dir = tempDir || path.resolve(process.cwd(), 'tmp', 'subtitles');
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    console.log(`[SubtitleGenerator] Building mobile-optimized subtitles for transcript (${rawText.length} chars)`);
+
+    const tempDir = path.resolve(process.cwd(), 'temp_media', 'subtitles');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
     }
 
     const uniqueId = `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const assFilePath = path.join(dir, `${uniqueId}.ass`);
-    const srtFilePath = path.join(dir, `${uniqueId}.srt`);
+    const assFilePath = path.join(tempDir, `${uniqueId}.ass`);
+    const srtFilePath = path.join(tempDir, `${uniqueId}.srt`);
 
-    // Clean and split text into natural phrases
-    const cues = this.buildSynchronizedCues(rawText, durationSec, config?.maxWordsPerLine || 6);
+    // Build word chunks and timeline cues
+    const cues = this.buildCues(rawText, durationSec, config?.maxWordsPerLine || 6);
 
-    // Write SubStation Alpha (.ass) format for clean rendering via FFmpeg
+    // Format and write SubStation Alpha (.ass) format for styled vertical overlay burning
     const assContent = this.formatASS(cues, config);
     fs.writeFileSync(assFilePath, assContent, 'utf-8');
 
-    // Write SRT format as well
+    // Format and write SubRip Subtitle (.srt) format
     const srtContent = this.formatSRT(cues);
     fs.writeFileSync(srtFilePath, srtContent, 'utf-8');
 
@@ -57,7 +47,7 @@ export class TranscriptSubtitleGenerator implements ISubtitleGenerator {
     };
   }
 
-  private buildSynchronizedCues(
+  private buildCues(
     text: string,
     totalDurationSec: number,
     maxWordsPerChunk: number
@@ -71,7 +61,6 @@ export class TranscriptSubtitleGenerator implements ISubtitleGenerator {
       return [];
     }
 
-    // Split text into words while preserving punctuation
     const words = cleanText.split(' ').filter((w) => w.length > 0);
     if (words.length === 0) return [];
 
@@ -93,9 +82,8 @@ export class TranscriptSubtitleGenerator implements ISubtitleGenerator {
       chunks.push(currentChunk.join(' '));
     }
 
-    // Allocate time intervals evenly across the total clip duration with short natural padding
     const cueCount = chunks.length;
-    const timePerCue = Math.max(1.2, totalDurationSec / cueCount);
+    const timePerCue = Math.max(1.0, totalDurationSec / cueCount);
 
     const cues: SubtitleCue[] = [];
     for (let i = 0; i < cueCount; i++) {
@@ -117,12 +105,9 @@ export class TranscriptSubtitleGenerator implements ISubtitleGenerator {
 
   private formatASS(cues: SubtitleCue[], config?: SubtitleConfig): string {
     const fontSize = config?.fontSize || 22;
-    // Primary color in ASS is &HAABBGGRR (e.g. &H00FFFFFF for white)
-    const primaryAssColor = '&H00FFFFFF';
-    const outlineColor = '&H00000000'; // Black outline for crisp readability
+    const primaryAssColor = '&H00FFFFFF'; // White
+    const outlineColor = '&H00000000';    // Black outline
 
-    // Clean, professional mobile subtitles:
-    // Font: Arial Bold, Size: 22, Outline: 2, MarginV: 140 (safe lower third)
     let ass = `[Script Info]
 Title: ClipFlow Subtitles
 ScriptType: v4.00+
@@ -144,7 +129,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       const endStr = this.formatASSTime(cue.endTimeSec);
       const styleName = cue.isHook ? 'HookStyle' : 'Default';
 
-      // Insert clean line breaks if long
       let lineText = cue.text;
       const words = lineText.split(' ');
       if (words.length > 5) {

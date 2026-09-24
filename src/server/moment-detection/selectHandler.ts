@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { getSupabaseServerClient } from '../discovery/pipeline';
-import { CompliantMediaProvider } from '../rendering/MediaProvider';
+import { SourceMediaProvider } from '../rendering/SourceMediaProvider';
 
 export async function handleCandidateSelectRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -94,19 +94,32 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       .eq('id', candidateId);
 
     // 4. Automatic Source Media Acquisition
-    const mediaProvider = new CompliantMediaProvider();
-    const sourceRecord = {
-      id: sourceVideo?.id || candidate.source_video_id || candidateId,
-      youtubeUrl: sourceVideo?.youtube_url || factors.sourceYoutubeUrl || '',
-      sourceUrl: sourceVideo?.source_url || '',
-      title: sourceVideo?.title || candidate.source_title || '',
-      channelTitle: sourceVideo?.channel_title || candidate.channel_title || '',
-      mediaUrl: sourceVideo?.media_url,
-      mediaPath: sourceVideo?.media_path,
-      mediaStatus: sourceVideo?.media_status,
-    };
+    const mediaProvider = new SourceMediaProvider();
+    let mediaResult: any;
 
-    const mediaResult = await mediaProvider.acquire(sourceRecord);
+    try {
+      const sourceInfo = await mediaProvider.acquire({
+        id: sourceVideo?.id || candidate.source_video_id || candidateId,
+        youtube_url: sourceVideo?.youtube_url || factors.sourceYoutubeUrl || '',
+        mediaUrl: sourceVideo?.media_url || candidate.mediaUrl,
+        mediaPath: sourceVideo?.media_path || candidate.mediaPath,
+        title: sourceVideo?.title || candidate.source_title || '',
+      });
+
+      mediaResult = {
+        success: true,
+        status: 'available',
+        mediaPath: sourceInfo.localPath,
+        mediaUrl: sourceInfo.sourceUrl,
+      };
+    } catch (err: any) {
+      mediaResult = {
+        success: false,
+        status: 'failed',
+        errorCode: 'MEDIA_ACQUISITION_FAILED',
+        errorMessage: err.message || 'Source media could not be acquired.',
+      };
+    }
 
     let finalRenderStatus: 'media_ready' | 'failed' | 'unavailable' = 'failed';
     let mediaErrorMessage = mediaResult.errorMessage;

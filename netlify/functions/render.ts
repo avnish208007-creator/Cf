@@ -115,7 +115,11 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     }
 
     // 2. CREATE A NEW JOB ROW
-    const jobId = 'job_rend_' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 6);
+    const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
     const { error: jobInsertErr } = await supabase
       .from('jobs')
       .insert({

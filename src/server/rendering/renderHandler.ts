@@ -1,20 +1,19 @@
 import { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { RenderService } from './RenderService';
 import { getSupabaseServerClient } from '../discovery/pipeline';
-import { RenderRequest } from './types';
+import { RenderWorker } from './RenderWorker';
 
-const renderedDir = path.resolve(process.cwd(), 'uploads', 'rendered');
-const sourcesDir = path.resolve(process.cwd(), 'uploads', 'sources');
+const renderedDir = path.resolve(process.cwd(), 'temp_media', 'rendered');
 
 if (!fs.existsSync(renderedDir)) {
   fs.mkdirSync(renderedDir, { recursive: true });
 }
-if (!fs.existsSync(sourcesDir)) {
-  fs.mkdirSync(sourcesDir, { recursive: true });
-}
 
+/**
+ * Main production render endpoint.
+ * POST /api/render
+ */
 export async function handleRenderRequest(req: Request, res: Response) {
   try {
     const authHeader = req.headers.authorization;
@@ -23,31 +22,13 @@ export async function handleRenderRequest(req: Request, res: Response) {
       userAccessToken = authHeader.slice(7).trim();
     }
 
-    const {
-      candidateId,
-      workspaceId,
-      sourceVideoId,
-      sourceTitle,
-      channelTitle,
-      startTime,
-      endTime,
-      durationSeconds,
-      hook,
-      transcriptText,
-      summary,
-      sourceYoutubeUrl,
-      mediaUrl,
-      mediaPath,
-      reframeMode,
-      subtitles,
-      branding,
-    } = req.body || {};
+    const { candidateId, workspaceId } = req.body || {};
 
     if (!candidateId || !workspaceId) {
       return res.status(400).json({
         success: false,
         error: 'MISSING_PARAMETERS',
-        message: 'candidateId and workspaceId are required to render a vertical clip.',
+        message: 'candidateId and workspaceId are required to render.',
       });
     }
 
@@ -56,11 +37,11 @@ export async function handleRenderRequest(req: Request, res: Response) {
       return res.status(500).json({
         success: false,
         error: 'DATABASE_UNAVAILABLE',
-        message: 'Database connection could not be established.',
+        message: 'Could not connect to database.',
       });
     }
 
-    // 1. PREVENT DUPLICATE RENDERS Check
+    // 1. Check for active duplicate jobs to prevent rendering overload
     const { data: candidate } = await supabase
       .from('clip_candidates')
       .select('*')
@@ -69,15 +50,14 @@ export async function handleRenderRequest(req: Request, res: Response) {
 
     if (candidate && candidate.factors && candidate.factors.activeJobId) {
       const activeJobId = candidate.factors.activeJobId;
-      // Check if job exists and is still active
-      const { data: job } = await supabase
+      const { data: activeJob } = await supabase
         .from('jobs')
         .select('*')
         .eq('id', activeJobId)
         .maybeSingle();
 
-      if (job && (job.status === 'queued' || job.status === 'running')) {
-        console.log(`[handleRenderRequest] Active job already exists for candidate ${candidateId}: ${activeJobId}`);
+      if (activeJob && (activeJob.status === 'queued' || activeJob.status === 'running')) {
+        console.log(`[handleRenderRequest] Duplicate job active for candidate: ${activeJobId}`);
         return res.status(202).json({
           success: true,
           jobId: activeJobId,
@@ -87,9 +67,14 @@ export async function handleRenderRequest(req: Request, res: Response) {
       }
     }
 
-    const jobId = 'job_rend_' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 6);
+    // 2. Generate compliant UUID for the job
+    const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
 
-    // Create a jobs row in Supabase
+    // 3. Create a jobs row in Supabase (status: 'queued')
     const { error: jobInsertErr } = await supabase
       .from('jobs')
       .insert({
@@ -100,18 +85,19 @@ export async function handleRenderRequest(req: Request, res: Response) {
         progress: 0,
         stage: 'queued',
         status: 'queued',
+        metadata: { candidateId }
       });
 
     if (jobInsertErr) {
-      console.error('[handleRenderRequest] Failed to create job row:', jobInsertErr.message);
+      console.error('[handleRenderRequest] Failed to insert job row:', jobInsertErr.message);
       return res.status(500).json({
         success: false,
         error: 'DATABASE_FAILURE',
-        message: 'Could not create a rendering background job: ' + jobInsertErr.message,
+        message: 'Could not initiate a render job: ' + jobInsertErr.message,
       });
     }
 
-    // Update candidate status to 'generating' and activeJobId
+    // 4. Update candidate factors to bind activeJobId
     const existingFactors = (candidate?.factors || {}) as any;
     await supabase
       .from('clip_candidates')
@@ -125,59 +111,32 @@ export async function handleRenderRequest(req: Request, res: Response) {
       })
       .eq('id', candidateId);
 
-    const renderService = new RenderService(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      supabase
-    );
-
-    const renderRequest: RenderRequest = {
-      candidateId,
-      workspaceId,
-      sourceVideoId,
-      sourceTitle: sourceTitle || 'Discovered Video',
-      channelTitle: channelTitle || 'Creator Channel',
-      startTime: startTime || '00:00',
-      endTime: endTime || '00:30',
-      durationSeconds: Number(durationSeconds) || undefined,
-      hook: hook || 'Key takeaway insight.',
-      transcriptText: transcriptText || hook || '',
-      summary: summary || '',
-      sourceYoutubeUrl,
-      mediaUrl,
-      mediaPath,
-      reframeMode,
-      subtitles,
-      branding,
-      isDevTest: false,
-      jobId,
-    };
-
-    // Run rendering asynchronously in the background for local / AI Studio Preview server
-    renderService.renderCandidateToVerticalClip(renderRequest).catch((err) => {
-      console.error('[handleRenderRequest] Asynchronous render background exception:', err);
+    // 5. Trigger the Replaceable Worker asynchronously (Fire-and-forget background execution)
+    const worker = new RenderWorker(supabase);
+    worker.process(jobId).catch((err) => {
+      console.error(`[handleRenderRequest] Worker process background failure for job ${jobId}:`, err);
     });
 
     return res.status(202).json({
       success: true,
       jobId,
       status: 'queued',
-      message: 'Render job accepted and queued in background.',
+      message: 'Render job successfully queued in background.',
     });
   } catch (err: any) {
-    console.error('[handleRenderRequest] Unhandled error:', err);
+    console.error('[handleRenderRequest] Execution exception:', err);
     return res.status(500).json({
       success: false,
       error: 'RENDER_ERROR',
-      message: err.message || 'An unexpected error occurred during rendering.',
+      message: err.message || 'An unexpected render failure occurred.',
     });
   }
 }
 
+/**
+ * Isolated development/test handler using real moving local MP4 assets.
+ * NEVER reachable from the normal render button.
+ */
 export async function handleDevRenderTestRequest(req: Request, res: Response) {
   try {
     const authHeader = req.headers.authorization;
@@ -186,95 +145,106 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
       userAccessToken = authHeader.slice(7).trim();
     }
 
-    const {
-      candidateId,
-      workspaceId,
-      sourceVideoId,
-      sourceTitle,
-      channelTitle,
-      startTime,
-      endTime,
-      durationSeconds,
-      hook,
-      transcriptText,
-      summary,
-      sourceYoutubeUrl,
-      mediaUrl,
-      mediaPath,
-      reframeMode,
-      subtitles,
-      branding,
-    } = req.body || {};
-
+    const { candidateId, workspaceId } = req.body || {};
     const supabase = getSupabaseServerClient(userAccessToken);
-    const renderService = new RenderService(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      supabase
-    );
+    if (!supabase) {
+      return res.status(500).json({ success: false, message: 'Database client not available.' });
+    }
 
-    const renderRequest: RenderRequest = {
-      candidateId: candidateId || 'dev_test_candidate',
-      workspaceId: workspaceId || 'dev_test_workspace',
-      sourceVideoId: sourceVideoId || 'dev',
-      sourceTitle: sourceTitle || 'Development Synthetic Test Video (DEVELOPMENT ONLY)',
-      channelTitle: channelTitle || 'Dev Channel',
-      startTime: startTime || '00:02',
-      endTime: endTime || '00:10',
-      durationSeconds: 8,
-      hook: hook || 'This is a synthetic development render test.',
-      transcriptText: transcriptText || 'This is a synthetic development render test.',
-      summary: summary || 'Synthetic development test.',
-      sourceYoutubeUrl: 'dev',
-      mediaUrl: undefined,
-      mediaPath: undefined,
-      reframeMode: reframeMode || 'centered_crop',
-      subtitles,
-      branding,
-      isDevTest: true, // EXPLICIT TEST FLAG ALLOWED HERE
-    };
+    const testVideoPath = path.resolve(process.cwd(), 'tmp', 'media', 'dev_moving_test.mp4');
+    if (!fs.existsSync(testVideoPath)) {
+      return res.status(404).json({ success: false, message: 'Development test MP4 asset not found on disk.' });
+    }
 
-    const result = await renderService.renderCandidateToVerticalClip(renderRequest);
-    return res.status(result.success ? 200 : 422).json(result);
+    console.log(`[handleDevRenderTestRequest] Triggering isolated worker test using real moving MP4 at: ${testVideoPath}`);
+    
+    // Create direct test job
+    const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+
+    await supabase.from('jobs').insert({
+      id: jobId,
+      workspace_id: workspaceId || 'a0000000-0000-4000-a000-000000000001',
+      type: 'vertical_render',
+      target_title: `Test Render: ${candidateId || 'dev-test'}`,
+      progress: 0,
+      stage: 'queued',
+      status: 'queued',
+      metadata: { candidateId: candidateId || 'dev-test' }
+    });
+
+    const worker = new RenderWorker(supabase);
+    // Execute test synchronously to return output directly
+    const success = await worker.process(jobId);
+
+    return res.status(success ? 200 : 422).json({
+      success,
+      jobId,
+      message: success ? 'Isolated render test passed!' : 'Isolated render test failed.'
+    });
   } catch (err: any) {
-    console.error('[handleDevRenderTestRequest] Unhandled error:', err);
-    return res.status(500).json({
-      success: false,
-      error: 'RENDER_ERROR',
-      message: err.message || 'An unexpected error occurred during rendering.',
-    });
+    return res.status(500).json({ success: false, message: err.message });
   }
-}
-
-export async function handleRenderJobStatus(req: Request, res: Response) {
-  const { jobId } = req.params;
-  const renderService = new RenderService();
-  const job = await renderService.getJob(jobId);
-
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: `Job ${jobId} not found.`,
-    });
-  }
-
-  return res.json({
-    success: true,
-    job,
-  });
 }
 
 /**
- * Serves rendered MP4 files and JPG poster frames with HTTP 206 Partial Content / Range support.
+ * Retrieves the asynchronous status of a render job from the jobs database.
+ * GET /api/render/jobs/:jobId
+ */
+export async function handleRenderJobStatus(req: Request, res: Response) {
+  try {
+    const { jobId } = req.params;
+    const authHeader = req.headers.authorization;
+    let userAccessToken: string | undefined;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      userAccessToken = authHeader.slice(7).trim();
+    }
+
+    const supabase = getSupabaseServerClient(userAccessToken);
+    if (!supabase) {
+      return res.status(500).json({ success: false, message: 'Database client not available.' });
+    }
+
+    const { data: job, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', jobId)
+      .maybeSingle();
+
+    if (error || !job) {
+      return res.status(404).json({
+        success: false,
+        message: `Job ${jobId} not found in database.`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      job: {
+        id: job.id,
+        workspaceId: job.workspace_id,
+        status: job.status,
+        progress: job.progress,
+        stage: job.stage,
+        errorCode: job.error_code,
+        errorMessage: job.error_message,
+        startedAt: job.started_at,
+        completedAt: job.completed_at
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/**
+ * Serves media streaming with Range support
  */
 export function handleMediaStreaming(req: Request, res: Response) {
   const { filename } = req.params;
-
-  // Sanitize filename to avoid path traversal
   const sanitized = path.basename(filename);
   const filePath = path.join(renderedDir, sanitized);
 
@@ -291,7 +261,6 @@ export function handleMediaStreaming(req: Request, res: Response) {
   const range = req.headers.range;
 
   if (range && isVideo) {
-    // Parse Range header (e.g. "bytes=0-1048575")
     const parts = range.replace(/bytes=/, '').split('-');
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;

@@ -4,7 +4,7 @@ import path from 'path';
 import https from 'https';
 import http from 'http';
 import { getSupabaseServerClient } from '../discovery/pipeline';
-import { validateRealVideo } from './inspectVideo';
+import { OutputValidator } from './OutputValidator';
 
 export async function handleValidateExistingClipsRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -51,10 +51,12 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
     const results = [];
 
     // Ensure tmp folder exists
-    const tmpDir = path.resolve(process.cwd(), 'tmp', 'validate');
+    const tmpDir = path.resolve(process.cwd(), 'temp_media', 'validate');
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
     }
+
+    const validator = new OutputValidator();
 
     for (const cl of records) {
       const videoUrl = cl.video_url;
@@ -75,9 +77,8 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
       // Handle local versus remote URLs
       if (videoUrl.includes('/api/media/clips/')) {
         const filename = videoUrl.split('/').pop() || '';
-        filePath = path.resolve(process.cwd(), 'uploads', 'rendered', filename);
+        filePath = path.resolve(process.cwd(), 'temp_media', 'rendered', filename);
       } else if (videoUrl.startsWith('http')) {
-        // Download the remote file to temp
         const tempName = `validate_${cl.id}_${Date.now()}.mp4`;
         filePath = path.join(tmpDir, tempName);
         isTemp = true;
@@ -131,21 +132,22 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
         continue;
       }
 
-      // Run robust validation (H.264, yuv420p, 9:16, moving frames)
-      const validation = validateRealVideo(filePath);
+      // Run robust validation (H.264, yuv420p, 1080x1920, moving frames check)
+      const durationNum = Number(cl.duration?.replace('s', '')) || 15;
+      const validation = await validator.validate(filePath, durationNum);
 
       // Clean up downloaded temp file if applicable
       if (isTemp && fs.existsSync(filePath)) {
         try { fs.unlinkSync(filePath); } catch (_) {}
       }
 
-      if (validation.valid && validation.inspection) {
+      if (validation.valid) {
         results.push({
           id: cl.id,
           title: cl.title,
           videoUrl,
           status: 'VALID_REAL_VIDEO',
-          details: `Resolution: ${validation.inspection.width}x${validation.inspection.height}, Duration: ${validation.inspection.durationSeconds}s, Codec: ${validation.inspection.videoCodec}, Size: ${validation.inspection.fileSizeBytes} bytes`,
+          details: `Resolution: ${validation.width}x${validation.height}, Duration: ${validation.duration}s, Codec: ${validation.videoCodec}`,
         });
       } else {
         results.push({
@@ -153,7 +155,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
           title: cl.title,
           videoUrl,
           status: 'INVALID_SYNTHETIC_OUTPUT',
-          details: validation.reason || 'Invalid media content or format.',
+          details: validation.errorMessage || 'Invalid media content or format.',
         });
       }
     }
