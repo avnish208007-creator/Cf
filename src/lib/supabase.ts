@@ -134,6 +134,7 @@ export interface DbClip {
   progress: number;
   in_queue: boolean;
   queue_status: 'needs_review' | 'approved' | 'scheduled' | 'exported';
+  video_url: string | null;
   scheduled_slot: string | null;
   created_at: string;
 }
@@ -862,8 +863,7 @@ export const SupabaseContentRepo = {
 
     return rawClips.map((cl: DbClip) => {
       const rawThumb = cl.thumbnail_bg || (cl as any).thumbnail_url;
-      // Map straightforwardly to video_url, utilizing backward-compatible fallback only if video_url column doesn't exist on the db record yet
-      const rawVideo = ('video_url' in cl) ? (cl as any).video_url : cl.scheduled_slot;
+      const rawVideo = cl.video_url;
 
       const isThumbUrl = rawThumb && typeof rawThumb === 'string' && (rawThumb.startsWith('/') || rawThumb.startsWith('http'));
       const isVideoUrl = rawVideo && typeof rawVideo === 'string' && (rawVideo.startsWith('/') || rawVideo.startsWith('http'));
@@ -894,15 +894,6 @@ export const SupabaseContentRepo = {
   async insertClip(workspaceId: string, clip: Omit<Clip, 'id'> & { inQueue?: boolean }): Promise<string | null> {
     if (!isSupabaseConfigured) return null;
     try {
-      // Robustly check if database has video_url column
-      let hasVideoUrl = false;
-      try {
-        const { error: testErr } = await supabase.from('clips').select('video_url').limit(1);
-        hasVideoUrl = !testErr || testErr.code !== '42703';
-      } catch (_) {
-        hasVideoUrl = false;
-      }
-
       const insertPayload: Record<string, any> = {
         workspace_id: workspaceId,
         candidate_id: clip.candidateId || null,
@@ -914,20 +905,15 @@ export const SupabaseContentRepo = {
         aspect_ratio: clip.aspectRatio,
         style: clip.style,
         status: clip.status,
-        thumbnail_bg: clip.thumbnailUrl || clip.thumbnailBg,
+        thumbnail_bg: clip.thumbnailUrl || clip.thumbnailBg || '',
         captions_sample: clip.captionsSample,
         hashtags: clip.hashtags,
         progress: clip.progress ?? 100,
         in_queue: clip.inQueue ?? false,
         queue_status: 'needs_review',
+        video_url: clip.videoUrl || null,
+        scheduled_slot: null,
       };
-
-      if (hasVideoUrl) {
-        insertPayload.video_url = clip.videoUrl || null;
-        insertPayload.scheduled_slot = null;
-      } else {
-        insertPayload.scheduled_slot = clip.videoUrl || null;
-      }
 
       const { data, error } = await supabase
         .from('clips')

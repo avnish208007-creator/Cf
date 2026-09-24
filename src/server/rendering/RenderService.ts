@@ -416,15 +416,6 @@ export class RenderService {
 
       if (this.supabase) {
         try {
-          // Check if table contains video_url column dynamically to prevent crashes on non-migrated instances
-          let hasVideoUrlColumn = false;
-          try {
-            const { error: colErr } = await this.supabase.from('clips').select('video_url').limit(1);
-            hasVideoUrlColumn = !colErr || colErr.code !== '42703';
-          } catch (_) {
-            hasVideoUrlColumn = false;
-          }
-
           const insertPayload: Record<string, any> = {
             workspace_id: request.workspaceId,
             candidate_id: request.candidateId.length === 36 ? request.candidateId : null,
@@ -440,14 +431,9 @@ export class RenderService {
             captions_sample: [request.hook, request.summary || 'Key highlights.'],
             hashtags: ['#shorts', '#vertical'],
             progress: 100,
+            video_url: finalVideoUrl,
+            scheduled_slot: null,
           };
-
-          if (hasVideoUrlColumn) {
-            insertPayload.video_url = finalVideoUrl;
-            insertPayload.scheduled_slot = null;
-          } else {
-            insertPayload.scheduled_slot = finalVideoUrl;
-          }
 
           await this.supabase.from('clips').insert(insertPayload);
 
