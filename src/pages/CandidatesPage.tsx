@@ -375,7 +375,7 @@ export const CandidatesPage: React.FC = () => {
 
       const json = await resp.json();
       if (resp.ok && json.success) {
-        showToast(forceTestVideo ? 'Vertical clip rendered successfully with local test media!' : 'Vertical 9:16 MP4 clip rendered successfully!', 'success');
+        showToast(forceTestVideo ? 'Vertical clip rendering queued in background with local test media!' : 'Render job queued in background! Monitoring progress...', 'success');
         // Clear errors on success
         setCandidateErrors((prev) => {
           const next = { ...prev };
@@ -536,6 +536,22 @@ export const CandidatesPage: React.FC = () => {
 
     return 'MEDIA_UNAVAILABLE';
   };
+
+  // Poll candidate status continuously if any are rendering or acquiring
+  useEffect(() => {
+    const hasActiveRendering = directCandidates.some((c) => {
+      const state = getCandidateRenderState(c);
+      return state === 'RENDER_IN_PROGRESS' || state === 'MEDIA_ACQUIRING';
+    });
+
+    if (!hasActiveRendering) return;
+
+    const interval = setInterval(() => {
+      executeCandidateFetch();
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [directCandidates, executeCandidateFetch]);
 
   const getRenderStateBadge = (renderState: string) => {
     switch (renderState) {

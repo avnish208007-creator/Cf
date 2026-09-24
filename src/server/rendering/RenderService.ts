@@ -46,8 +46,99 @@ export class RenderService {
     this.supabase = supabaseClient !== undefined ? supabaseClient : getSupabaseServerClient();
   }
 
-  public getJob(jobId: string): RenderJobState | undefined {
-    return RenderService.jobsMap.get(jobId);
+  public async getJob(jobId: string): Promise<RenderJobState | undefined> {
+    const memJob = RenderService.jobsMap.get(jobId);
+    if (memJob) {
+      return memJob;
+    }
+    if (this.supabase) {
+      try {
+        const { data, error } = await this.supabase
+          .from('jobs')
+          .select('*')
+          .eq('id', jobId)
+          .maybeSingle();
+
+        if (data && !error) {
+          let mappedStatus: RenderJobState['status'] = 'queued';
+          if (data.status === 'completed') mappedStatus = 'completed';
+          else if (data.status === 'failed') mappedStatus = 'failed';
+          else if (data.status === 'running') {
+            if (['queued', 'acquiring_media', 'media_acquired', 'validating_media', 'rendering', 'validating_output', 'uploading', 'persisting'].includes(data.stage)) {
+              mappedStatus = data.stage as RenderJobState['status'];
+            } else {
+              mappedStatus = 'rendering';
+            }
+          }
+
+          return {
+            id: data.id,
+            workspaceId: data.workspace_id,
+            candidateId: data.target_title.replace('Render Clip: ', ''),
+            status: mappedStatus,
+            stage: data.stage,
+            progress: data.progress,
+            createdAt: data.started_at,
+            updatedAt: data.completed_at || data.started_at,
+          };
+        }
+      } catch (_) {}
+    }
+    return undefined;
+  }
+
+  private async updateJobState(
+    jobState: RenderJobState,
+    status: RenderJobState['status'],
+    stage: string,
+    progress?: number,
+    extra: Partial<RenderJobState> = {}
+  ) {
+    jobState.status = status;
+    jobState.stage = stage;
+    if (progress !== undefined) {
+      jobState.progress = progress;
+    }
+    Object.assign(jobState, extra);
+    jobState.updatedAt = new Date().toISOString();
+    RenderService.jobsMap.set(jobState.id, jobState);
+
+    if (this.supabase) {
+      try {
+        const dbStatus =
+          status === 'queued'
+            ? 'queued'
+            : status === 'completed'
+            ? 'completed'
+            : status === 'failed'
+            ? 'failed'
+            : 'running';
+
+        const dbPayload: any = {
+          id: jobState.id,
+          workspace_id: jobState.workspaceId,
+          type: 'vertical_render',
+          target_title: `Render Clip: ${jobState.candidateId}`,
+          progress: progress !== undefined ? Math.round(progress) : 0,
+          stage: stage,
+          status: dbStatus,
+        };
+
+        if (status === 'completed') {
+          dbPayload.completed_at = new Date().toISOString();
+        }
+
+        const { error } = await this.supabase
+          .from('jobs')
+          .upsert(dbPayload, { onConflict: 'id' });
+
+        if (error) {
+          console.warn(`[RenderService] Failed to upsert job in DB: ${error.message}`);
+        }
+      } catch (dbErr: any) {
+        console.warn(`[RenderService] Database error updating job:`, dbErr?.message);
+      }
+    }
   }
 
   /**
@@ -63,7 +154,7 @@ export class RenderService {
    * → completed / failed
    */
   public async renderCandidateToVerticalClip(request: RenderRequest): Promise<RenderResult> {
-    const jobId = `job_rend_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const jobId = request.jobId || `job_rend_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const clipId = `clip_${request.candidateId.slice(0, 12)}_${Date.now()}`;
 
     console.log(`[Render] render started: candidate ${request.candidateId} in workspace ${request.workspaceId}`);
@@ -75,10 +166,12 @@ export class RenderService {
       candidateId: request.candidateId,
       status: 'queued',
       stage: 'queued',
+      progress: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     RenderService.jobsMap.set(jobId, jobState);
+    await this.updateJobState(jobState, 'queued', 'queued', 0);
 
     try {
       // 1. SOURCE LOOKUP (Fetch corresponding source_videos record from Supabase)
@@ -116,9 +209,7 @@ export class RenderService {
       );
 
       // Stage: acquiring_media
-      jobState.status = 'acquiring_media';
-      jobState.stage = 'Acquiring source media...';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'acquiring_media', 'acquiring_media', 10);
 
       // 3. SOURCE MEDIA ACQUISITION
       const media = await this.mediaProvider.acquire({
@@ -136,11 +227,10 @@ export class RenderService {
         
         console.log(`[Render] render failed: ${failMsg}`);
 
-        jobState.status = 'failed';
-        jobState.stage = failMsg;
-        jobState.errorCode = 'MEDIA_ACQUISITION_FAILED';
-        jobState.errorMessage = failMsg;
-        jobState.updatedAt = new Date().toISOString();
+        await this.updateJobState(jobState, 'failed', failMsg, 10, {
+          errorCode: 'MEDIA_ACQUISITION_FAILED',
+          errorMessage: failMsg,
+        });
 
         // Update candidate with failed status
         if (this.supabase && request.candidateId.length === 36) {
@@ -191,11 +281,10 @@ export class RenderService {
         
         console.error(`[Render] render blocked by provenance policy: ${failMsg}`);
 
-        jobState.status = 'failed';
-        jobState.stage = failMsg;
-        jobState.errorCode = 'MEDIA_ACQUISITION_FAILED';
-        jobState.errorMessage = failMsg;
-        jobState.updatedAt = new Date().toISOString();
+        await this.updateJobState(jobState, 'failed', failMsg, 10, {
+          errorCode: 'MEDIA_ACQUISITION_FAILED',
+          errorMessage: failMsg,
+        });
 
         return {
           success: false,
@@ -213,14 +302,10 @@ export class RenderService {
       }
 
       // Stage: media_acquired
-      jobState.status = 'media_acquired';
-      jobState.stage = 'Media acquired successfully';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'media_acquired', 'media_acquired', 20);
 
       // Stage: validating_media
-      jobState.status = 'validating_media';
-      jobState.stage = 'Validating acquired source media...';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'validating_media', 'validating_media', 25);
 
       // 4. REAL MEDIA INPUT VALIDATION
       const validation = validateRealVideo(media.mediaPath);
@@ -233,11 +318,10 @@ export class RenderService {
         const failMsg = `${errorCode}: ${validationError}`;
         console.error(`[Render] ${failMsg}`);
 
-        jobState.status = 'failed';
-        jobState.stage = failMsg;
-        jobState.errorCode = errorCode;
-        jobState.errorMessage = failMsg;
-        jobState.updatedAt = new Date().toISOString();
+        await this.updateJobState(jobState, 'failed', failMsg, 25, {
+          errorCode,
+          errorMessage: failMsg,
+        });
 
         // NO clip generated, fail honestly
         return {
@@ -285,11 +369,10 @@ export class RenderService {
         if (effectiveDurationSec <= 0) {
           const errMsg = `SOURCE_TIMESTAMP_OUT_OF_RANGE: Requested clip duration is invalid or non-positive (${effectiveDurationSec}s).`;
           console.error(`[Render] ${errMsg}`);
-          jobState.status = 'failed';
-          jobState.stage = errMsg;
-          jobState.errorCode = 'SOURCE_TIMESTAMP_OUT_OF_RANGE';
-          jobState.errorMessage = errMsg;
-          jobState.updatedAt = new Date().toISOString();
+          await this.updateJobState(jobState, 'failed', errMsg, 25, {
+            errorCode: 'SOURCE_TIMESTAMP_OUT_OF_RANGE',
+            errorMessage: errMsg,
+          });
           return {
             success: false,
             clipId,
@@ -307,11 +390,10 @@ export class RenderService {
         if (effectiveStartSec >= inputInspection.durationSeconds || effectiveStartSec < 0) {
           const errMsg = `SOURCE_TIMESTAMP_OUT_OF_RANGE: Requested start time (${effectiveStartSec}s) is out of range of the source video duration (${inputInspection.durationSeconds}s).`;
           console.error(`[Render] ${errMsg}`);
-          jobState.status = 'failed';
-          jobState.stage = errMsg;
-          jobState.errorCode = 'SOURCE_TIMESTAMP_OUT_OF_RANGE';
-          jobState.errorMessage = errMsg;
-          jobState.updatedAt = new Date().toISOString();
+          await this.updateJobState(jobState, 'failed', errMsg, 25, {
+            errorCode: 'SOURCE_TIMESTAMP_OUT_OF_RANGE',
+            errorMessage: errMsg,
+          });
           return {
             success: false,
             clipId,
@@ -329,11 +411,10 @@ export class RenderService {
         if (effectiveStartSec + effectiveDurationSec > inputInspection.durationSeconds) {
           const errMsg = `SOURCE_TIMESTAMP_OUT_OF_RANGE: Requested clip interval ends at ${effectiveStartSec + effectiveDurationSec}s, exceeding the source video duration (${inputInspection.durationSeconds}s).`;
           console.error(`[Render] ${errMsg}`);
-          jobState.status = 'failed';
-          jobState.stage = errMsg;
-          jobState.errorCode = 'SOURCE_TIMESTAMP_OUT_OF_RANGE';
-          jobState.errorMessage = errMsg;
-          jobState.updatedAt = new Date().toISOString();
+          await this.updateJobState(jobState, 'failed', errMsg, 25, {
+            errorCode: 'SOURCE_TIMESTAMP_OUT_OF_RANGE',
+            errorMessage: errMsg,
+          });
           return {
             success: false,
             clipId,
@@ -351,9 +432,7 @@ export class RenderService {
       }
 
       // Stage: rendering
-      jobState.status = 'rendering';
-      jobState.stage = 'Rendering vertical 9:16 MP4...';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'rendering', 'rendering', 50);
 
       // 5. 9:16 REFRAME & AUDIO PREPARATION
       const reframe = this.verticalReframer.buildReframeFilter({
@@ -403,9 +482,7 @@ export class RenderService {
       });
 
       // Stage: validating_output
-      jobState.status = 'validating_output';
-      jobState.stage = 'Validating render output...';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'validating_output', 'validating_output', 75);
 
       // 7. REAL OUTPUT VERIFICATION (Strict validation check)
       const outputValidation = validateRealVideo(rendered.outputMp4Path);
@@ -414,11 +491,10 @@ export class RenderService {
         const failMsg = `RENDER_OUTPUT_INVALID: ${outError}`;
         console.error(`[Render] ${failMsg}`);
 
-        jobState.status = 'failed';
-        jobState.stage = failMsg;
-        jobState.errorCode = 'RENDER_OUTPUT_INVALID';
-        jobState.errorMessage = failMsg;
-        jobState.updatedAt = new Date().toISOString();
+        await this.updateJobState(jobState, 'failed', failMsg, 75, {
+          errorCode: 'RENDER_OUTPUT_INVALID',
+          errorMessage: failMsg,
+        });
 
         return {
           success: false,
@@ -442,11 +518,10 @@ export class RenderService {
         const failMsg = crossMatch.reason || 'Visual cross-validation between source and rendered output failed.';
         console.error(`[Render] ${failMsg}`);
 
-        jobState.status = 'failed';
-        jobState.stage = failMsg;
-        jobState.errorCode = 'OUTPUT_VISUAL_MISMATCH';
-        jobState.errorMessage = failMsg;
-        jobState.updatedAt = new Date().toISOString();
+        await this.updateJobState(jobState, 'failed', failMsg, 75, {
+          errorCode: 'OUTPUT_VISUAL_MISMATCH',
+          errorMessage: failMsg,
+        });
 
         return {
           success: false,
@@ -467,8 +542,7 @@ export class RenderService {
       const outputInspection = outputValidation.inspection;
 
       // Stage: uploading
-      jobState.status = 'uploading';
-      jobState.stage = 'Uploading vertical clip to storage...';
+      await this.updateJobState(jobState, 'uploading', 'uploading', 90);
       jobState.updatedAt = new Date().toISOString();
 
       // 8. UPLOAD TO STORAGE & PERSIST TO DB
@@ -576,9 +650,7 @@ export class RenderService {
       }
 
       // Stage: persisting
-      jobState.status = 'persisting';
-      jobState.stage = 'Persisting vertical clip data in database...';
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'persisting', 'persisting', 95);
 
       if (this.supabase) {
         try {
@@ -646,11 +718,9 @@ export class RenderService {
       }
 
       // Stage: completed
-      jobState.status = 'completed';
-      jobState.stage = 'Render complete';
-      jobState.outputUrl = finalVideoUrl;
-      jobState.progress = 100;
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'completed', 'completed', 100, {
+        outputUrl: finalVideoUrl,
+      });
 
       return {
         success: true,
@@ -682,11 +752,10 @@ export class RenderService {
       else if (errorMsg.includes('OUTPUT_MEDIA_STATIC')) errorCode = 'OUTPUT_MEDIA_STATIC';
       else if (errorMsg.includes('DATABASE_PERSISTENCE_FAILED')) errorCode = 'DATABASE_PERSISTENCE_FAILED';
 
-      jobState.status = 'failed';
-      jobState.stage = errorMsg;
-      jobState.errorCode = errorCode;
-      jobState.errorMessage = errorMsg;
-      jobState.updatedAt = new Date().toISOString();
+      await this.updateJobState(jobState, 'failed', errorMsg, jobState.progress || 0, {
+        errorCode,
+        errorMessage: errorMsg,
+      });
 
       if (this.supabase && request.candidateId.length === 36) {
         try {

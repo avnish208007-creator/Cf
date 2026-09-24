@@ -42,6 +42,7 @@ export interface RenderRequest {
   subtitles?: SubtitleConfig;
   branding?: BrandingConfig;
   isDevTest?: boolean;
+  jobId?: string;
 }
 
 export interface MediaSourceInfo {

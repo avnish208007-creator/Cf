@@ -1,7 +1,5 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { RenderService } from '../../src/server/rendering/RenderService';
 import { getSupabaseServerClient } from '../../src/server/discovery/pipeline';
-import { RenderRequest } from '../../src/server/rendering/types';
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -74,42 +72,122 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     }
 
     const supabase = getSupabaseServerClient(userAccessToken);
-    const renderService = new RenderService(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      supabase
-    );
+    if (!supabase) {
+      return {
+        statusCode: 500,
+        headers: defaultHeaders,
+        body: JSON.stringify({
+          success: false,
+          error: 'DATABASE_UNAVAILABLE',
+          message: 'Could not connect to database.',
+        }),
+      };
+    }
 
-    const renderRequest: RenderRequest = {
-      candidateId,
-      workspaceId,
-      sourceVideoId,
-      sourceTitle: sourceTitle || 'Discovered Video',
-      channelTitle: channelTitle || 'Creator Channel',
-      startTime: startTime || '00:00',
-      endTime: endTime || '00:30',
-      durationSeconds: Number(durationSeconds) || undefined,
-      hook: hook || 'Key takeaway insight.',
-      transcriptText: transcriptText || hook || '',
-      summary: summary || '',
-      sourceYoutubeUrl,
-      mediaUrl,
-      mediaPath,
-      reframeMode,
-      subtitles,
-      branding,
-    };
+    // 1. PREVENT DUPLICATE RENDERS Check
+    const { data: candidate } = await supabase
+      .from('clip_candidates')
+      .select('*')
+      .eq('id', candidateId)
+      .maybeSingle();
 
-    const result = await renderService.renderCandidateToVerticalClip(renderRequest);
+    if (candidate && candidate.factors && candidate.factors.activeJobId) {
+      const activeJobId = candidate.factors.activeJobId;
+      const { data: job } = await supabase
+        .from('jobs')
+        .select('*')
+        .eq('id', activeJobId)
+        .maybeSingle();
+
+      if (job && (job.status === 'queued' || job.status === 'running')) {
+        console.log(`[netlify/functions/render] Active job already exists: ${activeJobId}`);
+        return {
+          statusCode: 202,
+          headers: defaultHeaders,
+          body: JSON.stringify({
+            success: true,
+            jobId: activeJobId,
+            status: 'queued',
+            message: 'An active render is already in progress for this candidate. Reusing job.'
+          }),
+        };
+      }
+    }
+
+    // 2. CREATE A NEW JOB ROW
+    const jobId = 'job_rend_' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 6);
+    const { error: jobInsertErr } = await supabase
+      .from('jobs')
+      .insert({
+        id: jobId,
+        workspace_id: workspaceId,
+        type: 'vertical_render',
+        target_title: `Render Clip: ${candidateId}`,
+        progress: 0,
+        stage: 'queued',
+        status: 'queued',
+      });
+
+    if (jobInsertErr) {
+      return {
+        statusCode: 500,
+        headers: defaultHeaders,
+        body: JSON.stringify({
+          success: false,
+          error: 'DATABASE_FAILURE',
+          message: 'Could not create rendering job: ' + jobInsertErr.message,
+        }),
+      };
+    }
+
+    // Update candidate to 'generating'
+    const existingFactors = (candidate?.factors || {}) as any;
+    await supabase
+      .from('clip_candidates')
+      .update({
+        status: 'generating',
+        factors: {
+          ...existingFactors,
+          renderStatus: 'rendering',
+          activeJobId: jobId,
+        }
+      })
+      .eq('id', candidateId);
+
+    // 3. TRIGGER NETLIFY BACKGROUND FUNCTION
+    const protocol = event.headers['x-forwarded-proto'] || 'https';
+    const host = event.headers.host;
+    const triggerUrl = `${protocol}://${host}/.netlify/functions/render-background`;
+
+    console.log(`[netlify/functions/render] Triggering background function at: ${triggerUrl} with jobId ${jobId}`);
+
+    // Call the background function asynchronously
+    try {
+      await fetch(triggerUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader,
+        },
+        body: JSON.stringify({
+          payload,
+          jobId,
+          userAccessToken,
+        }),
+      });
+    } catch (triggerErr: any) {
+      console.error('[netlify/functions/render] Warning triggering background function:', triggerErr?.message);
+    }
 
     return {
-      statusCode: result.success ? 200 : 422,
+      statusCode: 202,
       headers: defaultHeaders,
-      body: JSON.stringify(result),
+      body: JSON.stringify({
+        success: true,
+        jobId,
+        status: 'queued',
+        message: 'Render job accepted and executing in background.',
+      }),
     };
   } catch (err: any) {
     console.error('[netlify/functions/render] error:', err);

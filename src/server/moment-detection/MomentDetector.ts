@@ -102,77 +102,98 @@ Respond ONLY with a valid JSON array matching this exact schema:
 
     // Try primary and fallback Gemini models
     const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+    const maxRetries = 2;
 
     for (const modelName of candidateModels) {
-      try {
-        const response = await this.ai.models.generateContent({
-          model: modelName,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-          },
-        });
+      let attempt = 0;
+      let success = false;
+      let resultData: RawMomentCandidate[] = [];
 
-        const responseText = response.text?.trim() || '[]';
-        const parsed = JSON.parse(responseText);
-
-        if (!Array.isArray(parsed)) {
-          return [];
-        }
-
-        return parsed
-          .filter((item: any) => item && item.startTime && item.endTime && item.hook)
-          .map((item: any) => {
-            const durSec =
-              Number(item.durationSeconds) ||
-              this.calculateDurationSeconds(item.startTime, item.endTime);
-            return {
-              startTime: item.startTime,
-              endTime: item.endTime,
-              duration: `${durSec}s`,
-              durationSeconds: durSec,
-              transcriptText: item.transcriptText || item.hook,
-              hook: item.hook,
-              contextSummary: item.contextSummary || 'Context for candidate moment.',
-              payoff: item.payoff || 'Key takeaway.',
-              preliminaryReason: item.preliminaryReason || '',
-            };
+      while (attempt <= maxRetries && !success) {
+        try {
+          const response = await this.ai.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+            },
           });
-      } catch (err: any) {
-        const errString = typeof err === 'object' ? JSON.stringify(err) : String(err);
-        const errMessage = err?.message || '';
-        const isQuotaOrRateLimit =
-          err?.status === 'UNAVAILABLE' ||
-          err?.status === 'RESOURCE_EXHAUSTED' ||
-          err?.code === 503 ||
-          err?.status === 503 ||
-          err?.code === 429 ||
-          err?.status === 429 ||
-          err?.error?.code === 429 ||
-          err?.error?.status === 'RESOURCE_EXHAUSTED' ||
-          errMessage.includes('429') ||
-          errMessage.includes('RESOURCE_EXHAUSTED') ||
-          errMessage.includes('Quota exceeded') ||
-          errMessage.includes('quota') ||
-          errMessage.includes('rate limit') ||
-          errMessage.includes('high demand') ||
-          errMessage.includes('overloaded') ||
-          errString.includes('429') ||
-          errString.includes('RESOURCE_EXHAUSTED') ||
-          errString.includes('Quota exceeded') ||
-          errString.includes('quota');
 
-        if (isQuotaOrRateLimit) {
+          const responseText = response.text?.trim() || '[]';
+          const parsed = JSON.parse(responseText);
+
+          if (!Array.isArray(parsed)) {
+            resultData = [];
+          } else {
+            resultData = parsed
+              .filter((item: any) => item && item.startTime && item.endTime && item.hook)
+              .map((item: any) => {
+                const durSec =
+                  Number(item.durationSeconds) ||
+                  this.calculateDurationSeconds(item.startTime, item.endTime);
+                return {
+                  startTime: item.startTime,
+                  endTime: item.endTime,
+                  duration: `${durSec}s`,
+                  durationSeconds: durSec,
+                  transcriptText: item.transcriptText || item.hook,
+                  hook: item.hook,
+                  contextSummary: item.contextSummary || 'Context for candidate moment.',
+                  payoff: item.payoff || 'Key takeaway.',
+                  preliminaryReason: item.preliminaryReason || '',
+                };
+              });
+          }
+          success = true;
+        } catch (err: any) {
+          attempt++;
+          const errString = typeof err === 'object' ? JSON.stringify(err) : String(err);
+          const errMessage = err?.message || '';
+          
+          const isTransient =
+            err?.status === 'UNAVAILABLE' ||
+            err?.status === 'RESOURCE_EXHAUSTED' ||
+            err?.code === 503 ||
+            err?.status === 503 ||
+            err?.code === 429 ||
+            err?.status === 429 ||
+            err?.error?.code === 429 ||
+            err?.error?.status === 'RESOURCE_EXHAUSTED' ||
+            errMessage.includes('429') ||
+            errMessage.includes('RESOURCE_EXHAUSTED') ||
+            errMessage.includes('Quota exceeded') ||
+            errMessage.includes('quota') ||
+            errMessage.includes('rate limit') ||
+            errMessage.includes('high demand') ||
+            errMessage.includes('overloaded') ||
+            errMessage.includes('fetch failed') ||
+            errMessage.includes('network') ||
+            errMessage.includes('timeout') ||
+            errMessage.includes('connect') ||
+            errString.includes('429') ||
+            errString.includes('RESOURCE_EXHAUSTED') ||
+            errString.includes('Quota exceeded') ||
+            errString.includes('quota') ||
+            errString.includes('fetch failed') ||
+            errString.includes('connect');
+
+          if (isTransient && attempt <= maxRetries) {
+            console.warn(
+              `[GeminiMomentDetector] Model ${modelName} call failed (attempt ${attempt}/${maxRetries + 1}): ${errMessage || errString}. Retrying in 800ms...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, 800));
+            continue;
+          }
+
           console.warn(
-            `[GeminiMomentDetector] Model ${modelName} hit rate limit or quota limit, falling back to next available model or heuristic detector...`
+            `[GeminiMomentDetector] Model ${modelName} is temporarily unavailable after ${attempt} attempts.`
           );
-          continue;
+          break; // Break the retry loop, try next model
         }
+      }
 
-        console.warn(
-          `[GeminiMomentDetector] Model ${modelName} execution error:`,
-          errMessage || errString
-        );
+      if (success) {
+        return resultData;
       }
     }
 

@@ -52,6 +52,79 @@ export async function handleRenderRequest(req: Request, res: Response) {
     }
 
     const supabase = getSupabaseServerClient(userAccessToken);
+    if (!supabase) {
+      return res.status(500).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'Database connection could not be established.',
+      });
+    }
+
+    // 1. PREVENT DUPLICATE RENDERS Check
+    const { data: candidate } = await supabase
+      .from('clip_candidates')
+      .select('*')
+      .eq('id', candidateId)
+      .maybeSingle();
+
+    if (candidate && candidate.factors && candidate.factors.activeJobId) {
+      const activeJobId = candidate.factors.activeJobId;
+      // Check if job exists and is still active
+      const { data: job } = await supabase
+        .from('jobs')
+        .select('*')
+        .eq('id', activeJobId)
+        .maybeSingle();
+
+      if (job && (job.status === 'queued' || job.status === 'running')) {
+        console.log(`[handleRenderRequest] Active job already exists for candidate ${candidateId}: ${activeJobId}`);
+        return res.status(202).json({
+          success: true,
+          jobId: activeJobId,
+          status: 'queued',
+          message: 'An active render is already in progress for this candidate. Reusing job.'
+        });
+      }
+    }
+
+    const jobId = 'job_rend_' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 6);
+
+    // Create a jobs row in Supabase
+    const { error: jobInsertErr } = await supabase
+      .from('jobs')
+      .insert({
+        id: jobId,
+        workspace_id: workspaceId,
+        type: 'vertical_render',
+        target_title: `Render Clip: ${candidateId}`,
+        progress: 0,
+        stage: 'queued',
+        status: 'queued',
+      });
+
+    if (jobInsertErr) {
+      console.error('[handleRenderRequest] Failed to create job row:', jobInsertErr.message);
+      return res.status(500).json({
+        success: false,
+        error: 'DATABASE_FAILURE',
+        message: 'Could not create a rendering background job: ' + jobInsertErr.message,
+      });
+    }
+
+    // Update candidate status to 'generating' and activeJobId
+    const existingFactors = (candidate?.factors || {}) as any;
+    await supabase
+      .from('clip_candidates')
+      .update({
+        status: 'generating',
+        factors: {
+          ...existingFactors,
+          renderStatus: 'rendering',
+          activeJobId: jobId,
+        }
+      })
+      .eq('id', candidateId);
+
     const renderService = new RenderService(
       undefined,
       undefined,
@@ -81,11 +154,20 @@ export async function handleRenderRequest(req: Request, res: Response) {
       subtitles,
       branding,
       isDevTest: false,
+      jobId,
     };
 
-    const result = await renderService.renderCandidateToVerticalClip(renderRequest);
+    // Run rendering asynchronously in the background for local / AI Studio Preview server
+    renderService.renderCandidateToVerticalClip(renderRequest).catch((err) => {
+      console.error('[handleRenderRequest] Asynchronous render background exception:', err);
+    });
 
-    return res.status(result.success ? 200 : 422).json(result);
+    return res.status(202).json({
+      success: true,
+      jobId,
+      status: 'queued',
+      message: 'Render job accepted and queued in background.',
+    });
   } catch (err: any) {
     console.error('[handleRenderRequest] Unhandled error:', err);
     return res.status(500).json({
@@ -168,10 +250,10 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
   }
 }
 
-export function handleRenderJobStatus(req: Request, res: Response) {
+export async function handleRenderJobStatus(req: Request, res: Response) {
   const { jobId } = req.params;
   const renderService = new RenderService();
-  const job = renderService.getJob(jobId);
+  const job = await renderService.getJob(jobId);
 
   if (!job) {
     return res.status(404).json({
