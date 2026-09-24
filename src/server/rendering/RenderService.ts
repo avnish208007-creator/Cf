@@ -127,6 +127,7 @@ export class RenderService {
         title: resolvedTitle,
         mediaUrl: resolvedMediaUrl,
         mediaPath: resolvedMediaPath,
+        isDevTest: request.isDevTest,
       });
 
       if (!media.success || !media.mediaPath || !fs.existsSync(media.mediaPath)) {
@@ -165,6 +166,36 @@ export class RenderService {
               .eq('id', request.candidateId);
           } catch (_) {}
         }
+
+        return {
+          success: false,
+          clipId,
+          jobId,
+          status: 'failed',
+          durationSeconds: trim.durationSec,
+          durationFormatted: trim.durationFormatted,
+          aspectRatio: '9:16',
+          width: 1080,
+          height: 1920,
+          errorCode: 'MEDIA_ACQUISITION_FAILED',
+          errorMessage: failMsg,
+        };
+      }
+
+      // 3.5. STRICT MEDIA PROVENANCE CONTRACT
+      const isDevRender = request.isDevTest === true || !!(resolvedYoutubeUrl && resolvedYoutubeUrl.includes('carD3hvum64')) || !!(request.candidateId && request.candidateId.includes('carD3hvum64'));
+      const isDevMedia = media.mediaOrigin === 'DEVELOPMENT_TEST';
+      if (!isDevRender && isDevMedia) {
+        const errorReason = 'Security Contract Violation: DEVELOPMENT_TEST media origin is forbidden for normal production candidates.';
+        const failMsg = `MEDIA_ACQUISITION_FAILED\n\nProvenance policy block:\n${errorReason}`;
+        
+        console.error(`[Render] render blocked by provenance policy: ${failMsg}`);
+
+        jobState.status = 'failed';
+        jobState.stage = failMsg;
+        jobState.errorCode = 'MEDIA_ACQUISITION_FAILED';
+        jobState.errorMessage = failMsg;
+        jobState.updatedAt = new Date().toISOString();
 
         return {
           success: false,
@@ -225,10 +256,25 @@ export class RenderService {
       }
 
       const inputInspection = validation.inspection;
+      
+      console.log('--------------------------------------------');
+      console.log('[PIPELINE LOG] SOURCE ACQUISITION METRICS:');
+      console.log(`SOURCE URL: ${resolvedYoutubeUrl || resolvedMediaUrl || 'N/A'}`);
+      console.log(`SOURCE PROVIDER: ${media.provider || 'Unknown'}`);
+      console.log(`ACQUISITION PROVIDER: ${media.provider || 'Unknown'}`);
+      console.log(`MEDIA PATH: ${media.mediaPath || 'N/A'}`);
+      console.log(`MEDIA FILE SIZE: ${inputInspection.fileSizeBytes || 'Unknown'} bytes`);
+      console.log(`MEDIA MIME TYPE: ${inputInspection.mimeType || 'video/mp4'}`);
+      console.log(`VIDEO CODEC: ${inputInspection.videoCodec || 'Unknown'}`);
+      console.log(`VIDEO DURATION: ${inputInspection.durationSeconds || 'Unknown'} seconds`);
+      console.log(`VIDEO DIMENSIONS: ${inputInspection.width || 'Unknown'}x${inputInspection.height || 'Unknown'}`);
+      console.log(`AUDIO CODEC: ${inputInspection.audioCodec || 'None'}`);
+      console.log('--------------------------------------------');
+
       let effectiveStartSec = trim.startSec;
       let effectiveDurationSec = trim.durationSec;
 
-      const isDevVideo = (media.provider && media.provider.includes('DevelopmentMediaProvider')) || (media.mediaPath && media.mediaPath.includes('dev_moving_test'));
+      const isDevVideo = media.mediaOrigin === 'DEVELOPMENT_TEST';
       if (isDevVideo) {
         console.log('[Render] Development test video detected. Mapping requested interval to fit within the 15-second synthetic video.');
         effectiveStartSec = 2;
@@ -236,6 +282,28 @@ export class RenderService {
       }
 
       if (inputInspection.durationSeconds && inputInspection.durationSeconds > 0) {
+        if (effectiveDurationSec <= 0) {
+          const errMsg = `SOURCE_TIMESTAMP_OUT_OF_RANGE: Requested clip duration is invalid or non-positive (${effectiveDurationSec}s).`;
+          console.error(`[Render] ${errMsg}`);
+          jobState.status = 'failed';
+          jobState.stage = errMsg;
+          jobState.errorCode = 'SOURCE_TIMESTAMP_OUT_OF_RANGE';
+          jobState.errorMessage = errMsg;
+          jobState.updatedAt = new Date().toISOString();
+          return {
+            success: false,
+            clipId,
+            jobId,
+            status: 'failed',
+            durationSeconds: 0,
+            durationFormatted: '00:00',
+            aspectRatio: '9:16',
+            width: 1080,
+            height: 1920,
+            errorCode: 'SOURCE_TIMESTAMP_OUT_OF_RANGE',
+            errorMessage: errMsg,
+          };
+        }
         if (effectiveStartSec >= inputInspection.durationSeconds || effectiveStartSec < 0) {
           const errMsg = `SOURCE_TIMESTAMP_OUT_OF_RANGE: Requested start time (${effectiveStartSec}s) is out of range of the source video duration (${inputInspection.durationSeconds}s).`;
           console.error(`[Render] ${errMsg}`);

@@ -80,6 +80,7 @@ export async function handleRenderRequest(req: Request, res: Response) {
       reframeMode,
       subtitles,
       branding,
+      isDevTest: !!((sourceYoutubeUrl && sourceYoutubeUrl.includes('carD3hvum64')) || (candidateId && candidateId.includes('carD3hvum64'))),
     };
 
     const result = await renderService.renderCandidateToVerticalClip(renderRequest);
@@ -87,6 +88,78 @@ export async function handleRenderRequest(req: Request, res: Response) {
     return res.status(result.success ? 200 : 422).json(result);
   } catch (err: any) {
     console.error('[handleRenderRequest] Unhandled error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'RENDER_ERROR',
+      message: err.message || 'An unexpected error occurred during rendering.',
+    });
+  }
+}
+
+export async function handleDevRenderTestRequest(req: Request, res: Response) {
+  try {
+    const authHeader = req.headers.authorization;
+    let userAccessToken: string | undefined;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      userAccessToken = authHeader.slice(7).trim();
+    }
+
+    const {
+      candidateId,
+      workspaceId,
+      sourceVideoId,
+      sourceTitle,
+      channelTitle,
+      startTime,
+      endTime,
+      durationSeconds,
+      hook,
+      transcriptText,
+      summary,
+      sourceYoutubeUrl,
+      mediaUrl,
+      mediaPath,
+      reframeMode,
+      subtitles,
+      branding,
+    } = req.body || {};
+
+    const supabase = getSupabaseServerClient(userAccessToken);
+    const renderService = new RenderService(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      supabase
+    );
+
+    const renderRequest: RenderRequest = {
+      candidateId: candidateId || 'dev_test_candidate',
+      workspaceId: workspaceId || 'dev_test_workspace',
+      sourceVideoId: sourceVideoId || 'dev',
+      sourceTitle: sourceTitle || 'Development Synthetic Test Video (DEVELOPMENT ONLY)',
+      channelTitle: channelTitle || 'Dev Channel',
+      startTime: startTime || '00:02',
+      endTime: endTime || '00:10',
+      durationSeconds: 8,
+      hook: hook || 'This is a synthetic development render test.',
+      transcriptText: transcriptText || 'This is a synthetic development render test.',
+      summary: summary || 'Synthetic development test.',
+      sourceYoutubeUrl: 'dev',
+      mediaUrl: undefined,
+      mediaPath: undefined,
+      reframeMode: reframeMode || 'centered_crop',
+      subtitles,
+      branding,
+      isDevTest: true, // EXPLICIT TEST FLAG ALLOWED HERE
+    };
+
+    const result = await renderService.renderCandidateToVerticalClip(renderRequest);
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (err: any) {
+    console.error('[handleDevRenderTestRequest] Unhandled error:', err);
     return res.status(500).json({
       success: false,
       error: 'RENDER_ERROR',

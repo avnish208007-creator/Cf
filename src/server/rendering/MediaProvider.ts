@@ -20,7 +20,10 @@ export interface SourceVideoMediaRecord {
   mediaError?: string;
   mediaUpdatedAt?: string;
   durationSeconds?: number;
+  isDevTest?: boolean;
 }
+
+export type MediaProvenanceType = 'AUTHORIZED_DIRECT' | 'USER_OWNED' | 'LICENSED' | 'YOUTUBE_ACQUIRED' | 'DEVELOPMENT_TEST';
 
 export interface MediaProviderAcquireResult {
   success: boolean;
@@ -31,6 +34,7 @@ export interface MediaProviderAcquireResult {
   mimeType?: string;
   provider: string;
   mediaReference?: string;
+  mediaOrigin: MediaProvenanceType;
   errorCode?: string;
   errorMessage?: string;
   technicalDetails?: string;
@@ -79,6 +83,7 @@ export class DevelopmentMediaProvider implements IMediaProvider {
         mimeType: 'video/mp4',
         provider: this.name,
         mediaReference: 'dev_test_moving',
+        mediaOrigin: 'DEVELOPMENT_TEST',
       };
     }
 
@@ -116,6 +121,7 @@ export class DevelopmentMediaProvider implements IMediaProvider {
               mimeType: 'video/mp4',
               provider: this.name,
               mediaReference: 'dev_test_moving',
+              mediaOrigin: 'DEVELOPMENT_TEST',
             });
           } else {
             console.error(`[DevelopmentMediaProvider] FFmpeg failed with code ${code}. Stderr: ${stderr}`);
@@ -124,6 +130,7 @@ export class DevelopmentMediaProvider implements IMediaProvider {
               status: 'failed',
               acquisitionStatus: 'FAILED',
               provider: this.name,
+              mediaOrigin: 'DEVELOPMENT_TEST',
               errorCode: 'DEV_VIDEO_GENERATION_FAILED',
               errorMessage: `Failed to generate development reference testsrc video. Exit code: ${code}. Stderr: ${stderr.slice(-300)}`,
             });
@@ -136,6 +143,7 @@ export class DevelopmentMediaProvider implements IMediaProvider {
             status: 'failed',
             acquisitionStatus: 'FAILED',
             provider: this.name,
+            mediaOrigin: 'DEVELOPMENT_TEST',
             errorCode: 'DEV_VIDEO_GENERATION_FAILED',
             errorMessage: err.message,
           });
@@ -147,6 +155,7 @@ export class DevelopmentMediaProvider implements IMediaProvider {
           status: 'failed',
           acquisitionStatus: 'FAILED',
           provider: this.name,
+          mediaOrigin: 'DEVELOPMENT_TEST',
           errorCode: 'DEV_VIDEO_GENERATION_FAILED',
           errorMessage: err.message,
         });
@@ -188,6 +197,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
         status: 'unavailable',
         acquisitionStatus: 'UNAVAILABLE',
         provider: this.name,
+        mediaOrigin: 'AUTHORIZED_DIRECT',
         errorCode: 'NOT_A_DIRECT_URL',
       };
     }
@@ -206,6 +216,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
         status: 'unavailable',
         acquisitionStatus: 'UNSUPPORTED',
         provider: this.name,
+        mediaOrigin: 'AUTHORIZED_DIRECT',
         errorCode: 'UNSUPPORTED_MEDIA_URL_FORMAT',
       };
     }
@@ -224,6 +235,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
             status: 'failed',
             acquisitionStatus: 'FAILED',
             provider: this.name,
+            mediaOrigin: 'AUTHORIZED_DIRECT',
             errorCode: 'DIRECT_DOWNLOAD_HTTP_ERROR',
             errorMessage: `Direct download responded with HTTP ${response.statusCode}`,
           });
@@ -242,6 +254,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
               mimeType: 'video/mp4',
               provider: this.name,
               mediaReference: rawUrl,
+              mediaOrigin: 'AUTHORIZED_DIRECT',
             });
           } else {
             fs.unlink(targetFile, () => {});
@@ -250,6 +263,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
               status: 'failed',
               acquisitionStatus: 'FAILED',
               provider: this.name,
+              mediaOrigin: 'AUTHORIZED_DIRECT',
               errorCode: 'EMPTY_DOWNLOAD_FILE',
               errorMessage: 'Downloaded direct media file is empty or missing.',
             });
@@ -263,6 +277,7 @@ export class AuthorizedDirectMediaProvider implements IMediaProvider {
           status: 'failed',
           acquisitionStatus: 'FAILED',
           provider: this.name,
+          mediaOrigin: 'AUTHORIZED_DIRECT',
           errorCode: 'DOWNLOAD_NETWORK_ERROR',
           errorMessage: err.message,
         });
@@ -303,6 +318,7 @@ export class UserOwnedSourceProvider implements IMediaProvider {
           mimeType: 'video/mp4',
           provider: this.name,
           mediaReference: sourceVideo.mediaPath,
+          mediaOrigin: 'USER_OWNED',
         };
       }
     }
@@ -311,6 +327,7 @@ export class UserOwnedSourceProvider implements IMediaProvider {
       status: 'unavailable',
       acquisitionStatus: 'UNAVAILABLE',
       provider: this.name,
+      mediaOrigin: 'USER_OWNED',
       errorCode: 'LOCAL_FILE_MISSING',
       errorMessage: 'The requested local/user file does not exist on disk',
     };
@@ -345,6 +362,7 @@ export class LicensedMediaProvider implements IMediaProvider {
       status: 'unavailable',
       acquisitionStatus: 'UNAUTHORIZED',
       provider: this.name,
+      mediaOrigin: 'LICENSED',
       errorCode: 'LICENSED_ACCESS_REQUIRED',
       errorMessage: 'This source media requires licensing authentication.',
     };
@@ -375,6 +393,7 @@ export class UnsupportedSourceProvider implements IMediaProvider {
       status: 'failed',
       acquisitionStatus: 'UNSUPPORTED',
       provider: this.name,
+      mediaOrigin: 'DEVELOPMENT_TEST',
       errorCode: 'UNSUPPORTED_MEDIA_SOURCE',
       errorMessage: 'The selected source platform is unsupported in the current environment.',
     };
@@ -425,13 +444,11 @@ export class CompliantMediaProvider implements IMediaProvider {
     const rawUrl = (sourceVideo.youtubeUrl || sourceVideo.sourceUrl || sourceVideo.mediaUrl || '').trim();
     console.log(`[CompliantMediaProvider] Media acquisition started for ID ${sourceVideo.id}. URL: ${rawUrl}`);
 
-    const ytid = extractYouTubeId(rawUrl);
-    const isTestVideo = ytid === 'carD3hvum64' || sourceVideo.id?.includes('carD3hvum64') || rawUrl.includes('carD3hvum64');
-    const allowDevFallback = process.env.ALLOW_DEV_VIDEO_FALLBACK === 'true' || isTestVideo;
+    const isExplicitDevTest = sourceVideo.isDevTest || rawUrl === 'dev' || sourceVideo.id === 'dev' || rawUrl.includes('dev_moving_test') || rawUrl.includes('carD3hvum64') || !!(sourceVideo.id && sourceVideo.id.includes('carD3hvum64'));
 
-    // 1. Route to Development provider if marked or if we are using a test video/dev fallback
-    if (rawUrl === 'dev' || sourceVideo.id === 'dev' || rawUrl.includes('dev_moving_test') || allowDevFallback) {
-      console.log(`[CompliantMediaProvider] Routing to DEVELOPMENT ONLY provider due to explicit flag or test video ID (carD3hvum64)`);
+    // 1. Route to Development provider ONLY if explicitly requested/flagged as development test
+    if (isExplicitDevTest) {
+      console.log(`[CompliantMediaProvider] Routing to DEVELOPMENT ONLY provider due to explicit development test request`);
       return this.devProvider.acquire(sourceVideo);
     }
 
@@ -443,7 +460,7 @@ export class CompliantMediaProvider implements IMediaProvider {
     }
 
     // 3. Try Direct Stream Provider
-    if (rawUrl.startsWith('http')) {
+    if (rawUrl.startsWith('http') && !rawUrl.includes('youtube.com') && !rawUrl.includes('youtu.be')) {
       const directRes = await this.directProvider.acquire(sourceVideo);
       if (directRes.success) {
         console.log(`[CompliantMediaProvider] SUCCESS via Direct URL Provider`);
@@ -452,6 +469,7 @@ export class CompliantMediaProvider implements IMediaProvider {
     }
 
     // 4. Try YouTube (If direct YouTube ytdl fails due to Bot Security blocks, DO NOT bypass. Fail honestly!)
+    const ytid = extractYouTubeId(rawUrl);
     if (ytid || rawUrl.includes('youtube.com') || rawUrl.includes('youtu.be')) {
       console.log(`[CompliantMediaProvider] YouTube source detected. Attempting direct YouTube download...`);
       const ytVideoPath = path.join(this.tempDir, `yt_${sourceVideo.id.replace(/[^a-zA-Z0-9_-]/g, '_')}.mp4`);
@@ -468,6 +486,7 @@ export class CompliantMediaProvider implements IMediaProvider {
           mimeType: 'video/mp4',
           provider: this.name,
           mediaReference: rawUrl,
+          mediaOrigin: 'YOUTUBE_ACQUIRED',
         };
       }
 
@@ -478,6 +497,7 @@ export class CompliantMediaProvider implements IMediaProvider {
         status: 'failed',
         acquisitionStatus: 'UNAUTHORIZED',
         provider: this.name,
+        mediaOrigin: 'YOUTUBE_ACQUIRED',
         errorCode: 'MEDIA_ACQUISITION_FAILED',
         errorMessage: 'The selected source could not provide usable source media in the current runtime environment. YouTube stream download was unauthorized / blocked by bot protection.',
         technicalDetails: 'YouTube direct stream signature restriction encountered. Sign in/CAPTCHA verification required.',

@@ -12,6 +12,7 @@ import { handleClipsRequest } from './src/server/rendering/clipsHandler';
 import { handleValidateExistingClipsRequest } from './src/server/rendering/adminHandler';
 import {
   handleRenderRequest,
+  handleDevRenderTestRequest,
   handleRenderJobStatus,
   handleMediaStreaming,
 } from './src/server/rendering/renderHandler';
@@ -97,6 +98,7 @@ async function startServer() {
   app.options('/.netlify/functions/render', (req, res) => res.sendStatus(204));
   app.post('/api/render', handleRenderRequest);
   app.post('/.netlify/functions/render', handleRenderRequest);
+  app.post('/api/render-dev-test', handleDevRenderTestRequest);
   app.get('/api/render/jobs/:jobId', handleRenderJobStatus);
 
   // Static / Media streaming route for rendered clips and thumbnails

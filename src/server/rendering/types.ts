@@ -41,6 +41,7 @@ export interface RenderRequest {
   reframeMode?: 'centered_crop' | 'blurred_stack' | 'contain_pad';
   subtitles?: SubtitleConfig;
   branding?: BrandingConfig;
+  isDevTest?: boolean;
 }
 
 export interface MediaSourceInfo {

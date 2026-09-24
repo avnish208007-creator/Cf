@@ -351,7 +351,8 @@ export const CandidatesPage: React.FC = () => {
       };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const resp = await fetch('/api/render', {
+      const endpoint = forceTestVideo ? '/api/render-dev-test' : '/api/render';
+      const resp = await fetch(endpoint, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -366,9 +367,9 @@ export const CandidatesPage: React.FC = () => {
           hook: candidate.hook,
           transcriptText: candidate.transcriptText,
           summary: candidate.summary,
-          sourceYoutubeUrl: forceTestVideo ? 'dev' : candidate.sourceYoutubeUrl,
-          mediaUrl: forceTestVideo ? 'dev' : candidate.mediaUrl,
-          mediaPath: forceTestVideo ? undefined : candidate.mediaPath,
+          sourceYoutubeUrl: candidate.sourceYoutubeUrl,
+          mediaUrl: candidate.mediaUrl,
+          mediaPath: candidate.mediaPath,
         }),
       });
 
@@ -1028,7 +1029,7 @@ export const CandidatesPage: React.FC = () => {
                               title="Generates high-definition local moving media with an HD test pattern and sine audio using FFmpeg, completely bypassing YouTube blocking filters."
                             >
                               <Sparkles className="w-3 h-3" />
-                              <span>Render with Local Test Video</span>
+                              <span>Render with Local Test Video (DEVELOPMENT ONLY)</span>
                             </button>
                           </div>
                         </div>
@@ -1160,7 +1161,7 @@ export const CandidatesPage: React.FC = () => {
                           title="Generates high-definition local moving media with an HD test pattern and sine audio using FFmpeg, completely bypassing YouTube blocking filters."
                         >
                           <Sparkles className="w-3.5 h-3.5" />
-                          <span>Use Test Video</span>
+                          <span>Use Test Video (DEVELOPMENT ONLY)</span>
                         </button>
                         <button
                           onClick={() => handleRenderCandidate(candidate)}
