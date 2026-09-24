@@ -1,0 +1,8 @@
+1
+00:00:00,000 --> 00:00:03,950
+This is a high signal technical
+
+2
+00:00:04,000 --> 00:00:07,950
+hook. Watch closely to learn!
+

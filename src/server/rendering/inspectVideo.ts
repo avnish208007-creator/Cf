@@ -93,17 +93,43 @@ export function inspectVideoFile(filePath: string): VideoInspectionResult {
   }
 }
 
-export function getFrameMd5(filePath: string, timeSec: number): string | null {
+export function getFrameRawRGB(filePath: string, timeSec: number, size: number = 16): Buffer | null {
   try {
-    const cmd = `ffmpeg -y -ss ${timeSec} -i "${filePath}" -vframes 1 -s 16x16 -f rawvideo -pix_fmt rgb24 - 2>/dev/null`;
+    const cmd = `ffmpeg -y -ss ${timeSec} -i "${filePath}" -vframes 1 -s ${size}x${size} -f rawvideo -pix_fmt rgb24 - 2>/dev/null`;
     const buffer = execSync(cmd, { timeout: 4000, stdio: ['pipe', 'pipe', 'ignore'] });
-    if (buffer && buffer.length > 0) {
-      return crypto.createHash('md5').update(buffer).digest('hex');
+    if (buffer && buffer.length === size * size * 3) {
+      return buffer;
     }
   } catch (err) {
-    // Bypassed or failed silently
+    // Silently continue
   }
   return null;
+}
+
+export function calculateCorrelation(bufA: Buffer, bufB: Buffer): number {
+  if (bufA.length !== bufB.length) return 0;
+  let sumA = 0, sumB = 0;
+  for (let i = 0; i < bufA.length; i++) {
+    sumA += bufA[i];
+    sumB += bufB[i];
+  }
+  const meanA = sumA / bufA.length;
+  const meanB = sumB / bufB.length;
+
+  let num = 0;
+  let denA = 0;
+  let denB = 0;
+
+  for (let i = 0; i < bufA.length; i++) {
+    const diffA = bufA[i] - meanA;
+    const diffB = bufB[i] - meanB;
+    num += diffA * diffB;
+    denA += diffA * diffA;
+    denB += diffB * diffB;
+  }
+
+  if (denA === 0 || denB === 0) return 1;
+  return num / Math.sqrt(denA * denB);
 }
 
 export function validateRealVideo(filePath: string): { valid: boolean; reason?: string; inspection?: VideoInspectionResult } {
@@ -130,36 +156,158 @@ export function validateRealVideo(filePath: string): { valid: boolean; reason?: 
     return { valid: false, reason: 'Frame rate is 0 or invalid', inspection };
   }
 
-  // To distinguish REAL VIDEO from a STATIC IMAGE LOOP, decode frames at distinct timestamps (0s, 1s, 2s, 5s) and compare.
   const duration = inspection.durationSeconds || 0;
   if (duration > 0) {
-    const testTimes = [0, 1, 2, 5].filter(t => t < duration);
-    if (testTimes.length < 2) {
-      testTimes.push(0);
-      testTimes.push(duration / 2);
+    const testTimes = [
+      0.0,
+      duration * 0.1,
+      duration * 0.25,
+      duration * 0.5,
+      duration * 0.75,
+      duration * 0.9
+    ].filter(t => t < duration);
+
+    while (testTimes.length < 3) {
+      testTimes.push(testTimes[testTimes.length - 1] + 0.1);
     }
 
-    const hashes: string[] = [];
+    const buffers: Buffer[] = [];
     for (const time of testTimes) {
-      const h = getFrameMd5(filePath, time);
-      if (h) {
-        hashes.push(h);
+      const buf = getFrameRawRGB(filePath, time, 16);
+      if (buf) {
+        buffers.push(buf);
       }
     }
 
-    if (hashes.length >= 2) {
-      const allIdentical = hashes.every(h => h === hashes[0]);
-      if (allIdentical) {
-        return { 
-          valid: false, 
-          reason: 'SOURCE_MEDIA_STATIC: Extracted frames at 0s, 1s, 2s, 5s intervals are completely identical. Static image loop/thumbnail detected.', 
-          inspection 
+    if (buffers.length >= 3) {
+      // 1. Uniform solid or black/blank check
+      for (let i = 0; i < buffers.length; i++) {
+        const buf = buffers[i];
+        let totalVal = 0;
+        let diffFromFirstPixel = 0;
+        const firstPixelR = buf[0];
+        const firstPixelG = buf[1];
+        const firstPixelB = buf[2];
+
+        for (let j = 0; j < buf.length; j += 3) {
+          totalVal += (buf[j] + buf[j+1] + buf[j+2]) / 3;
+          diffFromFirstPixel += Math.abs(buf[j] - firstPixelR) + Math.abs(buf[j+1] - firstPixelG) + Math.abs(buf[j+2] - firstPixelB);
+        }
+
+        const avgBrightness = totalVal / (buf.length / 3);
+        if (avgBrightness < 12) {
+          return { valid: false, reason: 'INVALID: Extracted frame is a blank/black placeholder (average brightness < 12).', inspection };
+        }
+
+        const avgPixelDiff = diffFromFirstPixel / (buf.length / 3);
+        if (avgPixelDiff < 3) {
+          return { valid: false, reason: 'INVALID: Extracted frame is a completely solid color (no visual detail).', inspection };
+        }
+      }
+
+      // 2. Pairwise frame correlation check (detect static image loops or zoompan fakes)
+      let sumCorrelation = 0;
+      let pairCount = 0;
+      for (let i = 0; i < buffers.length; i++) {
+        for (let j = i + 1; j < buffers.length; j++) {
+          const r = calculateCorrelation(buffers[i], buffers[j]);
+          sumCorrelation += r;
+          pairCount++;
+        }
+      }
+
+      const avgCorrelation = sumCorrelation / pairCount;
+      console.log(`[validateRealVideo] Video frame-to-frame correlation: ${avgCorrelation.toFixed(4)}`);
+
+      // We reject highly static looping images or linear zoompans that produce almost identical frame statistics.
+      if (avgCorrelation > 0.985) {
+        return {
+          valid: false,
+          reason: `SOURCE_MEDIA_STATIC: Video frames are highly static or have synthetic zoompan/movement (average frame correlation: ${avgCorrelation.toFixed(4)}). Expected real moving visual footage.`,
+          inspection
         };
       }
     } else {
-      return { valid: false, reason: 'Failed to decode sufficient video frames for motion validation', inspection };
+      return { valid: false, reason: 'Failed to decode sufficient representative video frames for motion and integrity validation', inspection };
     }
   }
 
   return { valid: true, inspection };
+}
+
+export function getFrameRawRGBCropped(
+  filePath: string,
+  timeSec: number,
+  cropFilter: string,
+  size: number = 16
+): Buffer | null {
+  try {
+    const cmd = `ffmpeg -y -ss ${timeSec} -i "${filePath}" -vframes 1 -vf "${cropFilter}" -s ${size}x${size} -f rawvideo -pix_fmt rgb24 - 2>/dev/null`;
+    const buffer = execSync(cmd, { timeout: 4000, stdio: ['pipe', 'pipe', 'ignore'] });
+    if (buffer && buffer.length === size * size * 3) {
+      return buffer;
+    }
+  } catch (err) {
+    // Silently continue
+  }
+  return null;
+}
+
+export function validateVisualMatch(
+  sourcePath: string,
+  startSec: number,
+  renderedPath: string
+): { matched: boolean; correlation: number; reason?: string } {
+  const sourceInspection = inspectVideoFile(sourcePath);
+  const renderedInspection = inspectVideoFile(renderedPath);
+
+  if (!sourceInspection.exists || !renderedInspection.exists) {
+    return { matched: false, correlation: 0, reason: 'Source or rendered file does not exist.' };
+  }
+
+  const duration = renderedInspection.durationSeconds || 5;
+  const testPoints = [duration * 0.25, duration * 0.5, duration * 0.75];
+
+  let totalCorrelation = 0;
+  let matchCount = 0;
+
+  // Source crop: Crop 9:16 center aspect ratio, and then take the top 75% (to avoid subtitles at the bottom)
+  const sourceCropFilter = 'crop=ih*9/16:ih*0.75:(iw-ih*9/16)/2:0';
+  // Rendered crop: Already vertical 9:16, so just take the top 75% to ignore subtitles
+  const renderedCropFilter = 'crop=iw:ih*0.75:0:0';
+
+  for (const tRend of testPoints) {
+    const tSrc = startSec + tRend;
+    if (tSrc < 0 || (sourceInspection.durationSeconds && tSrc > sourceInspection.durationSeconds)) {
+      continue;
+    }
+
+    const srcBuf = getFrameRawRGBCropped(sourcePath, tSrc, sourceCropFilter, 16);
+    const rendBuf = getFrameRawRGBCropped(renderedPath, tRend, renderedCropFilter, 16);
+
+    if (srcBuf && rendBuf) {
+      const r = calculateCorrelation(srcBuf, rendBuf);
+      totalCorrelation += r;
+      matchCount++;
+    }
+  }
+
+  if (matchCount === 0) {
+    return { matched: false, correlation: 0, reason: 'Could not extract corresponding visual frames for cross-validation.' };
+  }
+
+  const avgCorrelation = totalCorrelation / matchCount;
+  console.log(`[validateVisualMatch] Visual source-to-output match correlation (cropped): ${avgCorrelation.toFixed(4)}`);
+
+  // With exact crop matching, matching videos correlate extremely highly (usually r > 0.90)
+  // An average correlation >= 0.5 is exceptionally safe to prove origin.
+  if (avgCorrelation >= 0.5) {
+    return { matched: true, correlation: avgCorrelation };
+  } else {
+    return {
+      matched: false,
+      correlation: avgCorrelation,
+      reason: `OUTPUT_VISUAL_MISMATCH: Visual content in rendered clip does not correspond to the source video interval. (correlation: ${avgCorrelation.toFixed(4)} < 0.5)`
+    };
+  }
 }

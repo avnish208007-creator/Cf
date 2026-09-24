@@ -628,7 +628,7 @@ export const DiscoverPage: React.FC = () => {
         {showManualOverride && (
           <div className="pt-3 mt-2 border-t border-slate-200/60 text-xs space-y-3 animate-in fade-in duration-150">
             <p className="text-[11px] text-slate-500 leading-relaxed">
-              ClipFlow operates as an automated discovery engine based on your niche. You do not need to paste URLs to use the app. This override is provided strictly as an optional testing utility.
+              ClipFlow operates as an automated discovery engine based on your niche. This override is provided strictly as an optional testing utility. If automated YouTube downloads are blocked by platform bot detection on this server's IP address, you can paste any direct HTTP/HTTPS video URL (e.g., an MP4 link) to test the complete rendering pipeline.
             </p>
 
             <form onSubmit={handleManualOverrideSubmit} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
@@ -648,13 +648,13 @@ export const DiscoverPage: React.FC = () => {
 
               <div className="sm:col-span-4">
                 <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                  YouTube URL <span className="text-slate-400 font-normal">(Optional)</span>
+                  Video / YouTube URL <span className="text-slate-400 font-normal">(Direct MP4 or YouTube)</span>
                 </label>
                 <input
                   type="url"
                   value={manualUrl}
                   onChange={(e) => setManualUrl(e.target.value)}
-                  placeholder="https://youtube.com/watch?v=..."
+                  placeholder="https://example.com/video.mp4 or YouTube link"
                   className="w-full px-3 py-1.5 text-xs rounded-md border border-slate-200 focus:outline-hidden focus:ring-1 focus:ring-slate-900 bg-white"
                 />
               </div>

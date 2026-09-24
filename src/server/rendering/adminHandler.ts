@@ -57,7 +57,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
     }
 
     for (const cl of records) {
-      const videoUrl = cl.video_url || cl.scheduled_slot;
+      const videoUrl = cl.video_url;
       if (!videoUrl) {
         results.push({
           id: cl.id,
@@ -144,7 +144,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
           id: cl.id,
           title: cl.title,
           videoUrl,
-          status: 'VALID_MOVING_VIDEO',
+          status: 'VALID_REAL_VIDEO',
           details: `Resolution: ${validation.inspection.width}x${validation.inspection.height}, Duration: ${validation.inspection.durationSeconds}s, Codec: ${validation.inspection.videoCodec}, Size: ${validation.inspection.fileSizeBytes} bytes`,
         });
       } else {

@@ -214,26 +214,6 @@ export const ClipsPage: React.FC = () => {
 
         <div className="flex items-center gap-2 flex-wrap">
           <button
-            onClick={() => {
-              window.location.href = '/video-reality-test';
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs rounded-md transition-colors cursor-pointer"
-            title="Open Video Reality Test Page"
-          >
-            <Video className="w-3.5 h-3.5" />
-            <span>Reality Test</span>
-          </button>
-          <button
-            onClick={() => {
-              window.location.href = '/raw-video-test';
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs rounded-md transition-colors cursor-pointer"
-            title="Open Raw Video Test Page"
-          >
-            <Video className="w-3.5 h-3.5" />
-            <span>Raw Video Test</span>
-          </button>
-          <button
             onClick={handleRefresh}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs rounded-md transition-colors cursor-pointer"
             title="Refresh clips from Supabase"
@@ -644,27 +624,6 @@ export const ClipsPage: React.FC = () => {
                       ))}
                     </div>
                   )}
-                </div>
-
-                {/* Dev Verification Inspector Panel */}
-                <div className="p-2.5 bg-slate-900 text-slate-200 rounded-lg border border-slate-800 text-[10px] font-mono space-y-1">
-                  <div className="text-amber-400 font-bold uppercase tracking-wider text-[9px] mb-1 flex items-center justify-between">
-                    <span>VIDEO PLAYBACK DIAGNOSTIC</span>
-                    <span className="text-emerald-400 font-semibold">DIRECT SUPABASE MP4</span>
-                  </div>
-                  <div><span className="text-slate-400">URL (currentSrc):</span> <span className="text-slate-200 break-all">{diagState.currentSrc || selectedClipForPreview.videoUrl || 'None'}</span></div>
-                  <div><span className="text-slate-400">readyState:</span> <span className="text-emerald-400 font-bold">{getReadyStateText(diagState.readyState)}</span></div>
-                  <div><span className="text-slate-400">networkState:</span> <span className="text-emerald-400 font-bold">{getNetworkStateText(diagState.networkState)}</span></div>
-                  <div><span className="text-slate-400">duration:</span> <span className="text-slate-200 font-bold">{diagState.duration ? `${diagState.duration.toFixed(2)}s` : selectedClipForPreview.duration || 'Unknown'}</span></div>
-                  <div><span className="text-slate-400">currentTime:</span> <span className="text-emerald-300 font-bold">{diagState.currentTime.toFixed(2)}s</span></div>
-                  <div><span className="text-slate-400">dimensions:</span> <span className="text-sky-300 font-bold">{diagState.videoWidth} x {diagState.videoHeight}</span></div>
-                  <div><span className="text-slate-400">error code:</span> <span className={diagState.errorCode ? 'text-rose-400 font-bold' : 'text-slate-400'}>{diagState.errorCode !== null ? diagState.errorCode : 'None (0)'}</span></div>
-                  <div><span className="text-slate-400">error message:</span> <span className={diagState.errorMessage ? 'text-rose-400 font-bold' : 'text-slate-400'}>{diagState.errorMessage || 'None'}</span></div>
-                  <div><span className="text-slate-400">last event:</span> <span className="text-sky-400 font-bold">{diagState.lastEvent}</span></div>
-                  <div><span className="text-slate-400">Storage path:</span> {selectedClipForPreview.workspaceId || 'workspace'}/{selectedClipForPreview.videoUrl ? selectedClipForPreview.videoUrl.split('/').pop() : 'clip.mp4'}</div>
-                  <div className="pt-1 text-emerald-300 break-all border-t border-slate-800">
-                    &lt;video src="{selectedClipForPreview.videoUrl}" controls playsInline preload="metadata" /&gt;
-                  </div>
                 </div>
               </div>
 

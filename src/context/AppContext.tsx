@@ -16,9 +16,6 @@ import { ClientRenderService } from '../services/renderService';
 import {
   INITIAL_USER,
   INITIAL_WORKSPACE,
-  INITIAL_SOURCES,
-  INITIAL_CANDIDATES,
-  INITIAL_CLIPS,
   INITIAL_QUEUE,
   INITIAL_JOBS,
   INITIAL_ACTIVITY,
@@ -1006,14 +1003,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Manual source override
   const addSource = async (newSource: { title: string; youtubeUrl: string; niche: string }) => {
     const tempId = `src_${Date.now()}`;
+    const urlStr = newSource.youtubeUrl.trim();
+    const isYoutube = urlStr.includes('youtube.com') || urlStr.includes('youtu.be');
+    const isDirectMedia = urlStr.startsWith('http') && !isYoutube;
+
     const source: SourceVideo = {
       id: tempId,
       title: newSource.title,
-      channelTitle: 'Discovered Channel',
+      channelTitle: isYoutube ? 'Discovered YouTube Channel' : 'Direct Media Provider',
       duration: '32:10',
       viewCount: Math.floor(Math.random() * 80000) + 12000,
       publishedAt: 'Today',
-      youtubeUrl: newSource.youtubeUrl,
+      youtubeUrl: isYoutube ? urlStr : '',
+      mediaUrl: isDirectMedia ? urlStr : undefined,
       status: 'analyzed',
       candidatesCount: 2,
       summary: `Automated analysis for ${newSource.niche}. High density of structured discussion found.`,
