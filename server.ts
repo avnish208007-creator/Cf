@@ -66,7 +66,11 @@ async function startServer() {
     const ffmpegExists = ffmpegPath === 'ffmpeg' || fs.existsSync(ffmpegPath);
     const ffprobeExists = ffprobePath === 'ffprobe' || fs.existsSync(ffprobePath);
     const geminiKeySet = Boolean(process.env.GEMINI_API_KEY);
-    const youtubeExtractionReady = ytRuntime.ready && Boolean(ytRuntime.denoPath || ytRuntime.nodePath);
+    const youtubeExtractionReady = ytRuntime.ready && Boolean(ytRuntime.denoPath) && Boolean(ytRuntime.pythonVersion);
+
+    const cookiesEnv = Boolean(process.env.YT_COOKIES || process.env.YOUTUBE_COOKIES);
+    const cookiesFileExists = fs.existsSync(path.resolve(process.cwd(), 'bin', 'cookies.txt')) || fs.existsSync(path.resolve(process.cwd(), 'cookies.txt'));
+    const cookiesConfigured = cookiesEnv || cookiesFileExists;
 
     res.json({
       status: 'ok',
@@ -75,10 +79,11 @@ async function startServer() {
       discovery: true,
       processing: {
         ytDlp: ytRuntime.ytDlpExists,
-        python: Boolean(ytRuntime.pythonPath),
+        ytDlpVersion: ytRuntime.ready ? 'verified' : null,
+        python: ytRuntime.pythonVersion || null,
         deno: Boolean(ytRuntime.denoPath),
-        node: Boolean(ytRuntime.nodePath),
         youtubeExtractionReady,
+        cookiesConfigured,
         ffmpeg: ffmpegExists,
         ffprobe: ffprobeExists,
         transcription: true,
@@ -88,7 +93,6 @@ async function startServer() {
       diagnostics: {
         ytDlpPath: ytRuntime.ytDlpPath,
         denoPath: ytRuntime.denoPath,
-        nodePath: ytRuntime.nodePath,
         pythonVersion: ytRuntime.pythonVersion,
         runtimeError: ytRuntime.error || null,
       },

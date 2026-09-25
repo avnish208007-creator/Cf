@@ -20,50 +20,35 @@ export function resolveYtDlp(): string {
 
 export function resolveDeno(): string | null {
   const envPath = process.env.DENO_PATH;
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath;
+  const candidates = [
+    envPath,
+    path.resolve(process.cwd(), 'bin', 'deno'),
+    path.resolve(process.cwd(), '.deno', 'bin', 'deno'),
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      try {
+        execFileSync(candidate, ['--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+        return candidate;
+      } catch {}
+    }
   }
-  const localBin = path.resolve(process.cwd(), 'bin', 'deno');
-  if (fs.existsSync(localBin)) {
-    return localBin;
-  }
-  const localDotDeno = path.resolve(process.cwd(), '.deno', 'bin', 'deno');
-  if (fs.existsSync(localDotDeno)) {
-    return localDotDeno;
-  }
+
   try {
     const whichOut = execFileSync('which', ['deno'], { encoding: 'utf8' }).trim();
     if (whichOut && fs.existsSync(whichOut)) {
+      execFileSync(whichOut, ['--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
       return whichOut;
     }
   } catch {}
-  return null;
-}
 
-export function resolveNode(): string | null {
-  const envPath = process.env.NODE_PATH;
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath;
-  }
-  if (process.execPath && fs.existsSync(process.execPath)) {
-    return process.execPath;
-  }
-  const commonPaths = ['/usr/local/bin/node', '/usr/bin/node', '/bin/node'];
-  for (const p of commonPaths) {
-    if (fs.existsSync(p)) return p;
-  }
-  try {
-    const whichOut = execFileSync('which', ['node'], { encoding: 'utf8' }).trim();
-    if (whichOut && fs.existsSync(whichOut)) {
-      return whichOut;
-    }
-  } catch {}
   return null;
 }
 
 export function resolvePython(): { path: string | null; version: string | null; isPython311Plus: boolean } {
   const envPath = process.env.PYTHON_PATH;
-  const candidates = [envPath, 'python3.12', 'python3.11', 'python3.10', 'python3', 'python', '/usr/bin/python3', '/usr/local/bin/python3'].filter(Boolean) as string[];
+  const candidates = [envPath, 'python3.12', 'python3.11', 'python3', 'python', '/usr/bin/python3', '/usr/local/bin/python3'].filter(Boolean) as string[];
 
   for (const candidate of candidates) {
     try {
@@ -75,12 +60,14 @@ export function resolvePython(): { path: string | null; version: string | null; 
       if (match) {
         const verStr = match[1];
         const [major, minor] = verStr.split('.').map(Number);
-        const is311Plus = major > 3 || (major === 3 && minor >= 10);
-        return {
-          path: isPath ? candidate : execFileSync('which', [candidate], { encoding: 'utf8' }).trim(),
-          version: verStr,
-          isPython311Plus: is311Plus,
-        };
+        const is311Plus = major > 3 || (major === 3 && minor >= 11);
+        if (is311Plus) {
+          return {
+            path: isPath ? candidate : execFileSync('which', [candidate], { encoding: 'utf8' }).trim(),
+            version: verStr,
+            isPython311Plus: true,
+          };
+        }
       }
     } catch {}
   }
@@ -140,21 +127,29 @@ export function verifyYouTubeRuntime(): YouTubeRuntimeStatus {
       denoPath: null,
       nodePath: null,
       jsRuntimeArg: null,
-      error: 'yt-dlp binary not found in bin/yt-dlp or system PATH.',
+      error: 'YOUTUBE_RUNTIME_NOT_READY: yt-dlp binary not found in bin/yt-dlp or system PATH.',
     };
   }
 
   const denoPath = resolveDeno();
-  const nodePath = resolveNode();
+  if (!denoPath) {
+    return {
+      ready: false,
+      ytDlpPath,
+      ytDlpExists: true,
+      isStandalone: ytDlpPath !== 'yt-dlp',
+      pythonPath: null,
+      pythonVersion: null,
+      denoPath: null,
+      nodePath: null,
+      jsRuntimeArg: null,
+      error: 'YOUTUBE_RUNTIME_NOT_READY: No valid Deno JS runtime found or verified.',
+    };
+  }
+
   const pythonInfo = resolvePython();
+  const jsRuntimeArg = `deno:${denoPath}`;
 
-  const jsRuntimes: string[] = [];
-  if (denoPath) jsRuntimes.push(`deno:${denoPath}`);
-  if (nodePath) jsRuntimes.push(`node:${nodePath}`);
-
-  const jsRuntimeArg = jsRuntimes.length > 0 ? jsRuntimes.join(',') : null;
-
-  // Test executing yt-dlp --version
   try {
     const env: NodeJS.ProcessEnv = { ...process.env };
     const binDir = path.resolve(process.cwd(), 'bin');
@@ -165,11 +160,11 @@ export function verifyYouTubeRuntime(): YouTubeRuntimeStatus {
       ready: true,
       ytDlpPath,
       ytDlpExists: true,
-      isStandalone: true,
+      isStandalone: ytDlpPath !== 'yt-dlp',
       pythonPath: pythonInfo.path,
       pythonVersion: pythonInfo.version,
       denoPath,
-      nodePath,
+      nodePath: null,
       jsRuntimeArg,
     };
   } catch (execErr: any) {
@@ -181,9 +176,9 @@ export function verifyYouTubeRuntime(): YouTubeRuntimeStatus {
       pythonPath: pythonInfo.path,
       pythonVersion: pythonInfo.version,
       denoPath,
-      nodePath,
+      nodePath: null,
       jsRuntimeArg,
-      error: `Failed to execute yt-dlp: ${execErr?.message || String(execErr)}`,
+      error: `YOUTUBE_RUNTIME_NOT_READY: Failed to execute yt-dlp: ${execErr?.message || String(execErr)}`,
     };
   }
 }

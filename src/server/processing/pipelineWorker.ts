@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { execFile } from 'child_process';
+import { execFile, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { db, storage } from '../../lib/firebase';
 import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
@@ -38,14 +38,35 @@ function formatSeconds(sec: number): string {
 
 export class PipelineWorker {
   private cancelledJobs: Set<string> = new Set();
+  private activeProcesses: Map<string, ChildProcess> = new Map();
 
   public cancelJob(jobId: string) {
     this.cancelledJobs.add(jobId);
-    console.log(`[PipelineWorker] Job ${jobId} registered as cancelled.`);
+    const proc = this.activeProcesses.get(jobId);
+    if (proc) {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+      this.activeProcesses.delete(jobId);
+    }
+    console.log(`[PipelineWorker] Job ${jobId} cancelled and active processes terminated.`);
   }
 
   private isCancelled(jobId: string): boolean {
     return this.cancelledJobs.has(jobId);
+  }
+
+  private registerProcess(jobId: string, proc: ChildProcess) {
+    this.activeProcesses.set(jobId, proc);
+    if (this.isCancelled(jobId)) {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+    }
+  }
+
+  private unregisterProcess(jobId: string) {
+    this.activeProcesses.delete(jobId);
   }
 
   /**
@@ -71,6 +92,9 @@ export class PipelineWorker {
       errorCode?: string
     ) => {
       try {
+        if (this.isCancelled(jobId) && status === 'completed') {
+          status = 'cancelled';
+        }
         await updateDoc(jobRef, {
           stage,
           progress,
@@ -113,8 +137,12 @@ export class PipelineWorker {
         return;
       }
 
-      // 2. Download source via yt-dlp
-      const downloadedMedia = await downloadYouTubeSource(youtubeUrl, tmpDir, jobId);
+      // 2. Download source via yt-dlp with process tracking
+      const downloadedMedia = await downloadYouTubeSource(youtubeUrl, tmpDir, jobId, (proc) => {
+        this.registerProcess(jobId, proc);
+      });
+      this.unregisterProcess(jobId);
+
       sourceMp4 = downloadedMedia.localPath;
       tempFiles.push(sourceMp4);
 
@@ -151,7 +179,7 @@ export class PipelineWorker {
         throw new Error('GEMINI_API_KEY environment variable is not configured.');
       }
 
-      const modelName = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+      const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
       const ai = new GoogleGenAI({
         apiKey,
         httpOptions: {
@@ -164,9 +192,8 @@ export class PipelineWorker {
       console.log(`[PipelineWorker] Running moment detection with configured model "${modelName}"...`);
 
       const prompt = `You are an expert video content analyst and viral short-form editor.
-Here is the video title: "${sourceData.title}"
+Here is the video title: "${sourceData.title || 'Untitled'}"
 Total video duration: ${durationSeconds} seconds.
-Niche: ${sourceData.niche || 'General'}
 
 Below is the REAL timestamped transcript of the video:
 ---
@@ -207,11 +234,11 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         const parsed = JSON.parse(cleanJson);
 
         if (Array.isArray(parsed) && parsed.length > 0) {
-          // Validate moments against video duration and constraints
           moments = parsed.filter((m: any) => {
             const s = Number(m.start);
             const e = Number(m.end);
-            return !isNaN(s) && !isNaN(e) && s >= 0 && e > s && e <= durationSeconds + 5;
+            const dur = e - s;
+            return !isNaN(s) && !isNaN(e) && s >= 0 && e > s && e <= durationSeconds && dur >= 15 && dur <= 55;
           });
         }
       } catch (geminiErr: any) {
@@ -220,7 +247,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
       }
 
       if (moments.length === 0) {
-        throw new Error(`Gemini moment detection failed to extract valid timestamped moments grounded in transcript.`);
+        throw new Error(`Gemini moment detection failed to extract valid timestamped moments (15-55s) grounded in transcript.`);
       }
 
       if (this.isCancelled(jobId)) {
@@ -244,7 +271,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         const candidateId = 'cand_' + Math.random().toString(36).substring(2, 9);
         const clipId = 'clip_' + Math.random().toString(36).substring(2, 9);
         const startSec = Math.max(0, Math.floor(Number(m.start) || 0));
-        const endSec = Math.min(durationSeconds, Math.max(startSec + 10, Math.floor(Number(m.end) || startSec + 30)));
+        const endSec = Math.min(durationSeconds, Math.max(startSec + 15, Math.floor(Number(m.end) || startSec + 30)));
         const segDuration = endSec - startSec;
 
         const candidateObj = {
@@ -276,13 +303,12 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
         await updateJob('rendering', 70 + i * 8, 'processing');
 
-        // FFmpeg: Render 9:16 vertical video (1080x1920) H.264 + AAC + faststart
         const clipMp4 = path.resolve(tmpDir, `${jobId}_clip_${i}.mp4`);
         const thumbJpg = path.resolve(tmpDir, `${jobId}_thumb_${i}.jpg`);
         tempFiles.push(clipMp4, thumbJpg);
 
         try {
-          await execFileAsync(ffmpegExecutable, [
+          const ffmpegProcess = execFile(ffmpegExecutable, [
             '-y',
             '-ss', String(startSec),
             '-i', sourceMp4,
@@ -296,13 +322,23 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
             '-b:a', '128k',
             '-movflags', '+faststart',
             clipMp4,
-          ], { timeout: 120000 });
+          ]);
+
+          this.registerProcess(jobId, ffmpegProcess);
+
+          await new Promise((resolve, reject) => {
+            ffmpegProcess.on('error', (err) => reject(err));
+            ffmpegProcess.on('close', (code) => {
+              if (code === 0) resolve(0);
+              else reject(new Error(`FFmpeg exited with code ${code}`));
+            });
+          });
+          this.unregisterProcess(jobId);
         } catch (ffErr: any) {
           console.error('[PipelineWorker] FFmpeg cut failed:', ffErr);
           throw new Error(`Video rendering failed during FFmpeg cut: ${ffErr?.message || ffErr}`);
         }
 
-        // Validate rendered MP4 with ffprobe
         if (!fs.existsSync(clipMp4) || fs.statSync(clipMp4).size < 1000) {
           throw new Error('Rendered clip MP4 file is invalid or missing.');
         }
@@ -318,14 +354,13 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
           const probe = JSON.parse(stdout);
           const videoStream = probe.streams?.find((s: any) => s.codec_type === 'video');
           if (!videoStream || Number(videoStream.width) !== 1080 || Number(videoStream.height) !== 1920) {
-            throw new Error(`Rendered video does not meet 1080x1920 specification (found ${videoStream?.width}x${videoStream?.height}).`);
+            throw new Error(`Rendered video does not meet 1080x1920 specification.`);
           }
         } catch (validationErr: any) {
           console.error('[PipelineWorker] FFprobe validation failed:', validationErr);
           throw new Error(`FFprobe validation failed: ${validationErr.message}`);
         }
 
-        // Generate thumbnail
         try {
           await execFileAsync(ffmpegExecutable, [
             '-y',
@@ -334,9 +369,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
             '-frames:v', '1',
             thumbJpg,
           ]);
-        } catch (thumbErr: any) {
-          console.warn('[PipelineWorker] Thumbnail extraction warning:', thumbErr?.message);
-        }
+        } catch {}
 
         if (this.isCancelled(jobId)) {
           await updateJob('failed', 88, 'cancelled', 'Job cancelled.');
@@ -345,7 +378,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
         await updateJob('uploading', 88 + i * 3, 'processing');
 
-        // 6. Upload directly to Firebase Storage (Single Production Media Storage)
         let videoUrl = '';
         let thumbnailUrl = '';
 
@@ -368,7 +400,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
           throw new Error(`Firebase Storage upload failed: ${storageErr?.message || storageErr}`);
         }
 
-        // 7. Persist Clip document to Firestore
         const clipObj = {
           id: clipId,
           candidateId,
@@ -386,11 +417,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
           status: 'ready',
           score: Math.min(99, Math.max(60, Number(m.score) || 85)),
           caption: m.summary || '',
-          hashtags: [
-            '#shorts',
-            '#viral',
-            '#' + (sourceData.niche || 'content').replace(/[^a-zA-Z0-9]/g, '').toLowerCase(),
-          ],
+          hashtags: ['#shorts', '#viral'],
           processingJobId: jobId,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -400,7 +427,11 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         await setDoc(doc(db, 'workspaces', workspaceId, 'clips', clipId), clipObj);
       }
 
-      // Mark source as analyzed
+      if (this.isCancelled(jobId)) {
+        await updateJob('failed', 100, 'cancelled', 'Job cancelled.');
+        return;
+      }
+
       await updateDoc(sourceRef, {
         status: 'analyzed',
         candidatesCount: candidates.length,
@@ -429,7 +460,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         await updateDoc(sourceRef, { status: 'failed', updatedAt: new Date().toISOString() });
       } catch {}
     } finally {
-      // Clean up temporary disk files
       for (const f of tempFiles) {
         try {
           if (fs.existsSync(f)) fs.unlinkSync(f);
@@ -463,6 +493,9 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
       errorCode?: string
     ) => {
       try {
+        if (this.isCancelled(jobId) && status === 'completed') {
+          status = 'cancelled';
+        }
         await updateDoc(jobRef, {
           stage,
           progress,
@@ -489,7 +522,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
       await updateJob('downloading', 15, 'processing');
 
-      // 1. Fetch Source & Candidate
       const [sourceSnap, candSnap] = await Promise.all([getDoc(sourceRef), getDoc(candidateRef)]);
       if (!sourceSnap.exists()) {
         throw new Error(`Source video '${sourceVideoId}' not found.`);
@@ -500,8 +532,11 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
       const youtubeUrl =
         sourceData.youtubeUrl || `https://www.youtube.com/watch?v=${sourceData.youtubeVideoId || sourceVideoId}`;
 
-      // 2. Download source
-      const downloadedMedia = await downloadYouTubeSource(youtubeUrl, tmpDir, jobId);
+      const downloadedMedia = await downloadYouTubeSource(youtubeUrl, tmpDir, jobId, (proc) => {
+        this.registerProcess(jobId, proc);
+      });
+      this.unregisterProcess(jobId);
+
       const sourceMp4 = downloadedMedia.localPath;
       tempFiles.push(sourceMp4);
 
@@ -514,7 +549,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
       const startSec = parseSeconds(startTime || candData.startTime || 0);
       const endSec = parseSeconds(endTime || candData.endTime || startSec + 30);
-      const segDuration = Math.max(5, endSec - startSec);
+      const segDuration = Math.max(15, endSec - startSec);
 
       const clipId = 'clip_' + Math.random().toString(36).substring(2, 9);
       const clipMp4 = path.resolve(tmpDir, `${jobId}_render_${clipId}.mp4`);
@@ -524,8 +559,7 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
       const ffmpegExecutable = resolveFfmpeg();
       const ffprobeExecutable = resolveFfprobe();
 
-      // Render vertical short with FFmpeg
-      await execFileAsync(ffmpegExecutable, [
+      const ffmpegProcess = execFile(ffmpegExecutable, [
         '-y',
         '-ss', String(startSec),
         '-i', sourceMp4,
@@ -539,9 +573,19 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         '-b:a', '128k',
         '-movflags', '+faststart',
         clipMp4,
-      ], { timeout: 120000 });
+      ]);
 
-      // Validate rendered clip
+      this.registerProcess(jobId, ffmpegProcess);
+
+      await new Promise((resolve, reject) => {
+        ffmpegProcess.on('error', (err) => reject(err));
+        ffmpegProcess.on('close', (code) => {
+          if (code === 0) resolve(0);
+          else reject(new Error(`FFmpeg exited with code ${code}`));
+        });
+      });
+      this.unregisterProcess(jobId);
+
       if (!fs.existsSync(clipMp4) || fs.statSync(clipMp4).size < 1000) {
         throw new Error('Rendered candidate clip MP4 is invalid or missing.');
       }
@@ -559,7 +603,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         throw new Error('Rendered video does not meet 1080x1920 specification.');
       }
 
-      // Generate thumbnail
       try {
         await execFileAsync(ffmpegExecutable, [
           '-y',
@@ -577,7 +620,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
       await updateJob('uploading', 85, 'processing');
 
-      // Upload to Firebase Storage
       const videoStorageRef = ref(storage, `workspaces/${workspaceId}/clips/${clipId}/video.mp4`);
       const videoBuffer = new Uint8Array(fs.readFileSync(clipMp4));
       await uploadBytes(videoStorageRef, videoBuffer, { contentType: 'video/mp4' });
@@ -591,7 +633,6 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
         thumbnailUrl = await getDownloadURL(thumbStorageRef);
       }
 
-      // Save Clip in Firestore
       const clipObj = {
         id: clipId,
         candidateId,
@@ -617,12 +658,16 @@ Return ONLY valid JSON. No commentary, no markdown formatting.`;
 
       await setDoc(doc(db, 'workspaces', workspaceId, 'clips', clipId), clipObj);
 
-      // Update candidate status
       await updateDoc(candidateRef, {
         status: 'rendered',
         renderedClipId: clipId,
         updatedAt: new Date().toISOString(),
       });
+
+      if (this.isCancelled(jobId)) {
+        await updateJob('failed', 100, 'cancelled', 'Job cancelled.');
+        return;
+      }
 
       await updateJob('completed', 100, 'completed');
       console.log(`[PipelineWorker] Candidate ${candidateId} rendered to clip ${clipId} successfully.`);
