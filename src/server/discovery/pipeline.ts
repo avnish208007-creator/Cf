@@ -57,21 +57,29 @@ export async function runDiscoveryPipeline(
   const authenticatedWorkspaceId = workspaceId.trim() || DEFAULT_WORKSPACE_ID;
   console.log(`[ClipFlow] DISCOVERY started for workspace: ${authenticatedWorkspaceId}`);
 
-  // 1. Get or create workspace document in Firestore
-  const wsRef = doc(db, 'workspaces', authenticatedWorkspaceId);
-  const wsSnap = await getDoc(wsRef);
-
+  // 1. Get or create workspace document in Firestore with fallback
   let wsData: any = null;
-  if (!wsSnap.exists()) {
+  try {
+    const wsRef = doc(db, 'workspaces', authenticatedWorkspaceId);
+    const wsSnap = await getDoc(wsRef);
+
+    if (!wsSnap.exists()) {
+      wsData = {
+        id: authenticatedWorkspaceId,
+        name: workspaceName || 'ClipFlow Workspace',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await setDoc(wsRef, wsData, { merge: true });
+    } else {
+      wsData = wsSnap.data();
+    }
+  } catch (fsErr) {
+    console.warn('[Discovery] Firestore workspace fetch warning (continuing with default settings):', fsErr);
     wsData = {
       id: authenticatedWorkspaceId,
       name: workspaceName || 'ClipFlow Workspace',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
     };
-    await setDoc(wsRef, wsData, { merge: true });
-  } else {
-    wsData = wsSnap.data();
   }
 
   const activeNiche = (optionNiche && optionNiche.trim()) || wsData?.config?.mainNiche || wsData?.mainNiche || 'AI & Technology';
@@ -91,8 +99,8 @@ export async function runDiscoveryPipeline(
   }
 
   let totalExistingCount = 0;
-  const sourcesColRef = collection(db, 'workspaces', authenticatedWorkspaceId, 'sources');
   try {
+    const sourcesColRef = collection(db, 'workspaces', authenticatedWorkspaceId, 'sources');
     const sourcesSnapshot = await getDocs(sourcesColRef);
     totalExistingCount = sourcesSnapshot.docs.length;
     sourcesSnapshot.docs.forEach((d) => {

@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
-import { getFirestore, Firestore } from 'firebase/firestore';
+import { getFirestore, Firestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
@@ -18,16 +18,28 @@ const app: FirebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) 
 
 let dbInstance: Firestore;
 try {
+  const options: any = {
+    experimentalForceLongPolling: true,
+  };
   if (databaseId && databaseId !== '(default)') {
-    dbInstance = getFirestore(app, databaseId);
+    dbInstance = initializeFirestore(app, options, databaseId);
   } else {
-    dbInstance = getFirestore(app);
+    dbInstance = initializeFirestore(app, options);
   }
 } catch (err) {
-  console.warn('[Firebase] Warning initializing Firestore with databaseId, falling back to default:', err);
-  dbInstance = getFirestore(app);
+  try {
+    if (databaseId && databaseId !== '(default)') {
+      dbInstance = getFirestore(app, databaseId);
+    } else {
+      dbInstance = getFirestore(app);
+    }
+  } catch (err2) {
+    console.warn('[Firebase] Warning initializing Firestore, falling back to default getFirestore:', err2);
+    dbInstance = getFirestore(app);
+  }
 }
 
 export const db = dbInstance;
 export const storage: FirebaseStorage = getStorage(app);
 export const DEFAULT_WORKSPACE_ID = 'default-workspace';
+
