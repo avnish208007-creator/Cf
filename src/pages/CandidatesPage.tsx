@@ -23,7 +23,8 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { ClipCandidate } from '../types';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { db, auth, isFirebaseConfigured } from '../lib/firebase';
+import { collection, query, where, getDocs } from 'firebase/firestore';
 
 function parseTimestampToSeconds(timeStr: string): number {
   if (!timeStr) return 0;
@@ -88,20 +89,14 @@ export const CandidatesPage: React.FC = () => {
 
     // 1. Resolve current workspace ID
     let wsId = currentWorkspaceId;
-    if (!wsId && isSupabaseConfigured) {
+    if (!wsId && isFirebaseConfigured) {
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        if (authData?.user?.id) {
-          const { data: wsData } = await supabase
-            .from('workspaces')
-            .select('id')
-            .eq('owner_id', authData.user.id)
-            .limit(1)
-            .maybeSingle();
-          if (wsData?.id) wsId = wsData.id;
+        const u = auth.currentUser;
+        if (u) {
+          wsId = currentWorkspaceId || u.uid;
         }
       } catch (err) {
-        console.warn('[Candidates] Warning querying user workspace from Supabase:', err);
+        console.warn('[Candidates] Warning querying user workspace from Firebase:', err);
       }
     }
     if (!wsId) {
@@ -118,10 +113,9 @@ export const CandidatesPage: React.FC = () => {
       let totalAllDb = 0;
       let allDbSummary: DbRowDiagnostic[] = [];
 
-      // A. Query via resilient backend service handler (which has Supabase service role access)
+      // A. Query via backend service handler
       try {
-        const { data: sessionData } = isSupabaseConfigured ? await supabase.auth.getSession() : { data: null };
-        const token = sessionData?.session?.access_token;
+        const token = await auth.currentUser?.getIdToken();
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (token) headers['Authorization'] = `Bearer ${token}`;
 
@@ -144,30 +138,17 @@ export const CandidatesPage: React.FC = () => {
       }
 
       // B. If direct client query fallback is available and needed
-      if (candidateRows.length === 0 && isSupabaseConfigured) {
-        const { data: srcRows } = await supabase
-          .from('source_videos')
-          .select('*')
-          .eq('workspace_id', wsId);
-
-        if (srcRows) {
-          sourcesList = srcRows;
-          for (const s of srcRows) {
-            sourceMap.set(s.id, s);
-          }
-        }
-
-        const { data: candData, error: candError } = await supabase
-          .from('clip_candidates')
-          .select('*')
-          .eq('workspace_id', wsId)
-          .order('score', { ascending: false });
-
-        if (candError) {
-          console.error('[Candidates] Direct Supabase error:', candError);
+      if (candidateRows.length === 0 && isFirebaseConfigured) {
+        try {
+          const candQuery = query(
+            collection(db, 'clip_candidates'),
+            where('workspace_id', '==', wsId)
+          );
+          const candSnap = await getDocs(candQuery);
+          candidateRows = candSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+        } catch (candError: any) {
+          console.error('[Candidates] Direct Firebase error:', candError);
           if (!candidateRows.length) setQueryError(candError.message);
-        } else if (candData) {
-          candidateRows = candData;
         }
       }
 
@@ -291,8 +272,7 @@ export const CandidatesPage: React.FC = () => {
   const handleSelectCandidate = async (candidateId: string) => {
     setActionLoadingIds((prev) => ({ ...prev, [candidateId]: 'selecting' }));
     try {
-      const { data: sessionData } = isSupabaseConfigured ? await supabase.auth.getSession() : { data: null };
-      const token = sessionData?.session?.access_token;
+      const token = await auth.currentUser?.getIdToken();
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -343,8 +323,7 @@ export const CandidatesPage: React.FC = () => {
   const handleRenderCandidate = async (candidate: ClipCandidate, forceTestVideo: boolean = false) => {
     setActionLoadingIds((prev) => ({ ...prev, [candidate.id]: 'rendering' }));
     try {
-      const { data: sessionData } = isSupabaseConfigured ? await supabase.auth.getSession() : { data: null };
-      const token = sessionData?.session?.access_token;
+      const token = await auth.currentUser?.getIdToken();
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',

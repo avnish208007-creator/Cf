@@ -1,6 +1,11 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, query, where, getDocs, limit } from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
 import { MomentPipeline } from '../../src/server/moment-detection/MomentPipeline';
-import { getSupabaseServerClient } from '../../src/server/discovery/pipeline';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -40,14 +45,6 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
       subtopics: passedSubtopics,
     } = payload;
 
-    const authHeader =
-      event.headers.authorization ||
-      event.headers.Authorization ||
-      '';
-    const userAccessToken = authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7).trim()
-      : undefined;
-
     if (!workspaceId || typeof workspaceId !== 'string' || !workspaceId.trim()) {
       return {
         statusCode: 400,
@@ -60,30 +57,19 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
       };
     }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return {
-        statusCode: 503,
-        headers: defaultHeaders,
-        body: JSON.stringify({
-          success: false,
-          error: 'DATABASE_UNAVAILABLE',
-          message: 'Supabase database is not configured.',
-        }),
-      };
-    }
-
     let activeNiche = passedNiche || 'Fitness & Hypertrophy';
     let activeSubtopics: string[] = passedSubtopics || [];
 
     if (!passedNiche || activeSubtopics.length === 0) {
-      const { data: settings } = await supabase
-        .from('workspace_settings')
-        .select('main_niche, subtopics')
-        .eq('workspace_id', workspaceId)
-        .maybeSingle();
+      const settingsQuery = query(
+        collection(db, 'workspace_settings'),
+        where('workspace_id', '==', workspaceId),
+        limit(1)
+      );
+      const settingsSnap = await getDocs(settingsQuery);
 
-      if (settings) {
+      if (!settingsSnap.empty) {
+        const settings = settingsSnap.docs[0].data();
         activeNiche = passedNiche || settings.main_niche || activeNiche;
         activeSubtopics = activeSubtopics.length > 0 ? activeSubtopics : settings.subtopics || [];
       }
@@ -95,16 +81,14 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     } else if (Array.isArray(passedSourceIds) && passedSourceIds.length > 0) {
       targetSourceIds = passedSourceIds;
     } else {
-      const { data: sources } = await supabase
-        .from('source_videos')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .in('status', ['new', 'queued'])
-        .limit(5);
-
-      if (sources && sources.length > 0) {
-        targetSourceIds = sources.map((s) => s.id);
-      }
+      const sourcesQuery = query(
+        collection(db, 'source_videos'),
+        where('workspace_id', '==', workspaceId),
+        where('status', 'in', ['new', 'queued']),
+        limit(5)
+      );
+      const sourcesSnap = await getDocs(sourcesQuery);
+      targetSourceIds = sourcesSnap.docs.map((s) => s.id);
     }
 
     if (targetSourceIds.length === 0) {
@@ -121,7 +105,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
       };
     }
 
-    const pipeline = new MomentPipeline(undefined, undefined, undefined, supabase);
+    const pipeline = new MomentPipeline();
 
     const results = await pipeline.analyzeSources(targetSourceIds, {
       workspaceId,

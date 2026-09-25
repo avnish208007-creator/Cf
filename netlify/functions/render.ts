@@ -1,5 +1,10 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { getSupabaseServerClient } from '../../src/server/discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -31,33 +36,12 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
 
   try {
     const payload = event.body ? JSON.parse(event.body) : {};
-    const {
-      candidateId,
-      workspaceId,
-      sourceVideoId,
-      sourceTitle,
-      channelTitle,
-      startTime,
-      endTime,
-      durationSeconds,
-      hook,
-      transcriptText,
-      summary,
-      sourceYoutubeUrl,
-      mediaUrl,
-      mediaPath,
-      reframeMode,
-      subtitles,
-      branding,
-    } = payload;
+    const { candidateId, workspaceId } = payload;
 
     const authHeader =
       event.headers.authorization ||
       event.headers.Authorization ||
       '';
-    const userAccessToken = authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7).trim()
-      : undefined;
 
     if (!candidateId || !workspaceId) {
       return {
@@ -71,101 +55,68 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
       };
     }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return {
-        statusCode: 500,
-        headers: defaultHeaders,
-        body: JSON.stringify({
-          success: false,
-          error: 'DATABASE_UNAVAILABLE',
-          message: 'Could not connect to database.',
-        }),
-      };
-    }
-
-    // 1. PREVENT DUPLICATE RENDERS Check
-    const { data: candidate } = await supabase
-      .from('clip_candidates')
-      .select('*')
-      .eq('id', candidateId)
-      .maybeSingle();
+    const candRef = doc(db, 'clip_candidates', candidateId);
+    const candSnap = await getDoc(candRef);
+    const candidate = candSnap.exists() ? candSnap.data() : null;
 
     if (candidate && candidate.factors && candidate.factors.activeJobId) {
       const activeJobId = candidate.factors.activeJobId;
-      const { data: job } = await supabase
-        .from('jobs')
-        .select('*')
-        .eq('id', activeJobId)
-        .maybeSingle();
+      const jobSnap = await getDoc(doc(db, 'render_jobs', activeJobId));
 
-      if (job && (job.status === 'queued' || job.status === 'running')) {
-        console.log(`[netlify/functions/render] Active job already exists: ${activeJobId}`);
-        return {
-          statusCode: 202,
-          headers: defaultHeaders,
-          body: JSON.stringify({
-            success: true,
-            jobId: activeJobId,
-            status: 'queued',
-            message: 'An active render is already in progress for this candidate. Reusing job.'
-          }),
-        };
+      if (jobSnap.exists()) {
+        const job = jobSnap.data();
+        if (job.status === 'queued' || job.status === 'running') {
+          console.log(`[netlify/functions/render] Active job already exists: ${activeJobId}`);
+          return {
+            statusCode: 202,
+            headers: defaultHeaders,
+            body: JSON.stringify({
+              success: true,
+              jobId: activeJobId,
+              status: 'queued',
+              message: 'An active render is already in progress for this candidate. Reusing job.'
+            }),
+          };
+        }
       }
     }
 
-    // 2. CREATE A NEW JOB ROW
     const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0;
       const v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
-    const { error: jobInsertErr } = await supabase
-      .from('jobs')
-      .insert({
-        id: jobId,
-        workspace_id: workspaceId,
-        type: 'vertical_render',
-        target_title: `Render Clip: ${candidateId}`,
-        progress: 0,
-        stage: 'queued',
-        status: 'queued',
-      });
+    const now = new Date().toISOString();
 
-    if (jobInsertErr) {
-      return {
-        statusCode: 500,
-        headers: defaultHeaders,
-        body: JSON.stringify({
-          success: false,
-          error: 'DATABASE_FAILURE',
-          message: 'Could not create rendering job: ' + jobInsertErr.message,
-        }),
-      };
-    }
+    await setDoc(doc(db, 'render_jobs', jobId), {
+      id: jobId,
+      workspace_id: workspaceId,
+      type: 'vertical_render',
+      target_title: `Render Clip: ${candidateId}`,
+      progress: 0,
+      stage: 'queued',
+      status: 'queued',
+      created_at: now,
+    });
 
-    // Update candidate to 'generating'
     const existingFactors = (candidate?.factors || {}) as any;
-    await supabase
-      .from('clip_candidates')
-      .update({
+    if (candSnap.exists()) {
+      await updateDoc(candRef, {
         status: 'generating',
         factors: {
           ...existingFactors,
           renderStatus: 'rendering',
           activeJobId: jobId,
         }
-      })
-      .eq('id', candidateId);
+      });
+    }
 
-    // 3. TRIGGER NETLIFY BACKGROUND FUNCTION
     const protocol = event.headers['x-forwarded-proto'] || 'https';
     const host = event.headers.host;
     const triggerUrl = `${protocol}://${host}/.netlify/functions/render-background`;
 
     console.log(`[netlify/functions/render] Triggering background function at: ${triggerUrl} with jobId ${jobId}`);
 
-    // Call the background function asynchronously
     try {
       await fetch(triggerUrl, {
         method: 'POST',
@@ -176,7 +127,6 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
         body: JSON.stringify({
           payload,
           jobId,
-          userAccessToken,
         }),
       });
     } catch (triggerErr: any) {

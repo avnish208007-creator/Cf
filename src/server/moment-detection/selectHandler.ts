@@ -1,6 +1,11 @@
 import { Request, Response } from 'express';
-import { getSupabaseServerClient } from '../discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, updateDoc } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
 import { SourceMediaProvider } from '../rendering/SourceMediaProvider';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleCandidateSelectRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -25,31 +30,11 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
 
   console.log(`[Render] candidate selected: ${candidateId}`);
 
-  const authHeader = req.headers.authorization || '';
-  const userAccessToken = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : undefined;
-
-  const supabase = getSupabaseServerClient(userAccessToken);
-  if (!supabase) {
-    res.status(500).json({
-      success: false,
-      error: 'SERVER_CONFIG_ERROR',
-      message: 'Supabase server client could not be initialized.',
-    });
-    return;
-  }
-
   try {
-    // 1. Fetch Candidate from Supabase
-    const { data: candidate, error: candErr } = await supabase
-      .from('clip_candidates')
-      .select('*')
-      .eq('id', candidateId)
-      .maybeSingle();
+    const candRef = doc(db, 'clip_candidates', candidateId);
+    const candSnap = await getDoc(candRef);
 
-    if (candErr || !candidate) {
-      console.error(`[Render] candidate not found: ${candidateId}`, candErr);
+    if (!candSnap.exists()) {
       res.status(404).json({
         success: false,
         error: 'CANDIDATE_NOT_FOUND',
@@ -58,26 +43,18 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       return;
     }
 
+    const candidate = { id: candSnap.id, ...candSnap.data() } as any;
     const effectiveWsId = candidate.workspace_id || workspaceId;
     const factors = (candidate.factors || {}) as any;
 
-    // 2. Fetch Parent Source Video
     let sourceVideo: any = null;
     if (candidate.source_video_id) {
-      const { data: srcData, error: srcErr } = await supabase
-        .from('source_videos')
-        .select('*')
-        .eq('id', candidate.source_video_id)
-        .maybeSingle();
-
-      if (srcData && !srcErr) {
-        sourceVideo = srcData;
+      const srcDoc = await getDoc(doc(db, 'source_videos', candidate.source_video_id));
+      if (srcDoc.exists()) {
+        sourceVideo = { id: srcDoc.id, ...srcDoc.data() };
       }
     }
 
-    console.log(`[Render] source loaded: ${sourceVideo ? sourceVideo.id : 'N/A'} (title: "${sourceVideo?.title || candidate.source_title || 'Unknown'}")`);
-
-    // 3. Update candidate selection status to 'approved' and renderStatus to 'acquiring_media'
     const updatedFactorsInitial = {
       ...factors,
       selectionStatus: 'selected',
@@ -85,15 +62,11 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       selectedAt: new Date().toISOString(),
     };
 
-    await supabase
-      .from('clip_candidates')
-      .update({
-        status: 'approved',
-        factors: updatedFactorsInitial,
-      })
-      .eq('id', candidateId);
+    await updateDoc(candRef, {
+      status: 'approved',
+      factors: updatedFactorsInitial,
+    });
 
-    // 4. Automatic Source Media Acquisition
     const mediaProvider = new SourceMediaProvider();
     let mediaResult: any;
 
@@ -127,33 +100,25 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
 
     if (mediaResult.success && mediaResult.status === 'available' && mediaResult.mediaPath) {
       finalRenderStatus = 'media_ready';
-      // Update source video if media path newly acquired
       if (sourceVideo?.id) {
-        await supabase
-          .from('source_videos')
-          .update({
-            media_status: 'available',
-            media_path: mediaResult.mediaPath,
-            media_url: mediaResult.mediaUrl,
-            media_updated_at: new Date().toISOString(),
-          })
-          .eq('id', sourceVideo.id);
+        await updateDoc(doc(db, 'source_videos', sourceVideo.id), {
+          media_status: 'available',
+          media_path: mediaResult.mediaPath,
+          media_url: mediaResult.mediaUrl,
+          media_updated_at: new Date().toISOString(),
+        });
       }
     } else {
       finalRenderStatus = 'failed';
       if (sourceVideo?.id) {
-        await supabase
-          .from('source_videos')
-          .update({
-            media_status: 'unavailable',
-            media_error: mediaResult.errorMessage || mediaResult.errorCode,
-            media_updated_at: new Date().toISOString(),
-          })
-          .eq('id', sourceVideo.id);
+        await updateDoc(doc(db, 'source_videos', sourceVideo.id), {
+          media_status: 'unavailable',
+          media_error: mediaResult.errorMessage || mediaResult.errorCode,
+          media_updated_at: new Date().toISOString(),
+        });
       }
     }
 
-    // 5. Persist final candidate factors
     const finalFactors = {
       ...updatedFactorsInitial,
       renderStatus: finalRenderStatus,
@@ -165,12 +130,7 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       mediaUrl: mediaResult.mediaUrl,
     };
 
-    await supabase
-      .from('clip_candidates')
-      .update({
-        factors: finalFactors,
-      })
-      .eq('id', candidateId);
+    await updateDoc(candRef, { factors: finalFactors });
 
     res.status(200).json({
       success: true,

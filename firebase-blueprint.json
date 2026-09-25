@@ -1,0 +1,166 @@
+{
+  "entities": {
+    "Workspace": {
+      "title": "Workspace",
+      "description": "User workspace entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "owner_id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 256 },
+        "brand_name": { "type": "string", "maxLength": 256 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "owner_id", "name"]
+    },
+    "WorkspaceSettings": {
+      "title": "WorkspaceSettings",
+      "description": "Settings for a workspace",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workspace_id": { "type": "string", "maxLength": 128 },
+        "main_niche": { "type": "string", "maxLength": 256 },
+        "subtopics": { "type": "array" },
+        "content_language": { "type": "string", "maxLength": 128 },
+        "content_style": { "type": "string", "maxLength": 128 },
+        "aspect_ratio": { "type": "string", "maxLength": 32 },
+        "target_platforms": { "type": "array" },
+        "min_candidate_score": { "type": "number" },
+        "target_duration": { "type": "string", "maxLength": 64 },
+        "branding_settings": { "type": "object" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["workspace_id", "main_niche"]
+    },
+    "SourceVideo": {
+      "title": "SourceVideo",
+      "description": "Discovered source video metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workspace_id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 512 },
+        "channel_title": { "type": "string", "maxLength": 256 },
+        "duration": { "type": "string", "maxLength": 64 },
+        "view_count": { "type": "number" },
+        "published_at": { "type": "string" },
+        "youtube_url": { "type": "string", "maxLength": 1024 },
+        "status": { "type": "string", "maxLength": 64 },
+        "relevance_score": { "type": "number" },
+        "freshness_tag": { "type": "string", "maxLength": 256 },
+        "candidates_count": { "type": "number" },
+        "summary": { "type": "string", "maxLength": 4096 },
+        "niche": { "type": "string", "maxLength": 256 },
+        "thumbnail_gradient": { "type": "string", "maxLength": 512 },
+        "media_status": { "type": "string", "maxLength": 64 },
+        "media_provider": { "type": "string", "maxLength": 128 },
+        "media_reference": { "type": "string", "maxLength": 512 },
+        "media_path": { "type": "string", "maxLength": 1024 },
+        "media_url": { "type": "string", "maxLength": 1024 },
+        "media_error": { "type": "string", "maxLength": 2048 },
+        "media_updated_at": { "type": "string" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["workspace_id", "title", "youtube_url"]
+    },
+    "ClipCandidate": {
+      "title": "ClipCandidate",
+      "description": "Short-form moment candidate detected in source video",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workspace_id": { "type": "string", "maxLength": 128 },
+        "source_video_id": { "type": "string", "maxLength": 128 },
+        "source_title": { "type": "string", "maxLength": 512 },
+        "channel_title": { "type": "string", "maxLength": 256 },
+        "start_time": { "type": "string", "maxLength": 64 },
+        "end_time": { "type": "string", "maxLength": 64 },
+        "duration": { "type": "string", "maxLength": 64 },
+        "hook": { "type": "string", "maxLength": 1024 },
+        "summary": { "type": "string", "maxLength": 2048 },
+        "score": { "type": "number" },
+        "factors": { "type": "object" },
+        "status": { "type": "string", "maxLength": 64 },
+        "created_at": { "type": "string" }
+      },
+      "required": ["workspace_id", "source_title", "hook"]
+    },
+    "Clip": {
+      "title": "Clip",
+      "description": "Rendered short-form video clip",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workspace_id": { "type": "string", "maxLength": 128 },
+        "candidate_id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 512 },
+        "hook": { "type": "string", "maxLength": 1024 },
+        "source_title": { "type": "string", "maxLength": 512 },
+        "channel_title": { "type": "string", "maxLength": 256 },
+        "duration": { "type": "string", "maxLength": 64 },
+        "aspect_ratio": { "type": "string", "maxLength": 32 },
+        "style": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "maxLength": 64 },
+        "thumbnail_bg": { "type": "string", "maxLength": 1024 },
+        "captions_sample": { "type": "array" },
+        "hashtags": { "type": "array" },
+        "progress": { "type": "number" },
+        "in_queue": { "type": "boolean" },
+        "queue_status": { "type": "string", "maxLength": 64 },
+        "video_url": { "type": "string", "maxLength": 1024 },
+        "scheduled_slot": { "type": "string", "maxLength": 128 },
+        "created_at": { "type": "string" }
+      },
+      "required": ["workspace_id", "title"]
+    },
+    "RenderJob": {
+      "title": "RenderJob",
+      "description": "Asynchronous video render job",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workspace_id": { "type": "string", "maxLength": 128 },
+        "candidate_id": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "maxLength": 64 },
+        "progress": { "type": "number" },
+        "stage": { "type": "string", "maxLength": 128 },
+        "error_code": { "type": "string", "maxLength": 128 },
+        "error_message": { "type": "string", "maxLength": 2048 },
+        "created_at": { "type": "string" },
+        "started_at": { "type": "string" },
+        "completed_at": { "type": "string" },
+        "metadata": { "type": "object" }
+      },
+      "required": ["workspace_id", "status"]
+    }
+  },
+  "firestore": {
+    "/workspaces/{workspaceId}": {
+      "schema": { "$ref": "#/entities/Workspace" },
+      "description": "Workspaces collection"
+    },
+    "/workspace_settings/{settingsId}": {
+      "schema": { "$ref": "#/entities/WorkspaceSettings" },
+      "description": "Workspace settings collection"
+    },
+    "/source_videos/{sourceId}": {
+      "schema": { "$ref": "#/entities/SourceVideo" },
+      "description": "Source videos collection"
+    },
+    "/clip_candidates/{candidateId}": {
+      "schema": { "$ref": "#/entities/ClipCandidate" },
+      "description": "Clip candidates collection"
+    },
+    "/clips/{clipId}": {
+      "schema": { "$ref": "#/entities/Clip" },
+      "description": "Clips collection"
+    },
+    "/render_jobs/{jobId}": {
+      "schema": { "$ref": "#/entities/RenderJob" },
+      "description": "Render jobs collection"
+    }
+  }
+}

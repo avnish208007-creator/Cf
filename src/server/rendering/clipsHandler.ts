@@ -1,5 +1,10 @@
 import { Request, Response } from 'express';
-import { getSupabaseServerClient } from '../discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleClipsRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -17,41 +22,17 @@ export async function handleClipsRequest(req: Request, res: Response): Promise<v
     ''
   ).trim();
 
-  const authHeader = req.headers.authorization || '';
-  const userAccessToken = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : undefined;
-
-  const supabase = getSupabaseServerClient(userAccessToken);
-  if (!supabase) {
-    res.status(500).json({
-      success: false,
-      error: 'SERVER_CONFIG_ERROR',
-      message: 'Supabase server client could not be initialized.',
-    });
-    return;
-  }
-
   try {
-    let query = supabase.from('clips').select('*').order('created_at', { ascending: false });
-
+    let q;
     if (workspaceId) {
-      query = query.eq('workspace_id', workspaceId);
+      q = query(collection(db, 'clips'), where('workspace_id', '==', workspaceId));
+    } else {
+      q = query(collection(db, 'clips'));
     }
 
-    const { data, error } = await query;
+    const querySnap = await getDocs(q);
+    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
 
-    if (error) {
-      console.error('[ClipsHandler] Supabase clips query error:', error);
-      res.status(500).json({
-        success: false,
-        error: error.code || 'QUERY_FAILED',
-        message: error.message,
-      });
-      return;
-    }
-
-    const records = data || [];
     console.log(`[ClipsHandler] Fetched ${records.length} clip records for workspace "${workspaceId}"`);
 
     res.status(200).json({
@@ -65,7 +46,7 @@ export async function handleClipsRequest(req: Request, res: Response): Promise<v
     res.status(500).json({
       success: false,
       error: 'FETCH_CLIPS_FAILED',
-      message: err.message || 'An unexpected error occurred while querying clips from Supabase.',
+      message: err.message || 'An unexpected error occurred while querying clips from Firebase.',
     });
   }
 }

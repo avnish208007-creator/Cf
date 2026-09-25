@@ -1,5 +1,10 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { getSupabaseServerClient } from '../../src/server/discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -33,47 +38,14 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     };
   }
 
-  const authHeader =
-    event.headers.authorization ||
-    event.headers.Authorization ||
-    '';
-  const userAccessToken = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : undefined;
-
-  const supabase = getSupabaseServerClient(userAccessToken);
-  if (!supabase) {
-    return {
-      statusCode: 500,
-      headers: defaultHeaders,
-      body: JSON.stringify({
-        success: false,
-        error: 'SERVER_CONFIG_ERROR',
-        message: 'Supabase server client could not be initialized.',
-      }),
-    };
-  }
-
   try {
-    const { data, error } = await supabase
-      .from('source_videos')
-      .select('*')
-      .eq('workspace_id', workspaceId.trim())
-      .order('created_at', { ascending: false });
+    const q = query(
+      collection(db, 'source_videos'),
+      where('workspace_id', '==', workspaceId.trim())
+    );
+    const querySnap = await getDocs(q);
+    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
 
-    if (error) {
-      return {
-        statusCode: 500,
-        headers: defaultHeaders,
-        body: JSON.stringify({
-          success: false,
-          error: error.code || 'QUERY_FAILED',
-          message: error.message,
-        }),
-      };
-    }
-
-    const records = data || [];
     return {
       statusCode: 200,
       headers: defaultHeaders,

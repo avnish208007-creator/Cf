@@ -3,8 +3,13 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import http from 'http';
-import { getSupabaseServerClient } from '../discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
 import { OutputValidator } from './OutputValidator';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleValidateExistingClipsRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -17,40 +22,19 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
   }
 
   const workspaceId = ((req.query.workspaceId as string) || '').trim();
-  const authHeader = req.headers.authorization || '';
-  const userAccessToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
-
-  const supabase = getSupabaseServerClient(userAccessToken);
-  if (!supabase) {
-    res.status(500).json({
-      success: false,
-      error: 'SERVER_CONFIG_ERROR',
-      message: 'Supabase server client could not be initialized.',
-    });
-    return;
-  }
 
   try {
-    // 1. Fetch all clips
-    let query = supabase.from('clips').select('*');
+    let q;
     if (workspaceId) {
-      query = query.eq('workspace_id', workspaceId);
-    }
-    const { data: clips, error } = await query;
-
-    if (error) {
-      res.status(500).json({
-        success: false,
-        error: 'QUERY_FAILED',
-        message: error.message,
-      });
-      return;
+      q = query(collection(db, 'clips'), where('workspace_id', '==', workspaceId));
+    } else {
+      q = query(collection(db, 'clips'));
     }
 
-    const records = clips || [];
+    const querySnap = await getDocs(q);
+    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })) as any[];
     const results = [];
 
-    // Ensure tmp folder exists
     const tmpDir = path.resolve(process.cwd(), 'temp_media', 'validate');
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
@@ -74,7 +58,6 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
       let filePath = '';
       let isTemp = false;
 
-      // Handle local versus remote URLs
       if (videoUrl.includes('/api/media/clips/')) {
         const filename = videoUrl.split('/').pop() || '';
         filePath = path.resolve(process.cwd(), 'temp_media', 'rendered', filename);
@@ -117,7 +100,6 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
         }
       }
 
-      // Check existence and size
       if (!filePath || !fs.existsSync(filePath) || fs.statSync(filePath).size < 1000) {
         if (isTemp && filePath && fs.existsSync(filePath)) {
           try { fs.unlinkSync(filePath); } catch (_) {}
@@ -132,11 +114,9 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
         continue;
       }
 
-      // Run robust validation (H.264, yuv420p, 1080x1920, moving frames check)
       const durationNum = Number(cl.duration?.replace('s', '')) || 15;
       const validation = await validator.validate(filePath, durationNum);
 
-      // Clean up downloaded temp file if applicable
       if (isTemp && fs.existsSync(filePath)) {
         try { fs.unlinkSync(filePath); } catch (_) {}
       }

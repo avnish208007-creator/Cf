@@ -1,15 +1,14 @@
 import { Request, Response } from 'express';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, query, where, getDocs, limit } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
 import { MomentPipeline } from './MomentPipeline';
-import { getSupabaseServerClient } from '../discovery/pipeline';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleAnalyzeRequest(req: Request, res: Response) {
   try {
-    const authHeader = req.headers.authorization;
-    let userAccessToken: string | undefined;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      userAccessToken = authHeader.slice(7).trim();
-    }
-
     const {
       workspaceId,
       sourceId,
@@ -26,50 +25,38 @@ export async function handleAnalyzeRequest(req: Request, res: Response) {
       });
     }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return res.status(503).json({
-        success: false,
-        error: 'DATABASE_UNAVAILABLE',
-        message: 'Supabase database is not configured.',
-      });
-    }
-
-    // Retrieve workspace settings for niche and subtopics if not passed
     let activeNiche = passedNiche || 'Fitness & Hypertrophy';
     let activeSubtopics: string[] = passedSubtopics || [];
 
     if (!passedNiche || activeSubtopics.length === 0) {
-      const { data: settings } = await supabase
-        .from('workspace_settings')
-        .select('main_niche, subtopics')
-        .eq('workspace_id', workspaceId)
-        .maybeSingle();
+      const settingsQuery = query(
+        collection(db, 'workspace_settings'),
+        where('workspace_id', '==', workspaceId),
+        limit(1)
+      );
+      const settingsSnap = await getDocs(settingsQuery);
 
-      if (settings) {
+      if (!settingsSnap.empty) {
+        const settings = settingsSnap.docs[0].data();
         activeNiche = passedNiche || settings.main_niche || activeNiche;
         activeSubtopics = activeSubtopics.length > 0 ? activeSubtopics : settings.subtopics || [];
       }
     }
 
-    // Determine target sources to analyze
     let targetSourceIds: string[] = [];
     if (sourceId) {
       targetSourceIds = [sourceId];
     } else if (Array.isArray(passedSourceIds) && passedSourceIds.length > 0) {
       targetSourceIds = passedSourceIds;
     } else {
-      // Analyze all 'new' or 'queued' sources in this workspace
-      const { data: sources } = await supabase
-        .from('source_videos')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .in('status', ['new', 'queued'])
-        .limit(5);
-
-      if (sources && sources.length > 0) {
-        targetSourceIds = sources.map((s) => s.id);
-      }
+      const sourcesQuery = query(
+        collection(db, 'source_videos'),
+        where('workspace_id', '==', workspaceId),
+        where('status', 'in', ['new', 'queued']),
+        limit(5)
+      );
+      const sourcesSnap = await getDocs(sourcesQuery);
+      targetSourceIds = sourcesSnap.docs.map((d) => d.id);
     }
 
     if (targetSourceIds.length === 0) {
@@ -82,7 +69,7 @@ export async function handleAnalyzeRequest(req: Request, res: Response) {
       });
     }
 
-    const pipeline = new MomentPipeline(undefined, undefined, undefined, supabase);
+    const pipeline = new MomentPipeline();
 
     const results = await pipeline.analyzeSources(targetSourceIds, {
       workspaceId,

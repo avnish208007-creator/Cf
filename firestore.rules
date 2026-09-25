@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    match /workspaces/{workspaceId} {
+      allow read, write: if true;
+    }
+
+    match /workspace_settings/{settingsId} {
+      allow read, write: if true;
+    }
+
+    match /source_videos/{sourceId} {
+      allow read, write: if true;
+    }
+
+    match /clip_candidates/{candidateId} {
+      allow read, write: if true;
+    }
+
+    match /clips/{clipId} {
+      allow read, write: if true;
+    }
+
+    match /render_jobs/{jobId} {
+      allow read, write: if true;
+    }
+
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

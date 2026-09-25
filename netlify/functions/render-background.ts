@@ -1,5 +1,4 @@
 import type { Handler, HandlerEvent } from '@netlify/functions';
-import { getSupabaseServerClient } from '../../src/server/discovery/pipeline';
 import { RenderWorker } from '../../src/server/rendering/RenderWorker';
 
 export const handler: Handler = async (event: HandlerEvent) => {
@@ -12,21 +11,15 @@ export const handler: Handler = async (event: HandlerEvent) => {
     }
 
     const body = event.body ? JSON.parse(event.body) : {};
-    const { jobId, userAccessToken } = body;
+    const { jobId } = body;
 
     if (!jobId) {
       console.error('[render-background] Missing jobId in request body.');
       return { statusCode: 400 };
     }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      console.error('[render-background] Database client could not be instantiated.');
-      return { statusCode: 500 };
-    }
-
     console.log(`[render-background] Executing RenderWorker for jobId: ${jobId}`);
-    const worker = new RenderWorker(supabase);
+    const worker = new RenderWorker();
     const success = await worker.process(jobId);
     console.log(`[render-background] RenderWorker process complete. Success: ${success}`);
 

@@ -1,4 +1,9 @@
-import { SupabaseClient } from '@supabase/supabase-js';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, doc, updateDoc } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export type JobStatus =
   | 'queued'
@@ -11,15 +16,6 @@ export type JobStatus =
   | 'failed';
 
 export class RenderJobService {
-  private supabase: SupabaseClient;
-
-  constructor(supabase: SupabaseClient) {
-    this.supabase = supabase;
-  }
-
-  /**
-   * Safe status transitions ensuring only allowed V1 states are set.
-   */
   public async transition(
     jobId: string,
     status: JobStatus,
@@ -29,10 +25,9 @@ export class RenderJobService {
   ): Promise<void> {
     console.log(`[RenderJobService] Transitioning job ${jobId} to state "${status}" [${progress}%] - ${stage}`);
 
-    // Standard database fields mapped from our V1 architecture
     const updateData: any = {
       status: status === 'completed' || status === 'failed' ? status : 'running',
-      stage: status, // Align stage to allowed V1 states
+      stage: status,
       progress,
       completed_at: status === 'completed' || status === 'failed' ? new Date().toISOString() : null,
     };
@@ -44,13 +39,10 @@ export class RenderJobService {
       updateData.stage = 'failed';
     }
 
-    const { error } = await this.supabase
-      .from('jobs')
-      .update(updateData)
-      .eq('id', jobId);
-
-    if (error) {
-      console.error(`[RenderJobService] Failed to update job ${jobId} in Supabase:`, error.message);
+    try {
+      await updateDoc(doc(db, 'render_jobs', jobId), updateData);
+    } catch (error: any) {
+      console.error(`[RenderJobService] Failed to update job ${jobId} in Firestore:`, error.message);
     }
   }
 }

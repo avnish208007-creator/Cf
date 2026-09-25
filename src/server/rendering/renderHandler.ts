@@ -1,8 +1,13 @@
 import { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { getSupabaseServerClient } from '../discovery/pipeline';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import firebaseConfig from '../../../firebase-applet-config.json';
 import { RenderWorker } from './RenderWorker';
+
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 const renderedDir = path.resolve(process.cwd(), 'temp_media', 'rendered');
 
@@ -10,18 +15,8 @@ if (!fs.existsSync(renderedDir)) {
   fs.mkdirSync(renderedDir, { recursive: true });
 }
 
-/**
- * Main production render endpoint.
- * POST /api/render
- */
 export async function handleRenderRequest(req: Request, res: Response) {
   try {
-    const authHeader = req.headers.authorization;
-    let userAccessToken: string | undefined;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      userAccessToken = authHeader.slice(7).trim();
-    }
-
     const { candidateId, workspaceId } = req.body || {};
 
     if (!candidateId || !workspaceId) {
@@ -32,87 +27,60 @@ export async function handleRenderRequest(req: Request, res: Response) {
       });
     }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return res.status(500).json({
-        success: false,
-        error: 'DATABASE_UNAVAILABLE',
-        message: 'Could not connect to database.',
-      });
-    }
-
-    // 1. Check for active duplicate jobs to prevent rendering overload
-    const { data: candidate } = await supabase
-      .from('clip_candidates')
-      .select('*')
-      .eq('id', candidateId)
-      .maybeSingle();
+    const candRef = doc(db, 'clip_candidates', candidateId);
+    const candSnap = await getDoc(candRef);
+    const candidate = candSnap.exists() ? candSnap.data() : null;
 
     if (candidate && candidate.factors && candidate.factors.activeJobId) {
       const activeJobId = candidate.factors.activeJobId;
-      const { data: activeJob } = await supabase
-        .from('jobs')
-        .select('*')
-        .eq('id', activeJobId)
-        .maybeSingle();
-
-      if (activeJob && (activeJob.status === 'queued' || activeJob.status === 'running')) {
-        console.log(`[handleRenderRequest] Duplicate job active for candidate: ${activeJobId}`);
-        return res.status(202).json({
-          success: true,
-          jobId: activeJobId,
-          status: 'queued',
-          message: 'An active render is already in progress for this candidate. Reusing job.'
-        });
+      const jobSnap = await getDoc(doc(db, 'render_jobs', activeJobId));
+      if (jobSnap.exists()) {
+        const activeJob = jobSnap.data();
+        if (activeJob.status === 'queued' || activeJob.status === 'running') {
+          console.log(`[handleRenderRequest] Duplicate job active for candidate: ${activeJobId}`);
+          return res.status(202).json({
+            success: true,
+            jobId: activeJobId,
+            status: 'queued',
+            message: 'An active render is already in progress for this candidate. Reusing job.'
+          });
+        }
       }
     }
 
-    // 2. Generate compliant UUID for the job
     const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0;
       const v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
 
-    // 3. Create a jobs row in Supabase (status: 'queued')
-    const { error: jobInsertErr } = await supabase
-      .from('jobs')
-      .insert({
-        id: jobId,
-        workspace_id: workspaceId,
-        type: 'vertical_render',
-        target_title: `Render Clip: ${candidateId}`,
-        progress: 0,
-        stage: 'queued',
-        status: 'queued',
-        metadata: { candidateId }
-      });
+    const now = new Date().toISOString();
 
-    if (jobInsertErr) {
-      console.error('[handleRenderRequest] Failed to insert job row:', jobInsertErr.message);
-      return res.status(500).json({
-        success: false,
-        error: 'DATABASE_FAILURE',
-        message: 'Could not initiate a render job: ' + jobInsertErr.message,
-      });
-    }
+    await setDoc(doc(db, 'render_jobs', jobId), {
+      id: jobId,
+      workspace_id: workspaceId,
+      type: 'vertical_render',
+      target_title: `Render Clip: ${candidateId}`,
+      progress: 0,
+      stage: 'queued',
+      status: 'queued',
+      created_at: now,
+      metadata: { candidateId }
+    });
 
-    // 4. Update candidate factors to bind activeJobId
     const existingFactors = (candidate?.factors || {}) as any;
-    await supabase
-      .from('clip_candidates')
-      .update({
+    if (candSnap.exists()) {
+      await updateDoc(candRef, {
         status: 'generating',
         factors: {
           ...existingFactors,
           renderStatus: 'rendering',
           activeJobId: jobId,
         }
-      })
-      .eq('id', candidateId);
+      });
+    }
 
-    // 5. Trigger the Replaceable Worker asynchronously (Fire-and-forget background execution)
-    const worker = new RenderWorker(supabase);
+    const worker = new RenderWorker();
     worker.process(jobId).catch((err) => {
       console.error(`[handleRenderRequest] Worker process background failure for job ${jobId}:`, err);
     });
@@ -133,23 +101,9 @@ export async function handleRenderRequest(req: Request, res: Response) {
   }
 }
 
-/**
- * Isolated development/test handler using real moving local MP4 assets.
- * NEVER reachable from the normal render button.
- */
 export async function handleDevRenderTestRequest(req: Request, res: Response) {
   try {
-    const authHeader = req.headers.authorization;
-    let userAccessToken: string | undefined;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      userAccessToken = authHeader.slice(7).trim();
-    }
-
     const { candidateId, workspaceId } = req.body || {};
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return res.status(500).json({ success: false, message: 'Database client not available.' });
-    }
 
     const testVideoPath = path.resolve(process.cwd(), 'tmp', 'media', 'dev_moving_test.mp4');
     if (!fs.existsSync(testVideoPath)) {
@@ -158,14 +112,13 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
 
     console.log(`[handleDevRenderTestRequest] Triggering isolated worker test using real moving MP4 at: ${testVideoPath}`);
     
-    // Create direct test job
     const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0;
       const v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
 
-    await supabase.from('jobs').insert({
+    await setDoc(doc(db, 'render_jobs', jobId), {
       id: jobId,
       workspace_id: workspaceId || 'a0000000-0000-4000-a000-000000000001',
       type: 'vertical_render',
@@ -173,11 +126,11 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
       progress: 0,
       stage: 'queued',
       status: 'queued',
+      created_at: new Date().toISOString(),
       metadata: { candidateId: candidateId || 'dev-test' }
     });
 
-    const worker = new RenderWorker(supabase);
-    // Execute test synchronously to return output directly
+    const worker = new RenderWorker();
     const success = await worker.process(jobId);
 
     return res.status(success ? 200 : 422).json({
@@ -190,36 +143,20 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
   }
 }
 
-/**
- * Retrieves the asynchronous status of a render job from the jobs database.
- * GET /api/render/jobs/:jobId
- */
 export async function handleRenderJobStatus(req: Request, res: Response) {
   try {
     const { jobId } = req.params;
-    const authHeader = req.headers.authorization;
-    let userAccessToken: string | undefined;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      userAccessToken = authHeader.slice(7).trim();
-    }
 
-    const supabase = getSupabaseServerClient(userAccessToken);
-    if (!supabase) {
-      return res.status(500).json({ success: false, message: 'Database client not available.' });
-    }
+    const jobSnap = await getDoc(doc(db, 'render_jobs', jobId));
 
-    const { data: job, error } = await supabase
-      .from('jobs')
-      .select('*')
-      .eq('id', jobId)
-      .maybeSingle();
-
-    if (error || !job) {
+    if (!jobSnap.exists()) {
       return res.status(404).json({
         success: false,
         message: `Job ${jobId} not found in database.`,
       });
     }
+
+    const job = jobSnap.data();
 
     return res.json({
       success: true,
@@ -240,9 +177,6 @@ export async function handleRenderJobStatus(req: Request, res: Response) {
   }
 }
 
-/**
- * Serves media streaming with Range support
- */
 export function handleMediaStreaming(req: Request, res: Response) {
   const { filename } = req.params;
   const sanitized = path.basename(filename);
