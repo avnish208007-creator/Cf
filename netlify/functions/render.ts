@@ -1,5 +1,6 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { supabase } from '../../src/lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../src/lib/firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import crypto from 'crypto';
 
 const defaultHeaders: Record<string, string> = {
@@ -32,56 +33,57 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
 
   try {
     const payload = event.body ? JSON.parse(event.body) : {};
-    const { candidateId, workspaceId } = payload;
+    const { candidateId, workspaceId = DEFAULT_WORKSPACE_ID } = payload;
+    const effectiveWsId = workspaceId.trim() || DEFAULT_WORKSPACE_ID;
 
-    if (!candidateId || !workspaceId) {
+    if (!candidateId) {
       return {
         statusCode: 400,
         headers: defaultHeaders,
         body: JSON.stringify({
           success: false,
           error: 'MISSING_PARAMETERS',
-          message: 'candidateId and workspaceId are required to render.',
+          message: 'candidateId is required to render.',
         }),
       };
     }
 
-    const { data: candidate } = await supabase
-      .from('clip_candidates')
-      .select('*')
-      .eq('id', candidateId)
-      .maybeSingle();
+    const candRef = doc(db, 'workspaces', effectiveWsId, 'candidates', candidateId);
+    const candSnap = await getDoc(candRef);
+    const candidate = candSnap.exists() ? candSnap.data() : null;
 
     const jobId = crypto.randomUUID();
     const now = new Date().toISOString();
 
+    const jobRef = doc(db, 'workspaces', effectiveWsId, 'jobs', jobId);
     try {
-      await supabase.from('render_jobs').insert({
+      await setDoc(jobRef, {
         id: jobId,
-        workspace_id: workspaceId,
+        workspaceId: effectiveWsId,
         type: 'vertical_render',
-        target_title: `Render Clip: ${candidateId}`,
+        targetTitle: `Render Clip: ${candidateId}`,
         progress: 0,
         stage: 'queued',
         status: 'queued',
-        created_at: now,
+        createdAt: now,
       });
     } catch (_) {}
 
     if (candidate) {
       const existingFactors = (candidate.factors || {}) as any;
-      await supabase
-        .from('clip_candidates')
-        .update({
+      await setDoc(
+        candRef,
+        {
           status: 'generating',
           factors: {
             ...existingFactors,
             renderStatus: 'rendering',
             activeJobId: jobId,
           },
-          updated_at: now,
-        })
-        .eq('id', candidateId);
+          updatedAt: now,
+        },
+        { merge: true }
+      );
     }
 
     return {

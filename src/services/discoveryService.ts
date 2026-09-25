@@ -28,7 +28,7 @@ export class DiscoveryService {
 
   /**
    * Discovers relevant long-form source videos automatically
-   * based on active workspace niche, subtopics, and filters, and persists them to Supabase.
+   * based on active workspace niche, subtopics, and filters, and persists them to Firebase.
    */
   public static async discoverSources(
     options: DiscoveryFilterOptions
@@ -100,9 +100,9 @@ export class DiscoveryService {
 
         const rawVideos = Array.isArray(data.videos) ? data.videos : [];
 
-        // Map discovered items to standard SourceVideo entities using the REAL Supabase IDs
+        // Map discovered items to standard SourceVideo entities using the REAL database IDs
         const sourceVideos: SourceVideo[] = rawVideos.map((v: any) => ({
-          id: v.id, // Preserves the real UUID persisted in Supabase
+          id: v.id, // Preserves the real UUID persisted in Firebase
           title: v.title || 'Untitled Video',
           description: v.description,
           channelTitle: v.channelTitle || 'YouTube Channel',

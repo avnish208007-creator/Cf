@@ -3,7 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import http from 'http';
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { collection, getDocs } from 'firebase/firestore';
 import { OutputValidator } from './OutputValidator';
 
 export async function handleValidateExistingClipsRequest(req: Request, res: Response): Promise<void> {
@@ -16,16 +17,12 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
     return;
   }
 
-  const workspaceId = ((req.query.workspaceId as string) || '').trim();
+  const workspaceId = ((req.query.workspaceId as string) || DEFAULT_WORKSPACE_ID).trim();
 
   try {
-    let queryBuilder = supabase.from('clips').select('*');
-    if (workspaceId) {
-      queryBuilder = queryBuilder.eq('workspace_id', workspaceId);
-    }
-
-    const { data: records, error } = await queryBuilder;
-    if (error) throw new Error(error.message);
+    const clipsColRef = collection(db, 'workspaces', workspaceId, 'clips');
+    const snapshot = await getDocs(clipsColRef);
+    const records = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     const results = [];
 
@@ -36,12 +33,12 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
 
     const validator = new OutputValidator();
 
-    for (const cl of (records || [])) {
-      const videoUrl = cl.video_url;
+    for (const cl of records) {
+      const videoUrl = (cl as any).videoUrl || (cl as any).video_url;
       if (!videoUrl) {
         results.push({
           id: cl.id,
-          title: cl.title,
+          title: (cl as any).title,
           videoUrl: null,
           status: 'INVALID_SYNTHETIC_OUTPUT',
           details: 'No video URL present on the clip record.',
@@ -85,7 +82,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
           }
           results.push({
             id: cl.id,
-            title: cl.title,
+            title: (cl as any).title,
             videoUrl,
             status: 'INVALID_SYNTHETIC_OUTPUT',
             details: `Failed to download external MP4: ${downloadErr.message}`,
@@ -100,7 +97,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
         }
         results.push({
           id: cl.id,
-          title: cl.title,
+          title: (cl as any).title,
           videoUrl,
           status: 'INVALID_SYNTHETIC_OUTPUT',
           details: 'Media file does not exist or is empty.',
@@ -108,7 +105,8 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
         continue;
       }
 
-      const durationNum = Number(cl.duration?.replace('s', '')) || 15;
+      const durationStr = (cl as any).duration || '15s';
+      const durationNum = Number(durationStr.replace('s', '')) || 15;
       const validation = await validator.validate(filePath, durationNum);
 
       if (isTemp && fs.existsSync(filePath)) {
@@ -118,7 +116,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
       if (validation.valid) {
         results.push({
           id: cl.id,
-          title: cl.title,
+          title: (cl as any).title,
           videoUrl,
           status: 'VALID_REAL_VIDEO',
           details: `Resolution: ${validation.width}x${validation.height}, Duration: ${validation.duration}s, Codec: ${validation.videoCodec}`,
@@ -126,7 +124,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
       } else {
         results.push({
           id: cl.id,
-          title: cl.title,
+          title: (cl as any).title,
           videoUrl,
           status: 'INVALID_SYNTHETIC_OUTPUT',
           details: validation.errorMessage || 'Invalid media content or format.',
@@ -137,7 +135,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
     res.status(200).json({
       success: true,
       workspaceId,
-      totalCount: (records || []).length,
+      totalCount: records.length,
       validatedClips: results,
     });
   } catch (err: any) {

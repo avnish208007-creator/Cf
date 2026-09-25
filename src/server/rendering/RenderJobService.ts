@@ -1,4 +1,5 @@
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { doc, setDoc } from 'firebase/firestore';
 
 export type JobStatus =
   | 'queued'
@@ -16,7 +17,8 @@ export class RenderJobService {
     status: JobStatus,
     progress: number,
     stage: string,
-    errorDetails?: { code: string; message: string }
+    errorDetails?: { code: string; message: string },
+    workspaceId: string = DEFAULT_WORKSPACE_ID
   ): Promise<void> {
     console.log(`[RenderJobService] Transitioning job ${jobId} to state "${status}" [${progress}%] - ${stage}`);
 
@@ -24,25 +26,20 @@ export class RenderJobService {
       status: status === 'completed' || status === 'failed' ? status : 'running',
       stage: status,
       progress,
-      completed_at: status === 'completed' || status === 'failed' ? new Date().toISOString() : null,
+      updatedAt: new Date().toISOString(),
+      completedAt: status === 'completed' || status === 'failed' ? new Date().toISOString() : null,
     };
 
     if (errorDetails) {
-      updateData.error_code = errorDetails.code;
-      updateData.error_message = errorDetails.message;
+      updateData.errorCode = errorDetails.code;
+      updateData.errorMessage = errorDetails.message;
       updateData.status = 'failed';
       updateData.stage = 'failed';
     }
 
     try {
-      const { error } = await supabase
-        .from('render_jobs')
-        .update(updateData)
-        .eq('id', jobId);
-
-      if (error) {
-        console.warn(`[RenderJobService] Notice updating job ${jobId} in Supabase:`, error.message);
-      }
+      const jobRef = doc(db, 'workspaces', workspaceId, 'jobs', jobId);
+      await setDoc(jobRef, updateData, { merge: true });
     } catch (error: any) {
       console.error(`[RenderJobService] Exception updating job ${jobId}:`, error.message);
     }

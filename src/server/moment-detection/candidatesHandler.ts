@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { collection, getDocs, query, orderBy } from 'firebase/firestore';
 
 export async function handleCandidatesRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -14,32 +15,18 @@ export async function handleCandidatesRequest(req: Request, res: Response): Prom
   const workspaceId = (
     (req.query.workspaceId as string) ||
     (req.body && req.body.workspaceId) ||
-    ''
+    DEFAULT_WORKSPACE_ID
   ).trim();
 
   try {
-    let sourcesForWorkspace: any[] = [];
-    if (workspaceId) {
-      const { data: srcData } = await supabase
-        .from('source_videos')
-        .select('*')
-        .eq('workspace_id', workspaceId);
-      sourcesForWorkspace = srcData || [];
-    }
+    const sourcesColRef = collection(db, 'workspaces', workspaceId, 'sources');
+    const sourcesSnap = await getDocs(sourcesColRef);
+    const sourcesForWorkspace = sourcesSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    let workspaceCandidates: any[] = [];
-    if (workspaceId) {
-      const { data: candData, error } = await supabase
-        .from('clip_candidates')
-        .select('*')
-        .eq('workspace_id', workspaceId)
-        .order('score', { ascending: false });
-
-      if (error) {
-        throw new Error(error.message);
-      }
-      workspaceCandidates = candData || [];
-    }
+    const candsColRef = collection(db, 'workspaces', workspaceId, 'candidates');
+    const q = query(candsColRef, orderBy('score', 'desc'));
+    const candsSnap = await getDocs(q);
+    const workspaceCandidates = candsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     console.log(`[CandidatesHandler] Workspace: ${workspaceId} -> ${workspaceCandidates.length} candidates`);
 
@@ -55,7 +42,7 @@ export async function handleCandidatesRequest(req: Request, res: Response): Prom
     res.status(500).json({
       success: false,
       error: 'FETCH_CANDIDATES_FAILED',
-      message: err.message || 'An unexpected error occurred while querying candidates from Supabase.',
+      message: err.message || 'An unexpected error occurred while querying candidates from Firestore.',
     });
   }
 }

@@ -1,5 +1,6 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { supabase } from '../../src/lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../src/lib/firebase';
+import { doc, getDoc, collection, getDocs } from 'firebase/firestore';
 import { MomentPipeline } from '../../src/server/moment-detection/MomentPipeline';
 
 const defaultHeaders: Record<string, string> = {
@@ -33,38 +34,26 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   try {
     const payload = event.body ? JSON.parse(event.body) : {};
     const {
-      workspaceId,
+      workspaceId = DEFAULT_WORKSPACE_ID,
       sourceId,
       sourceIds: passedSourceIds,
       niche: passedNiche,
       subtopics: passedSubtopics,
     } = payload;
 
-    if (!workspaceId || typeof workspaceId !== 'string' || !workspaceId.trim()) {
-      return {
-        statusCode: 400,
-        headers: defaultHeaders,
-        body: JSON.stringify({
-          success: false,
-          error: 'MISSING_WORKSPACE_ID',
-          message: 'Active workspace ID is required for moment analysis.',
-        }),
-      };
-    }
+    const effectiveWsId = workspaceId.trim() || DEFAULT_WORKSPACE_ID;
 
-    let activeNiche = passedNiche || 'Fitness & Hypertrophy';
+    let activeNiche = passedNiche || 'AI & Technology';
     let activeSubtopics: string[] = passedSubtopics || [];
 
     if (!passedNiche || activeSubtopics.length === 0) {
-      const { data: settings } = await supabase
-        .from('workspace_settings')
-        .select('*')
-        .eq('workspace_id', workspaceId)
-        .maybeSingle();
+      const wsRef = doc(db, 'workspaces', effectiveWsId);
+      const wsSnap = await getDoc(wsRef);
+      const wsData = wsSnap.exists() ? wsSnap.data() : null;
 
-      if (settings) {
-        activeNiche = passedNiche || settings.main_niche || activeNiche;
-        activeSubtopics = activeSubtopics.length > 0 ? activeSubtopics : settings.subtopics || [];
+      if (wsData) {
+        activeNiche = passedNiche || wsData.mainNiche || wsData.config?.mainNiche || activeNiche;
+        activeSubtopics = activeSubtopics.length > 0 ? activeSubtopics : wsData.config?.subtopics || ['AI Agents', 'Automation'];
       }
     }
 
@@ -74,14 +63,14 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     } else if (Array.isArray(passedSourceIds) && passedSourceIds.length > 0) {
       targetSourceIds = passedSourceIds;
     } else {
-      const { data: sources } = await supabase
-        .from('source_videos')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .in('status', ['new', 'queued'])
-        .limit(5);
+      const sourcesColRef = collection(db, 'workspaces', effectiveWsId, 'sources');
+      const sourcesSnap = await getDocs(sourcesColRef);
+      const unanalyzed = sourcesSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() } as any))
+        .filter((s) => s.status === 'new' || s.status === 'queued')
+        .slice(0, 5);
 
-      targetSourceIds = (sources || []).map((s) => s.id);
+      targetSourceIds = unanalyzed.map((s: any) => s.id);
     }
 
     if (targetSourceIds.length === 0) {
@@ -101,7 +90,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     const pipeline = new MomentPipeline();
 
     const results = await pipeline.analyzeSources(targetSourceIds, {
-      workspaceId,
+      workspaceId: effectiveWsId,
       niche: activeNiche,
       subtopics: activeSubtopics,
     });

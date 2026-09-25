@@ -2,67 +2,51 @@ import React, { useState, useMemo } from 'react';
 import {
   Compass,
   Search,
+  MoreVertical,
+  Plus,
+  Trash2,
   Sparkles,
   ExternalLink,
-  MoreVertical,
-  Trash2,
+  Check,
   CheckSquare,
   Square,
-  AlertTriangle,
-  Play,
-  Clock,
-  Eye,
-  RefreshCw,
-  Plus,
   X,
   Filter,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { SourceVideo } from '../types';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { AddUrlModal } from '../components/ui/AddUrlModal';
+import { VideoDetailDrawer } from '../components/ui/VideoDetailDrawer';
+import { EmptyState } from '../components/ui/EmptyState';
+import { VideoCardSkeleton } from '../components/ui/Skeleton';
 
 export const DiscoverPage: React.FC = () => {
   const {
     sources,
     isFetchingSources,
-    sourcesFetchError,
-    fetchSources,
+    runDiscovery,
+    isDiscovering,
+    analyzeSource,
     deleteSource,
     bulkDeleteSources,
-    runDiscovery,
-    analyzeSource,
-    analyzeAllSources,
-    isDiscovering,
-    isAnalyzing,
     addSource,
+    candidates,
     workspace,
   } = useApp();
 
-  // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'new' | 'analyzed' | 'processing'>('all');
-  const [selectedSubtopic, setSelectedSubtopic] = useState<string>('all');
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
 
-  // Bulk Selection State
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Modal / Drawer state
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+  const [showBulkConfirm, setShowBulkConfirm] = useState(false);
+  const [showAddUrlModal, setShowAddUrlModal] = useState(false);
+  const [detailVideo, setDetailVideo] = useState<SourceVideo | null>(null);
 
-  // Delete Confirmation Modal State
-  const [deleteConfirmTarget, setDeleteConfirmTarget] = useState<{
-    type: 'single' | 'bulk';
-    sourceId?: string;
-    sourceTitle?: string;
-    count?: number;
-  } | null>(null);
-
-  // Overflow Menu active state
-  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
-
-  // Manual source add drawer state
-  const [showAddDrawer, setShowAddDrawer] = useState(false);
-  const [addTitle, setAddTitle] = useState('');
-  const [addUrl, setAddUrl] = useState('');
-  const [addSubtopic, setAddSubtopic] = useState(workspace.subtopics[0] || workspace.mainNiche);
-
-  // Filter sources
+  // Filtered sources
   const filteredSources = useMemo(() => {
     return sources.filter((src) => {
       const matchesSearch =
@@ -70,483 +54,368 @@ export const DiscoverPage: React.FC = () => {
         src.channelTitle.toLowerCase().includes(searchQuery.toLowerCase());
 
       const matchesStatus =
-        statusFilter === 'all' ||
-        (statusFilter === 'new' && (src.status === 'new' || src.status === 'queued')) ||
-        (statusFilter === 'analyzed' && src.status === 'analyzed') ||
-        (statusFilter === 'processing' && src.status === 'processing');
+        statusFilter === 'all'
+          ? true
+          : statusFilter === 'new'
+          ? src.status === 'new' || src.status === 'queued'
+          : statusFilter === 'analyzed'
+          ? src.status === 'analyzed'
+          : src.status === 'processing';
 
-      const matchesSubtopic =
-        selectedSubtopic === 'all' || src.niche === selectedSubtopic;
-
-      return matchesSearch && matchesStatus && matchesSubtopic;
+      return matchesSearch && matchesStatus;
     });
-  }, [sources, searchQuery, statusFilter, selectedSubtopic]);
+  }, [sources, searchQuery, statusFilter]);
 
-  const allVisibleSelected = useMemo(() => {
-    if (filteredSources.length === 0) return false;
-    return filteredSources.every((src) => selectedIds.has(src.id));
-  }, [filteredSources, selectedIds]);
-
-  // Toggle selection
-  const toggleSelectOne = (id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
+  // Bulk selection toggles
+  const handleToggleSelect = (id: string) => {
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
   };
 
-  const toggleSelectAllVisible = () => {
-    if (allVisibleSelected) {
-      setSelectedIds(new Set());
+  const handleSelectAll = () => {
+    if (selectedIds.length === filteredSources.length) {
+      setSelectedIds([]);
     } else {
-      const next = new Set<string>();
-      filteredSources.forEach((src) => next.add(src.id));
-      setSelectedIds(next);
+      setSelectedIds(filteredSources.map((s) => s.id));
     }
   };
 
-  const handleSingleDeleteRequest = (source: SourceVideo) => {
-    setActiveMenuId(null);
-    setDeleteConfirmTarget({
-      type: 'single',
-      sourceId: source.id,
-      sourceTitle: source.title,
-    });
-  };
-
-  const handleBulkDeleteRequest = () => {
-    setDeleteConfirmTarget({
-      type: 'bulk',
-      count: selectedIds.size,
-    });
-  };
-
-  const confirmDelete = async () => {
-    if (!deleteConfirmTarget) return;
-
-    if (deleteConfirmTarget.type === 'single' && deleteConfirmTarget.sourceId) {
-      await deleteSource(deleteConfirmTarget.sourceId);
-    } else if (deleteConfirmTarget.type === 'bulk') {
-      await bulkDeleteSources(Array.from(selectedIds));
-      setSelectedIds(new Set());
+  const handleConfirmSingleDelete = async () => {
+    if (deleteTargetId) {
+      await deleteSource(deleteTargetId);
+      setDeleteTargetId(null);
+      setSelectedIds((prev) => prev.filter((id) => id !== deleteTargetId));
     }
-
-    setDeleteConfirmTarget(null);
   };
 
-  const handleAddSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!addTitle.trim()) return;
-    await addSource({
-      title: addTitle.trim(),
-      youtubeUrl: addUrl.trim() || `https://www.youtube.com/watch?v=${Date.now()}`,
-      niche: addSubtopic,
-    });
-    setAddTitle('');
-    setAddUrl('');
-    setShowAddDrawer(false);
+  const handleConfirmBulkDelete = async () => {
+    if (selectedIds.length > 0) {
+      await bulkDeleteSources(selectedIds);
+      setSelectedIds([]);
+      setShowBulkConfirm(false);
+    }
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
+    <div className="space-y-6 pb-12">
       {/* Page Header */}
-      <div className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-20 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-xl font-semibold tracking-tight text-white">
-                Discover Sources
-              </h1>
-              <span className="text-xs font-medium text-slate-400 font-mono bg-slate-800/80 px-2 py-0.5 rounded">
-                {sources.length} videos
-              </span>
-            </div>
-            <p className="text-xs text-slate-400 mt-1">
-              Find long-form YouTube videos worth turning into short-form clips for{' '}
-              <span className="text-slate-200 font-medium">{workspace.mainNiche}</span>.
-            </p>
-          </div>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200/80">
+        <div className="space-y-0.5">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+            Discover
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-500">
+            Find videos worth turning into shorts.
+          </p>
+        </div>
 
-          {/* Primary Action Buttons */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => runDiscovery()}
-              disabled={isDiscovering}
-              className="px-3.5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
-            >
-              <Compass className={`w-3.5 h-3.5 ${isDiscovering ? 'animate-spin' : ''}`} />
-              <span>{isDiscovering ? 'Searching...' : 'Run Discovery'}</span>
-            </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowAddUrlModal(true)}
+            className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors shadow-2xs flex items-center gap-1.5 cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Add URL</span>
+          </button>
 
-            <button
-              onClick={() => analyzeAllSources()}
-              disabled={isAnalyzing || sources.filter((s) => s.status === 'new').length === 0}
-              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
-            >
-              <Sparkles className={`w-3.5 h-3.5 text-amber-400 ${isAnalyzing ? 'animate-spin' : ''}`} />
-              <span>{isAnalyzing ? 'Analyzing...' : 'Analyze All New'}</span>
-            </button>
-
-            <button
-              onClick={() => setShowAddDrawer(!showAddDrawer)}
-              className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Add URL</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => runDiscovery()}
+            disabled={isDiscovering}
+            className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors shadow-2xs flex items-center gap-1.5 cursor-pointer"
+          >
+            <Compass className={`w-3.5 h-3.5 ${isDiscovering ? 'animate-spin' : ''}`} />
+            <span>{isDiscovering ? 'Searching...' : 'Find videos'}</span>
+          </button>
         </div>
       </div>
 
-      {/* Main Content Area */}
-      <div className="max-w-7xl mx-auto w-full px-6 py-6 flex-1 space-y-5">
-        {/* Manual Add Drawer */}
-        {showAddDrawer && (
-          <div className="p-4 bg-slate-900/90 border border-slate-800 rounded-xl space-y-3">
-            <div className="flex items-center justify-between text-xs font-semibold text-white">
-              <span>Manually Add Source Video</span>
-              <button onClick={() => setShowAddDrawer(false)} className="text-slate-400 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <form onSubmit={handleAddSubmit} className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <input
-                type="text"
-                placeholder="Video Title..."
-                value={addTitle}
-                onChange={(e) => setAddTitle(e.target.value)}
-                required
-                className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500"
-              />
-              <input
-                type="url"
-                placeholder="YouTube URL..."
-                value={addUrl}
-                onChange={(e) => setAddUrl(e.target.value)}
-                className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500"
-              />
-              <button
-                type="submit"
-                className="py-1.5 px-4 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-              >
-                Add Video Record
-              </button>
-            </form>
-          </div>
-        )}
-
-        {/* Filter Controls & Search Bar */}
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-slate-900/40 p-2.5 rounded-xl border border-slate-800/80">
-          {/* Status Tabs (Interactive Segmented Control) */}
-          <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800/60">
-            {(['all', 'new', 'analyzed', 'processing'] as const).map((tab) => (
-              <button
-                key={tab}
-                onClick={() => setStatusFilter(tab)}
-                className={`px-3 py-1 text-xs font-medium rounded-md transition-all cursor-pointer capitalize ${
-                  statusFilter === tab
-                    ? 'bg-slate-800 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {tab}
-              </button>
-            ))}
-          </div>
-
-          {/* Search Input & Subtopic Filter */}
-          <div className="flex items-center gap-2">
-            <div className="relative flex-1 sm:w-64">
-              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-              <input
-                type="text"
-                placeholder="Search title or channel..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500 placeholder:text-slate-500"
-              />
-            </div>
-
-            {workspace.subtopics.length > 0 && (
-              <select
-                value={selectedSubtopic}
-                onChange={(e) => setSelectedSubtopic(e.target.value)}
-                className="px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-300 focus:outline-hidden focus:border-blue-500 cursor-pointer"
-              >
-                <option value="all">All Subtopics</option>
-                {workspace.subtopics.map((st) => (
-                  <option key={st} value={st}>
-                    {st}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
+      {/* Search & Filter Toolbar */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+        {/* Search Input */}
+        <div className="relative flex-1 max-w-md">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+          <input
+            type="text"
+            placeholder="Search videos or channels..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-slate-900 placeholder:text-slate-400"
+          />
         </div>
 
-        {/* Bulk Actions Contextual Toolbar */}
-        {selectedIds.size > 0 && (
-          <div className="flex items-center justify-between px-4 py-2.5 bg-blue-950/70 border border-blue-800/80 rounded-xl text-xs text-blue-200 animate-in fade-in duration-150">
-            <div className="flex items-center gap-2 font-medium">
-              <span className="font-semibold text-white">{selectedIds.size} selected</span>
-              <span className="text-slate-400">·</span>
-              <button
-                onClick={toggleSelectAllVisible}
-                className="text-blue-300 hover:text-white underline cursor-pointer"
-              >
-                {allVisibleSelected ? 'Deselect all' : 'Select all visible'}
-              </button>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleBulkDeleteRequest}
-                className="px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Delete Selected</span>
-              </button>
-              <button
-                onClick={() => setSelectedIds(new Set())}
-                className="px-2.5 py-1 text-slate-400 hover:text-white cursor-pointer"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Source Content List */}
-        {filteredSources.length === 0 ? (
-          <div className="p-12 text-center border border-dashed border-slate-800 rounded-2xl bg-slate-900/20">
-            <Compass className="w-8 h-8 text-slate-600 mx-auto mb-3" />
-            <h3 className="text-sm font-semibold text-slate-200">No discovered videos found</h3>
-            <p className="text-xs text-slate-500 max-w-md mx-auto mt-1 mb-4">
-              Run automatic discovery to query YouTube RSS feeds for videos matching your niche.
-            </p>
+        {/* Filter Tabs */}
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200/60 self-start sm:self-auto">
+          {(['all', 'new', 'analyzed', 'processing'] as const).map((tab) => (
             <button
-              onClick={() => runDiscovery()}
-              disabled={isDiscovering}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+              key={tab}
+              onClick={() => setStatusFilter(tab)}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md capitalize transition-colors cursor-pointer ${
+                statusFilter === tab
+                  ? 'bg-white text-slate-900 shadow-2xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
             >
-              Run Discovery
+              {tab}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Bulk Action Contextual Toolbar */}
+      {selectedIds.length > 0 && (
+        <div className="p-3 bg-slate-900 text-white rounded-xl shadow-md flex items-center justify-between animate-in fade-in duration-150">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleSelectAll}
+              className="text-xs font-medium text-slate-300 hover:text-white flex items-center gap-1.5"
+            >
+              {selectedIds.length === filteredSources.length ? (
+                <CheckSquare className="w-4 h-4 text-blue-400" />
+              ) : (
+                <Square className="w-4 h-4 text-slate-400" />
+              )}
+              <span>{selectedIds.length} selected</span>
             </button>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredSources.map((source) => {
-              const isSelected = selectedIds.has(source.id);
-              const youtubeId = source.youtubeUrl ? source.youtubeUrl.split('v=').pop()?.split('&')[0] : null;
-              const thumbUrl = youtubeId ? `https://i.ytimg.com/vi/${youtubeId}/mqdefault.jpg` : null;
 
-              return (
-                <div
-                  key={source.id}
-                  className={`group relative bg-slate-900/70 border transition-all rounded-xl overflow-hidden flex flex-col justify-between ${
-                    isSelected ? 'border-blue-500 ring-1 ring-blue-500 bg-slate-900' : 'border-slate-800 hover:border-slate-700'
-                  }`}
-                >
-                  {/* Card Header & Thumbnail */}
-                  <div>
-                    <div className="relative aspect-video bg-slate-950 overflow-hidden">
-                      {thumbUrl ? (
-                        <img
-                          src={thumbUrl}
-                          alt={source.title}
-                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                        />
-                      ) : (
-                        <div className={`w-full h-full bg-gradient-to-br ${source.thumbnailGradient || 'from-slate-900 to-indigo-950'} flex items-center justify-center text-slate-600`}>
-                          <Play className="w-8 h-8 opacity-40" />
-                        </div>
-                      )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowBulkConfirm(true)}
+              className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete selected</span>
+            </button>
+            <button
+              onClick={() => setSelectedIds([])}
+              className="p-1.5 text-slate-400 hover:text-white transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
-                      {/* Select Checkbox */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleSelectOne(source.id);
-                        }}
-                        className="absolute top-2 left-2 p-1 rounded-md bg-slate-950/80 hover:bg-slate-900 text-white backdrop-blur-xs cursor-pointer z-10"
-                      >
-                        {isSelected ? (
-                          <CheckSquare className="w-4 h-4 text-blue-400" />
-                        ) : (
-                          <Square className="w-4 h-4 text-slate-400 opacity-80 group-hover:opacity-100" />
-                        )}
-                      </button>
+      {/* Main Content View */}
+      {isFetchingSources ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <VideoCardSkeleton />
+          <VideoCardSkeleton />
+          <VideoCardSkeleton />
+        </div>
+      ) : filteredSources.length === 0 ? (
+        <EmptyState
+          icon={Compass}
+          title="No videos found"
+          description={
+            searchQuery
+              ? `No videos match "${searchQuery}".`
+              : 'Find YouTube videos for your niche to extract clips.'
+          }
+          actionLabel="Find videos"
+          onAction={() => runDiscovery()}
+        />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filteredSources.map((video) => {
+            const isSelected = selectedIds.includes(video.id);
 
-                      {/* Duration Tag */}
-                      <div className="absolute bottom-2 right-2 px-1.5 py-0.5 bg-slate-950/90 text-[10px] font-mono font-medium text-slate-200 rounded backdrop-blur-xs">
-                        {source.duration || '12:00'}
-                      </div>
+            return (
+              <div
+                key={video.id}
+                className={`bg-white border rounded-xl overflow-hidden transition-all duration-150 flex flex-col ${
+                  isSelected
+                    ? 'border-blue-500 ring-1 ring-blue-500/20'
+                    : 'border-slate-200/80 hover:border-slate-300'
+                }`}
+              >
+                {/* Card Thumbnail Area */}
+                <div className="relative aspect-video bg-slate-900 group">
+                  {video.youtubeUrl ? (
+                    <img
+                      src={`https://img.youtube.com/vi/${
+                        video.youtubeUrl.split('v=')[1]?.split('&')[0]
+                      }/hqdefault.jpg`}
+                      alt={video.title}
+                      className="w-full h-full object-cover group-hover:scale-102 transition-transform duration-300"
+                      onError={(e) => {
+                        // Fallback gradient container if image fails
+                        (e.target as HTMLElement).style.display = 'none';
+                      }}
+                    />
+                  ) : null}
 
-                      {/* Status Overlay */}
-                      <div className="absolute top-2 right-2">
-                        {source.status === 'analyzed' ? (
-                          <span className="px-2 py-0.5 text-[10px] font-medium bg-emerald-950/90 text-emerald-300 border border-emerald-800/80 rounded backdrop-blur-xs">
-                            Analyzed
-                          </span>
-                        ) : source.status === 'processing' ? (
-                          <span className="px-2 py-0.5 text-[10px] font-medium bg-blue-950/90 text-blue-300 border border-blue-800/80 rounded backdrop-blur-xs flex items-center gap-1">
-                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping" />
-                            Analyzing
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 text-[10px] font-medium bg-slate-950/90 text-slate-400 border border-slate-800 rounded backdrop-blur-xs">
-                            New
-                          </span>
-                        )}
-                      </div>
-                    </div>
+                  {/* Fallback gradient if no img */}
+                  <div className={`absolute inset-0 bg-gradient-to-br ${video.thumbnailGradient || 'from-slate-800 to-slate-900'} -z-10`} />
 
-                    {/* Card Body */}
-                    <div className="p-4 space-y-2">
-                      <h2 className="text-sm font-semibold text-slate-100 line-clamp-2 leading-snug group-hover:text-blue-400 transition-colors">
-                        {source.title}
-                      </h2>
+                  {/* Selection Checkbox */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleToggleSelect(video.id);
+                    }}
+                    className="absolute top-2.5 left-2.5 z-10 p-1 rounded-md bg-slate-900/60 backdrop-blur-xs text-white hover:bg-slate-900 transition-colors"
+                  >
+                    {isSelected ? (
+                      <CheckSquare className="w-4 h-4 text-blue-400" />
+                    ) : (
+                      <Square className="w-4 h-4 text-slate-300" />
+                    )}
+                  </button>
 
-                      {/* Anti-Slop Clean Text Metadata */}
-                      <div className="flex items-center gap-1.5 text-xs text-slate-400">
-                        <span className="font-medium text-slate-300 truncate">{source.channelTitle}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{source.publishedAt || 'Recently'}</span>
-                        {source.relevanceScore !== undefined && (
-                          <>
-                            <span aria-hidden="true">·</span>
-                            <span className="text-emerald-400 font-mono text-[11px] font-semibold">
-                              {source.relevanceScore}% fit
-                            </span>
-                          </>
-                        )}
-                      </div>
+                  {/* Duration Overlay */}
+                  <span className="absolute bottom-2.5 right-2.5 bg-slate-950/80 text-white font-mono text-[11px] px-1.5 py-0.5 rounded tabular-nums">
+                    {video.duration || '10:00'}
+                  </span>
+                </div>
+
+                {/* Card Body */}
+                <div className="p-4 flex-1 flex flex-col justify-between space-y-3">
+                  <div className="space-y-1">
+                    <h3
+                      onClick={() => setDetailVideo(video)}
+                      className="text-sm font-semibold text-slate-900 leading-snug line-clamp-2 hover:text-blue-600 transition-colors cursor-pointer"
+                    >
+                      {video.title}
+                    </h3>
+
+                    {/* Unboxed Text Metadata */}
+                    <div className="flex items-center gap-1.5 text-xs text-slate-500">
+                      <span className="font-medium text-slate-700 truncate max-w-[140px]">
+                        {video.channelTitle}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>{video.publishedAt}</span>
                     </div>
                   </div>
 
-                  {/* Card Actions & Overflow Menu */}
-                  <div className="p-4 pt-0 flex items-center justify-between gap-2 border-t border-slate-800/60 mt-3 pt-3">
-                    {source.status === 'new' ? (
-                      <button
-                        onClick={() => analyzeSource(source.id)}
-                        disabled={isAnalyzing}
-                        className="flex-1 py-1.5 px-3 bg-blue-600/90 hover:bg-blue-500 text-white font-medium text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
-                      >
-                        <Sparkles className="w-3.5 h-3.5" />
-                        <span>Analyze Moments</span>
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => analyzeSource(source.id)}
-                        className="flex-1 py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Re-analyze</span>
-                      </button>
-                    )}
+                  {/* Footer Actions */}
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span className="text-[11px] font-medium text-slate-500 capitalize">
+                      {video.status === 'analyzed'
+                        ? `${video.candidatesCount || 0} moments`
+                        : video.status}
+                    </span>
 
-                    {/* Overflow Menu (···) */}
-                    <div className="relative">
+                    <div className="flex items-center gap-1.5 relative">
+                      {video.status !== 'analyzed' && (
+                        <button
+                          type="button"
+                          onClick={() => analyzeSource(video.id)}
+                          className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-xs font-medium transition-colors shadow-2xs flex items-center gap-1 cursor-pointer"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          <span>Analyze</span>
+                        </button>
+                      )}
+
+                      {/* Overflow Menu Toggle */}
                       <button
-                        onClick={() => setActiveMenuId(activeMenuId === source.id ? null : source.id)}
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
-                        title="More options"
+                        type="button"
+                        onClick={() =>
+                          setOpenMenuId(openMenuId === video.id ? null : video.id)
+                        }
+                        className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-colors cursor-pointer"
                       >
                         <MoreVertical className="w-4 h-4" />
                       </button>
 
-                      {activeMenuId === source.id && (
-                        <div className="absolute right-0 bottom-full mb-1 w-44 bg-slate-900 border border-slate-800 rounded-xl shadow-xl z-30 p-1 text-xs space-y-0.5 animate-in fade-in duration-100">
+                      {/* Overflow Menu Dropdown */}
+                      {openMenuId === video.id && (
+                        <div
+                          className="absolute right-0 bottom-8 z-20 w-44 bg-white border border-slate-200 rounded-lg shadow-lg py-1 text-xs space-y-0.5 animate-in zoom-in-95 duration-100"
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           <button
                             onClick={() => {
-                              setActiveMenuId(null);
-                              analyzeSource(source.id);
+                              setDetailVideo(video);
+                              setOpenMenuId(null);
                             }}
-                            className="w-full text-left px-3 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg flex items-center gap-2 cursor-pointer"
+                            className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer"
                           >
-                            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                            <span>Analyze</span>
+                            <Sparkles className="w-3.5 h-3.5 text-blue-600" />
+                            <span>View details</span>
                           </button>
 
-                          {source.youtubeUrl && (
+                          {video.youtubeUrl && (
                             <a
-                              href={source.youtubeUrl}
+                              href={video.youtubeUrl}
                               target="_blank"
                               rel="noreferrer"
-                              onClick={() => setActiveMenuId(null)}
-                              className="w-full text-left px-3 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg flex items-center gap-2 cursor-pointer"
+                              onClick={() => setOpenMenuId(null)}
+                              className="w-full text-left px-3 py-1.5 text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer"
                             >
                               <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
                               <span>Open YouTube</span>
                             </a>
                           )}
 
-                          <div className="border-t border-slate-800/80 my-1" />
-
                           <button
-                            onClick={() => handleSingleDeleteRequest(source)}
-                            className="w-full text-left px-3 py-2 text-rose-400 hover:bg-rose-950/60 rounded-lg flex items-center gap-2 cursor-pointer"
+                            onClick={() => {
+                              setDeleteTargetId(video.id);
+                              setOpenMenuId(null);
+                            }}
+                            className="w-full text-left px-3 py-1.5 text-rose-600 hover:bg-rose-50 flex items-center gap-2 cursor-pointer"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
-                            <span>Remove from discoveries</span>
+                            <span>Remove</span>
                           </button>
                         </div>
                       )}
                     </div>
                   </div>
                 </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Delete Confirmation Modal */}
-      {deleteConfirmTarget && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
-            <div className="flex items-start gap-3 text-rose-400">
-              <div className="p-2 bg-rose-950/80 border border-rose-800/60 rounded-xl shrink-0">
-                <AlertTriangle className="w-5 h-5" />
               </div>
-              <div>
-                <h3 className="text-base font-semibold text-white">
-                  {deleteConfirmTarget.type === 'single'
-                    ? 'Remove this video?'
-                    : `Remove ${deleteConfirmTarget.count} selected videos?`}
-                </h3>
-                <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-                  Removing it will permanently delete the source record from Supabase and remove associated candidates and clips.
-                </p>
-                {deleteConfirmTarget.sourceTitle && (
-                  <p className="text-xs font-medium text-slate-300 mt-2 italic line-clamp-2">
-                    "{deleteConfirmTarget.sourceTitle}"
-                  </p>
-                )}
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
-              <button
-                onClick={() => setDeleteConfirmTarget(null)}
-                className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDelete}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors cursor-pointer"
-              >
-                {deleteConfirmTarget.type === 'single' ? 'Remove video' : 'Remove selected'}
-              </button>
-            </div>
-          </div>
+            );
+          })}
         </div>
       )}
+
+      {/* Confirmation Dialogs & Modals */}
+      <ConfirmDialog
+        isOpen={Boolean(deleteTargetId)}
+        title="Remove this video?"
+        description="Removing it will also remove its associated candidate moments and clips."
+        confirmLabel="Remove video"
+        cancelLabel="Cancel"
+        isDestructive={true}
+        onConfirm={handleConfirmSingleDelete}
+        onCancel={() => setDeleteTargetId(null)}
+      />
+
+      <ConfirmDialog
+        isOpen={showBulkConfirm}
+        title={`Remove ${selectedIds.length} videos?`}
+        description="Removing selected videos will also clean up their candidate moments."
+        confirmLabel="Remove videos"
+        cancelLabel="Cancel"
+        isDestructive={true}
+        onConfirm={handleConfirmBulkDelete}
+        onCancel={() => setShowBulkConfirm(false)}
+      />
+
+      <AddUrlModal
+        isOpen={showAddUrlModal}
+        onClose={() => setShowAddUrlModal(false)}
+        onSubmit={addSource}
+        defaultNiche={workspace.mainNiche}
+      />
+
+      <VideoDetailDrawer
+        isOpen={Boolean(detailVideo)}
+        onClose={() => setDetailVideo(null)}
+        video={detailVideo}
+        candidates={candidates}
+        onAnalyze={analyzeSource}
+        onDelete={(id) => {
+          setDetailVideo(null);
+          setDeleteTargetId(id);
+        }}
+      />
     </div>
   );
 };

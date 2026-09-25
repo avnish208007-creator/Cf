@@ -18,7 +18,7 @@ export const INITIAL_USER: UserSession = {
 
 /**
  * DEFAULT WORKSPACE CONFIGURATION
- * Initial state before onboarding or Supabase load
+ * Initial state before onboarding or Firebase load
  */
 export const INITIAL_WORKSPACE: WorkspaceConfig = {
   workspaceName: 'Media Operations Hub',
@@ -42,7 +42,7 @@ export const INITIAL_WORKSPACE: WorkspaceConfig = {
  * CLEAN INITIAL PRODUCTION STATE
  *
  * In accordance with ClipFlow production architecture:
- * - Supabase is the single source of truth.
+ * - Firebase is the single source of truth.
  * - No mock videos, fake candidates, dummy clips, or artificial metrics are presented as real data.
  * - If discovery has not been run or database tables are empty, clean zero-state UI is rendered.
  */

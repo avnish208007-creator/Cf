@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { SourceMediaProvider } from '../rendering/SourceMediaProvider';
 
 export async function handleCandidateSelectRequest(req: Request, res: Response): Promise<void> {
@@ -12,7 +13,7 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
     return;
   }
 
-  const { candidateId, workspaceId } = req.body || {};
+  const { candidateId, workspaceId = DEFAULT_WORKSPACE_ID } = req.body || {};
 
   if (!candidateId) {
     res.status(400).json({
@@ -26,13 +27,11 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
   console.log(`[Render] candidate selected: ${candidateId}`);
 
   try {
-    const { data: candidate } = await supabase
-      .from('clip_candidates')
-      .select('*')
-      .eq('id', candidateId)
-      .maybeSingle();
+    const effectiveWsId = workspaceId.trim() || DEFAULT_WORKSPACE_ID;
+    const candRef = doc(db, 'workspaces', effectiveWsId, 'candidates', candidateId);
+    const candSnap = await getDoc(candRef);
 
-    if (!candidate) {
+    if (!candSnap.exists()) {
       res.status(404).json({
         success: false,
         error: 'CANDIDATE_NOT_FOUND',
@@ -41,17 +40,16 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       return;
     }
 
-    const effectiveWsId = candidate.workspace_id || workspaceId;
+    const candidate = candSnap.data();
     const factors = (candidate.factors || {}) as any;
 
     let sourceVideo: any = null;
-    if (candidate.source_video_id) {
-      const { data: srcData } = await supabase
-        .from('source_videos')
-        .select('*')
-        .eq('id', candidate.source_video_id)
-        .maybeSingle();
-      sourceVideo = srcData;
+    if (candidate.sourceVideoId) {
+      const srcRef = doc(db, 'workspaces', effectiveWsId, 'sources', candidate.sourceVideoId);
+      const srcSnap = await getDoc(srcRef);
+      if (srcSnap.exists()) {
+        sourceVideo = srcSnap.data();
+      }
     }
 
     const updatedFactorsInitial = {
@@ -61,25 +59,26 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       selectedAt: new Date().toISOString(),
     };
 
-    await supabase
-      .from('clip_candidates')
-      .update({
+    await setDoc(
+      candRef,
+      {
         status: 'approved',
         factors: updatedFactorsInitial,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', candidateId);
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
 
     const mediaProvider = new SourceMediaProvider();
     let mediaResult: any;
 
     try {
       const sourceInfo = await mediaProvider.acquire({
-        id: sourceVideo?.id || candidate.source_video_id || candidateId,
-        youtube_url: sourceVideo?.youtube_url || factors.sourceYoutubeUrl || '',
-        mediaUrl: sourceVideo?.media_url || candidate.mediaUrl,
-        mediaPath: sourceVideo?.media_path || candidate.mediaPath,
-        title: sourceVideo?.title || candidate.source_title || '',
+        id: sourceVideo?.id || candidate.sourceVideoId || candidateId,
+        youtube_url: sourceVideo?.youtubeUrl || factors.sourceYoutubeUrl || '',
+        mediaUrl: sourceVideo?.mediaUrl || candidate.mediaUrl,
+        mediaPath: sourceVideo?.mediaPath || candidate.mediaPath,
+        title: sourceVideo?.title || candidate.sourceTitle || '',
       });
 
       mediaResult = {
@@ -104,27 +103,31 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
     if (mediaResult.success && mediaResult.status === 'available' && mediaResult.mediaPath) {
       finalRenderStatus = 'media_ready';
       if (sourceVideo?.id) {
-        await supabase
-          .from('source_videos')
-          .update({
-            media_status: 'available',
-            media_path: mediaResult.mediaPath,
-            media_url: mediaResult.mediaUrl,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', sourceVideo.id);
+        const srcRef = doc(db, 'workspaces', effectiveWsId, 'sources', sourceVideo.id);
+        await setDoc(
+          srcRef,
+          {
+            mediaStatus: 'available',
+            mediaPath: mediaResult.mediaPath,
+            mediaUrl: mediaResult.mediaUrl,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
       }
     } else {
       finalRenderStatus = 'failed';
       if (sourceVideo?.id) {
-        await supabase
-          .from('source_videos')
-          .update({
-            media_status: 'unavailable',
-            media_error: mediaResult.errorMessage || mediaResult.errorCode,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', sourceVideo.id);
+        const srcRef = doc(db, 'workspaces', effectiveWsId, 'sources', sourceVideo.id);
+        await setDoc(
+          srcRef,
+          {
+            mediaStatus: 'unavailable',
+            mediaError: mediaResult.errorMessage || mediaResult.errorCode,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
       }
     }
 
@@ -139,13 +142,14 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       mediaUrl: mediaResult.mediaUrl,
     };
 
-    await supabase
-      .from('clip_candidates')
-      .update({
+    await setDoc(
+      candRef,
+      {
         factors: finalFactors,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', candidateId);
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
 
     res.status(200).json({
       success: true,
@@ -156,6 +160,7 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       renderStatus: finalRenderStatus,
       mediaResult,
       candidate: {
+        id: candidateId,
         ...candidate,
         status: 'approved',
         factors: finalFactors,

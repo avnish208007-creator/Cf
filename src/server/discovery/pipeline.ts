@@ -1,5 +1,14 @@
 import 'dotenv/config';
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import {
+  doc,
+  getDoc,
+  setDoc,
+  collection,
+  getDocs,
+  query,
+  where,
+} from 'firebase/firestore';
 import {
   DiscoveredVideo,
   DiscoveryPipelineOptions,
@@ -32,7 +41,7 @@ export async function runDiscoveryPipeline(
   providerOverride?: IDiscoveryProvider
 ): Promise<DiscoveryPipelineResult> {
   const {
-    workspaceId,
+    workspaceId = DEFAULT_WORKSPACE_ID,
     niche: optionNiche,
     subtopics: optionSubtopics,
     language: optionLanguage,
@@ -45,46 +54,34 @@ export async function runDiscoveryPipeline(
     workspaceName,
   } = options;
 
-  if (!workspaceId || !workspaceId.trim()) {
-    throw new Error('Workspace ID is required to run discovery and persist records to Supabase.');
-  }
-
-  const authenticatedWorkspaceId = workspaceId.trim();
+  const authenticatedWorkspaceId = workspaceId.trim() || DEFAULT_WORKSPACE_ID;
   console.log(`[ClipFlow] DISCOVERY started for workspace: ${authenticatedWorkspaceId}`);
 
-  // 1. Authenticate / ensure workspace in Supabase
-  const { data: wsData } = await supabase
-    .from('workspaces')
-    .select('id')
-    .eq('id', authenticatedWorkspaceId)
-    .maybeSingle();
+  // 1. Get or create workspace document in Firestore
+  const wsRef = doc(db, 'workspaces', authenticatedWorkspaceId);
+  const wsSnap = await getDoc(wsRef);
 
-  if (!wsData) {
-    const ownerId = '791454a8-e110-430e-8a5d-c1b343a140c9';
-    await supabase.from('workspaces').upsert({
+  let wsData: any = null;
+  if (!wsSnap.exists()) {
+    wsData = {
       id: authenticatedWorkspaceId,
-      name: workspaceName || 'Apex Media Lab',
-      owner_id: ownerId,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
+      name: workspaceName || 'ClipFlow Workspace',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await setDoc(wsRef, wsData, { merge: true });
+  } else {
+    wsData = wsSnap.data();
   }
 
-  // 2. Read active workspace configuration and history
-  const { data: dbSettings } = await supabase
-    .from('workspace_settings')
-    .select('*')
-    .eq('workspace_id', authenticatedWorkspaceId)
-    .maybeSingle();
-
-  const activeNiche = (optionNiche && optionNiche.trim()) || dbSettings?.main_niche || 'Fitness & Strength Training';
+  const activeNiche = (optionNiche && optionNiche.trim()) || wsData?.config?.mainNiche || wsData?.mainNiche || 'AI & Technology';
   const activeSubtopics = (optionSubtopics && optionSubtopics.length > 0)
     ? optionSubtopics
-    : (dbSettings?.subtopics && dbSettings.subtopics.length > 0)
-    ? dbSettings.subtopics
-    : ['Workout Science', 'Hypertrophy Mechanics', 'Nutrition'];
-  const activeLanguage = optionLanguage || dbSettings?.content_language || 'English (US)';
-  const minScoreThreshold = dbSettings?.min_candidate_score || 60;
+    : (wsData?.config?.subtopics && wsData.config.subtopics.length > 0)
+    ? wsData.config.subtopics
+    : ['AI Agents', 'Automation', 'LLMs'];
+  const activeLanguage = optionLanguage || wsData?.config?.contentLanguage || 'English';
+  const minScoreThreshold = wsData?.config?.minCandidateScore || 70;
 
   // Gather existing discovered videos in this workspace to track history
   const knownSet = new Set<string>();
@@ -94,16 +91,14 @@ export async function runDiscoveryPipeline(
   }
 
   let totalExistingCount = 0;
+  const sourcesColRef = collection(db, 'workspaces', authenticatedWorkspaceId, 'sources');
   try {
-    const { data: sourcesData } = await supabase
-      .from('source_videos')
-      .select('youtube_url')
-      .eq('workspace_id', authenticatedWorkspaceId);
-
-    totalExistingCount = sourcesData?.length || 0;
-    (sourcesData || []).forEach((data) => {
-      if (data.youtube_url) {
-        const extracted = extractYouTubeId(data.youtube_url);
+    const sourcesSnapshot = await getDocs(sourcesColRef);
+    totalExistingCount = sourcesSnapshot.docs.length;
+    sourcesSnapshot.docs.forEach((d) => {
+      const data = d.data();
+      if (data.youtubeUrl) {
+        const extracted = extractYouTubeId(data.youtubeUrl);
         if (extracted) knownSet.add(extracted);
       }
     });
@@ -229,30 +224,28 @@ export async function runDiscoveryPipeline(
 
     const insertPayload = {
       id: newSourceId,
-      workspace_id: authenticatedWorkspaceId,
+      workspaceId: authenticatedWorkspaceId,
       title: v.title,
-      channel_title: v.channelTitle,
+      channelTitle: v.channelTitle,
       duration: v.duration,
-      view_count: v.viewCount,
-      published_at: v.publishedAt,
-      youtube_url: v.youtubeUrl,
+      viewCount: v.viewCount,
+      publishedAt: v.publishedAt,
+      youtubeUrl: v.youtubeUrl,
       status: 'new',
-      relevance_score: v.overallScore,
-      freshness_tag: `Overall: ${v.overallScore}% · Short-Form: ${v.shortFormScore}%`,
-      candidates_count: 0,
+      relevanceScore: v.overallScore,
+      freshnessTag: `Overall: ${v.overallScore}% · Short-Form: ${v.shortFormScore}%`,
+      candidatesCount: 0,
       summary: formattedSummary,
       niche: v.niche || activeNiche,
-      thumbnail_gradient: v.thumbnailGradient || 'from-slate-900 via-indigo-950 to-slate-900',
-      created_at: now,
-      updated_at: now,
+      thumbnailGradient: v.thumbnailGradient || 'from-slate-900 via-indigo-950 to-slate-900',
+      createdAt: now,
+      updatedAt: now,
     };
 
-    const { error: insertErr } = await supabase.from('source_videos').insert(insertPayload);
-
-    if (insertErr) {
-      console.error(`[ClipFlow] SOURCE INSERT FAILED for "${v.title}":`, insertErr.message);
-    } else {
-      console.log(`[ClipFlow] SOURCE INSERT SUCCESS in Supabase: ${newSourceId} - "${v.title}"`);
+    try {
+      const sourceDocRef = doc(db, 'workspaces', authenticatedWorkspaceId, 'sources', newSourceId);
+      await setDoc(sourceDocRef, insertPayload);
+      console.log(`[ClipFlow] SOURCE INSERT SUCCESS in Firestore: ${newSourceId} - "${v.title}"`);
 
       insertedVideos.push({
         ...v,
@@ -270,6 +263,8 @@ export async function runDiscoveryPipeline(
         is_development_source: isDevSource,
         isDevelopmentSource: isDevSource,
       });
+    } catch (insertErr: any) {
+      console.error(`[ClipFlow] SOURCE INSERT FAILED for "${v.title}":`, insertErr.message);
     }
   }
 

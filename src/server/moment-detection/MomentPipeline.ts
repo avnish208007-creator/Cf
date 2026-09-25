@@ -1,4 +1,13 @@
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import {
+  doc,
+  getDoc,
+  setDoc,
+  collection,
+  getDocs,
+  query,
+  where,
+} from 'firebase/firestore';
 import {
   ExtractedContent,
   MomentDetectionPipelineOptions,
@@ -43,14 +52,13 @@ export class MomentPipeline {
     sourceId: string,
     options: MomentDetectionPipelineOptions
   ): Promise<MomentDetectionSourceResult> {
-    // 1. Fetch source video from Supabase
-    const { data: source } = await supabase
-      .from('source_videos')
-      .select('*')
-      .eq('id', sourceId)
-      .maybeSingle();
+    const workspaceId = options.workspaceId || DEFAULT_WORKSPACE_ID;
 
-    if (!source) {
+    // 1. Fetch source video from Firestore
+    const sourceRef = doc(db, 'workspaces', workspaceId, 'sources', sourceId);
+    const sourceSnap = await getDoc(sourceRef);
+
+    if (!sourceSnap.exists()) {
       return {
         sourceId,
         videoTitle: 'Unknown Source',
@@ -59,34 +67,36 @@ export class MomentPipeline {
         contentStatus: 'content_unavailable',
         candidatesFound: 0,
         candidates: [],
-        message: 'Source video record not found in Supabase.',
+        message: 'Source video record not found in Firestore.',
       };
     }
 
-    // 2. Mark source as analyzing / processing
-    await supabase.from('source_videos').update({ status: 'processing', updated_at: new Date().toISOString() }).eq('id', sourceId);
+    const source = sourceSnap.data();
 
-    console.log(`[MomentPipeline] Analyzing source "${source.title}" (${source.youtube_url})...`);
+    // 2. Mark source as processing
+    await setDoc(sourceRef, { status: 'processing', updatedAt: new Date().toISOString() }, { merge: true });
+
+    console.log(`[MomentPipeline] Analyzing source "${source.title}" (${source.youtubeUrl})...`);
 
     // 3. Extract content
     let extracted: ExtractedContent;
     try {
       extracted = await this.contentExtractor.extractContent({
-        id: source.id,
-        youtubeUrl: source.youtube_url,
+        id: sourceId,
+        youtubeUrl: source.youtubeUrl,
         title: source.title,
-        channelTitle: source.channel_title,
+        channelTitle: source.channelTitle,
         description: source.summary || '',
         summary: source.summary || '',
       });
     } catch (err: any) {
-      console.warn(`[MomentPipeline] Content extraction error for ${source.id}:`, err);
+      console.warn(`[MomentPipeline] Content extraction error for ${sourceId}:`, err);
       extracted = {
         hasContent: false,
         contentType: 'none',
-        videoId: source.id,
+        videoId: sourceId,
         videoTitle: source.title,
-        channelTitle: source.channel_title,
+        channelTitle: source.channelTitle,
         description: '',
         fullText: '',
         reason: `Content unavailable for analysis: ${err.message || 'Extraction failed'}`,
@@ -97,17 +107,17 @@ export class MomentPipeline {
       const failureReason = extracted.reason || 'Content unavailable for analysis: No transcript or chapter outline available for this video.';
       console.log(`[MomentPipeline] Source "${source.title}" content unavailable.`);
 
-      await supabase.from('source_videos').update({
+      await setDoc(sourceRef, {
         status: 'analyzed',
-        candidates_count: 0,
+        candidatesCount: 0,
         summary: `${failureReason} · ${source.summary || ''}`,
-        updated_at: new Date().toISOString(),
-      }).eq('id', sourceId);
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
 
       return {
         sourceId,
         videoTitle: source.title,
-        youtubeUrl: source.youtube_url,
+        youtubeUrl: source.youtubeUrl,
         status: 'analyzed',
         contentStatus: 'content_unavailable',
         candidatesFound: 0,
@@ -127,17 +137,17 @@ export class MomentPipeline {
       });
     } catch (err: any) {
       console.error(`[MomentPipeline] Error during moment detection:`, err);
-      await supabase.from('source_videos').update({
+      await setDoc(sourceRef, {
         status: 'analyzed',
-        candidates_count: 0,
+        candidatesCount: 0,
         summary: `Analysis error: ${err.message || 'AI detection error'}. ${source.summary || ''}`,
-        updated_at: new Date().toISOString(),
-      }).eq('id', sourceId);
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
 
       return {
         sourceId,
         videoTitle: source.title,
-        youtubeUrl: source.youtube_url,
+        youtubeUrl: source.youtubeUrl,
         status: 'failed',
         contentStatus: extracted.contentType === 'transcript' ? 'transcript_analyzed' : 'metadata_analyzed',
         candidatesFound: 0,
@@ -149,17 +159,17 @@ export class MomentPipeline {
     if (rawMoments.length === 0) {
       const msg = 'Analyzed video content — no plausible short-form segments found in the dialogue.';
       console.log(`[MomentPipeline] ${msg} ("${source.title}")`);
-      await supabase.from('source_videos').update({
+      await setDoc(sourceRef, {
         status: 'analyzed',
-        candidates_count: 0,
+        candidatesCount: 0,
         summary: `${msg} ${source.summary || ''}`,
-        updated_at: new Date().toISOString(),
-      }).eq('id', sourceId);
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
 
       return {
         sourceId,
         videoTitle: source.title,
-        youtubeUrl: source.youtube_url,
+        youtubeUrl: source.youtubeUrl,
         status: 'analyzed',
         contentStatus: extracted.contentType === 'transcript' ? 'transcript_analyzed' : 'metadata_analyzed',
         candidatesFound: 0,
@@ -193,14 +203,15 @@ export class MomentPipeline {
       minSelectionScore: options.minCandidateScore ?? 75,
     });
 
-    // Check existing candidates in Supabase
-    const { data: existingCands } = await supabase
-      .from('clip_candidates')
-      .select('start_time, end_time')
-      .eq('source_video_id', sourceId);
+    // Check existing candidates in Firestore
+    const candsRef = collection(db, 'workspaces', workspaceId, 'candidates');
+    const candsSnap = await getDocs(candsRef);
+    const existingCands = candsSnap.docs
+      .map((d) => d.data())
+      .filter((c) => c.sourceVideoId === sourceId);
 
     const existingTimeKeys = new Set(
-      (existingCands || []).map((d) => `${d.start_time}_${d.end_time}`)
+      existingCands.map((d) => `${d.startTime}_${d.endTime}`)
     );
 
     let savedCount = 0;
@@ -241,7 +252,7 @@ export class MomentPipeline {
         hook: moment.candidate.hook,
         payoff: moment.candidate.payoff,
         contextSummary: moment.candidate.contextSummary,
-        sourceYoutubeUrl: source.youtube_url,
+        sourceYoutubeUrl: source.youtubeUrl,
       };
 
       const candidateDbStatus: 'new' | 'in_review' | 'generating' | 'approved' | 'rejected' =
@@ -254,22 +265,23 @@ export class MomentPipeline {
       const newCandId = crypto.randomUUID();
       const now = new Date().toISOString();
 
-      await supabase.from('clip_candidates').insert({
+      const candDocRef = doc(db, 'workspaces', workspaceId, 'candidates', newCandId);
+      await setDoc(candDocRef, {
         id: newCandId,
-        workspace_id: options.workspaceId,
-        source_video_id: sourceId,
-        source_title: source.title,
-        channel_title: source.channel_title,
-        start_time: moment.candidate.startTime,
-        end_time: moment.candidate.endTime,
+        workspaceId,
+        sourceVideoId: sourceId,
+        sourceTitle: source.title,
+        channelTitle: source.channelTitle,
+        startTime: moment.candidate.startTime,
+        endTime: moment.candidate.endTime,
         duration: moment.candidate.duration,
         hook: moment.candidate.hook,
         summary: `${moment.candidate.contextSummary} · Payoff: ${moment.candidate.payoff}`,
         score: moment.overallScore,
         factors: factorsPayload,
         status: candidateDbStatus,
-        created_at: now,
-        updated_at: now,
+        createdAt: now,
+        updatedAt: now,
       });
 
       console.log(`[ClipFlow] MOMENT INSERT: ${sourceId} [${moment.candidate.startTime} -> ${moment.candidate.endTime}] score: ${moment.overallScore} - "${moment.candidate.hook}"`);
@@ -277,18 +289,18 @@ export class MomentPipeline {
       savedCount++;
     }
 
-    await supabase.from('source_videos').update({
+    await setDoc(sourceRef, {
       status: 'analyzed',
-      candidates_count: savedCount,
-      updated_at: new Date().toISOString(),
-    }).eq('id', sourceId);
+      candidatesCount: savedCount,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
 
     const breakdownMsg = `${savedCount} candidates found (${selectionCounts.selected} auto-selected, ${selectionCounts.candidate} potential, ${selectionCounts.rejected} downranked)`;
 
     return {
       sourceId,
       videoTitle: source.title,
-      youtubeUrl: source.youtube_url,
+      youtubeUrl: source.youtubeUrl,
       status: 'analyzed',
       contentStatus: extracted.contentType === 'transcript' ? 'transcript_analyzed' : 'metadata_analyzed',
       candidatesFound: savedCount,

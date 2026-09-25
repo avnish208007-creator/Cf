@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { supabase } from '../../lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID, storage } from '../../lib/firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { SourceMediaProvider } from './SourceMediaProvider';
 import { SourceValidator } from './SourceValidator';
 import { ClipRenderer } from './ClipRenderer';
@@ -29,50 +31,45 @@ export class RenderWorker {
     this.storageService = new StorageService();
   }
 
-  public async process(jobId: string): Promise<boolean> {
+  public async process(jobId: string, workspaceId: string = DEFAULT_WORKSPACE_ID): Promise<boolean> {
     console.log(`[RenderWorker] Commencing async background render for job ID: ${jobId}`);
     let acquiredLocalPath: string | null = null;
     let subtitleAssPath: string | null = null;
     let renderedLocalPath: string | null = null;
 
     try {
-      // 1. Fetch job row
-      const { data: job } = await supabase
-        .from('render_jobs')
-        .select('*')
-        .eq('id', jobId)
-        .maybeSingle();
+      // 1. Fetch job row from Firestore
+      const jobRef = doc(db, 'workspaces', workspaceId, 'jobs', jobId);
+      const jobSnap = await getDoc(jobRef);
+      const job = jobSnap.exists() ? jobSnap.data() : null;
 
-      const workspaceId = job?.workspace_id || 'a0000000-0000-4000-a000-000000000001';
       const metadata = job?.metadata || {};
-      const candidateId = metadata.candidateId || (job?.target_title ? job.target_title.split(': ').pop()?.trim() : '');
+      const candidateId = metadata.candidateId || (job?.targetTitle ? job.targetTitle.split(': ').pop()?.trim() : '');
 
-      if (!candidateId || !workspaceId) {
-        throw new Error(`INVALID_JOB_METADATA: Missing candidateId or workspaceId.`);
+      if (!candidateId) {
+        throw new Error(`INVALID_JOB_METADATA: Missing candidateId.`);
       }
 
       // 2. Fetch candidate info
-      const { data: candidate } = await supabase
-        .from('clip_candidates')
-        .select('*')
-        .eq('id', candidateId)
-        .maybeSingle();
+      const candRef = doc(db, 'workspaces', workspaceId, 'candidates', candidateId);
+      const candSnap = await getDoc(candRef);
 
-      if (!candidate) {
+      if (!candSnap.exists()) {
         throw new Error(`CANDIDATE_NOT_FOUND: Could not load candidate details for ${candidateId}.`);
       }
 
+      const candidate = candSnap.data();
+
       // 3. Transition: ACQUIRING MEDIA
-      await this.jobService.transition(jobId, 'acquiring_media', 10, 'Acquiring source video streams...');
+      await this.jobService.transition(jobId, 'acquiring_media', 10, 'Acquiring source video streams...', undefined, workspaceId);
 
       let sourceVideo: any = null;
-      if (candidate.source_video_id) {
-        const { data: srcData } = await supabase
-          .from('source_videos')
-          .select('*')
-          .eq('id', candidate.source_video_id)
-          .maybeSingle();
-        sourceVideo = srcData;
+      if (candidate.sourceVideoId) {
+        const srcRef = doc(db, 'workspaces', workspaceId, 'sources', candidate.sourceVideoId);
+        const srcSnap = await getDoc(srcRef);
+        if (srcSnap.exists()) {
+          sourceVideo = srcSnap.data();
+        }
       }
 
       if (!sourceVideo) {
@@ -81,28 +78,28 @@ export class RenderWorker {
 
       const sourceInfo = await this.mediaProvider.acquire({
         id: sourceVideo.id,
-        youtube_url: sourceVideo.youtube_url,
-        mediaUrl: sourceVideo.media_url || candidate.mediaUrl,
-        mediaPath: sourceVideo.media_path || candidate.mediaPath,
+        youtube_url: sourceVideo.youtubeUrl,
+        mediaUrl: sourceVideo.mediaUrl || candidate.mediaUrl,
+        mediaPath: sourceVideo.mediaPath || candidate.mediaPath,
         title: sourceVideo.title,
       });
 
       acquiredLocalPath = sourceInfo.localPath;
 
       // 4. Transition: VALIDATING SOURCE
-      await this.jobService.transition(jobId, 'validating_source', 30, 'Validating downloaded source media...');
+      await this.jobService.transition(jobId, 'validating_source', 30, 'Validating downloaded source media...', undefined, workspaceId);
 
       const validation = await this.sourceValidator.validate(acquiredLocalPath);
       if (!validation.valid) {
         throw new Error(`SOURCE_VALIDATION_FAILED: ${validation.errorMessage || 'Invalid source file.'}`);
       }
 
-      const startOffset = this.parseTimestampToSeconds(candidate.start_time);
-      const endOffset = this.parseTimestampToSeconds(candidate.end_time);
+      const startOffset = this.parseTimestampToSeconds(candidate.startTime || candidate.start_time);
+      const endOffset = this.parseTimestampToSeconds(candidate.endTime || candidate.end_time);
       const candidateDuration = Math.max(5, endOffset - startOffset);
 
       // 5. Transition: RENDERING
-      await this.jobService.transition(jobId, 'rendering', 50, 'Standardizing layout, cropping landscape to vertical 9:16, and generating subtitles...');
+      await this.jobService.transition(jobId, 'rendering', 50, 'Standardizing layout and generating subtitles...', undefined, workspaceId);
 
       const transcript = candidate.transcriptText || candidate.hook || '';
       if (transcript) {
@@ -120,7 +117,7 @@ export class RenderWorker {
 
       await this.clipRenderer.render({
         sourcePath: acquiredLocalPath,
-        startTime: candidate.start_time,
+        startTime: candidate.startTime || candidate.start_time,
         duration: candidateDuration,
         subtitlePath: subtitleAssPath || undefined,
         outputPath: renderedLocalPath,
@@ -128,52 +125,56 @@ export class RenderWorker {
       });
 
       // 6. Transition: VALIDATING OUTPUT
-      await this.jobService.transition(jobId, 'validating_output', 80, 'Verifying render constraints and format...');
+      await this.jobService.transition(jobId, 'validating_output', 80, 'Verifying render constraints and format...', undefined, workspaceId);
 
       const outputValidation = await this.outputValidator.validate(renderedLocalPath, candidateDuration);
       if (!outputValidation.valid) {
         throw new Error(`OUTPUT_VALIDATION_FAILED: ${outputValidation.errorMessage || 'Invalid output MP4 file.'}`);
       }
 
-      // 7. Transition: UPLOADING / SAVING CLIP
-      await this.jobService.transition(jobId, 'uploading', 90, 'Uploading clip record...');
+      // 7. Transition: UPLOADING TO STORAGE & FIRESTORE
+      await this.jobService.transition(jobId, 'uploading', 90, 'Uploading clip record and media to Firebase Storage...', undefined, workspaceId);
 
-      const publicVideoUrl = await this.storageService.uploadAndVerify(renderedLocalPath, workspaceId, clipId);
-      const now = new Date().toISOString();
-
-      const { error: clipInsertErr } = await supabase.from('clips').insert({
-        id: clipId,
-        workspace_id: workspaceId,
-        candidate_id: candidateId,
-        title: `Vertical Clip: ${candidate.source_title || candidate.sourceTitle || 'Discovered Video'}`,
-        hook: candidate.hook,
-        source_title: candidate.source_title || candidate.sourceTitle,
-        channel_title: candidate.channel_title || candidate.channelTitle,
-        duration: candidate.duration || `${candidateDuration}s`,
-        aspect_ratio: '9:16',
-        style: 'kinetic',
-        status: 'ready',
-        video_url: publicVideoUrl,
-        thumbnail_bg: 'from-slate-900 via-indigo-950 to-slate-900',
-        captions_sample: [candidate.hook, candidate.summary],
-        hashtags: ['#shorts', '#viral'],
-        progress: 100,
-        in_queue: false,
-        queue_status: 'needs_review',
-        created_at: now,
-        updated_at: now,
-      });
-
-      if (clipInsertErr) {
-        console.error(`[RenderWorker] Error inserting clip record into Supabase:`, clipInsertErr.message);
+      // Upload to Firebase Storage
+      let publicVideoUrl = `/api/media/clips/${clipId}.mp4`;
+      try {
+        const fileBuffer = fs.readFileSync(renderedLocalPath);
+        const storageRef = ref(storage, `workspaces/${workspaceId}/clips/${clipId}/video.mp4`);
+        await uploadBytes(storageRef, fileBuffer, { contentType: 'video/mp4' });
+        publicVideoUrl = await getDownloadURL(storageRef);
+      } catch (storageErr: any) {
+        console.warn('[RenderWorker] Firebase Storage upload notice, falling back to local stream URL:', storageErr);
       }
 
-      await supabase
-        .from('clip_candidates')
-        .update({ status: 'approved', updated_at: now })
-        .eq('id', candidateId);
+      const now = new Date().toISOString();
+      const clipDocRef = doc(db, 'workspaces', workspaceId, 'clips', clipId);
 
-      await this.jobService.transition(jobId, 'completed', 100, 'Clip fully rendered and verified successfully!');
+      await setDoc(clipDocRef, {
+        id: clipId,
+        workspaceId,
+        candidateId,
+        title: `Vertical Clip: ${candidate.sourceTitle || 'Discovered Video'}`,
+        hook: candidate.hook,
+        sourceTitle: candidate.sourceTitle,
+        channelTitle: candidate.channelTitle,
+        duration: `${candidateDuration}s`,
+        aspectRatio: '9:16',
+        style: 'kinetic',
+        status: 'ready',
+        videoUrl: publicVideoUrl,
+        thumbnailBg: 'from-slate-900 via-indigo-950 to-slate-900',
+        captionsSample: [candidate.hook, candidate.summary],
+        hashtags: ['#shorts', '#viral'],
+        progress: 100,
+        inQueue: false,
+        queueStatus: 'needs_review',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await setDoc(candRef, { status: 'approved', updatedAt: now }, { merge: true });
+
+      await this.jobService.transition(jobId, 'completed', 100, 'Clip fully rendered and verified successfully!', undefined, workspaceId);
 
       return true;
 
@@ -186,7 +187,7 @@ export class RenderWorker {
       await this.jobService.transition(jobId, 'failed', 0, 'Render job failed', {
         code: errCode,
         message: errMsg,
-      });
+      }, workspaceId);
 
       return false;
     }

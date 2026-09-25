@@ -18,13 +18,14 @@ import {
   INITIAL_WORKSPACE,
 } from '../services/mockData';
 import {
-  supabase,
+  db,
   DEFAULT_WORKSPACE_ID,
-  SupabaseWorkspaceRepo,
-  SupabaseSourcesRepo,
-  SupabaseCandidatesRepo,
-  SupabaseClipsRepo,
-} from '../lib/supabase';
+} from '../lib/firebase';
+import { doc, setDoc } from 'firebase/firestore';
+import { FirebaseWorkspaceService } from '../services/firebase/workspaces';
+import { FirebaseSourcesService } from '../services/firebase/sources';
+import { FirebaseCandidatesService } from '../services/firebase/candidates';
+import { FirebaseClipsService } from '../services/firebase/clips';
 
 interface ToastState {
   id: number;
@@ -37,7 +38,7 @@ interface AppContextType {
   navigate: (page: PageRoute) => void;
   user: UserSession | null;
   currentWorkspaceId: string | null;
-  isSupabaseActive: boolean;
+  isFirebaseActive: boolean;
   login: (
     email?: string,
     password?: string,
@@ -159,18 +160,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.location.hash = `#/${page}`;
   };
 
-  // --- Initial Data Load from Supabase ---
+  // --- Initial Data Load from Firestore ---
   const loadWorkspaceData = useCallback(async (wsId: string) => {
     try {
-      const { config } = await SupabaseWorkspaceRepo.getWorkspace(wsId);
+      const { config } = await FirebaseWorkspaceService.getWorkspace(wsId);
       if (config) {
         setWorkspace(config);
       }
 
       const [srcs, cands, clps] = await Promise.all([
-        SupabaseSourcesRepo.getSources(wsId),
-        SupabaseCandidatesRepo.getCandidates(wsId),
-        SupabaseClipsRepo.getClips(wsId),
+        FirebaseSourcesService.getSources(wsId),
+        FirebaseCandidatesService.getCandidates(wsId),
+        FirebaseClipsService.getClips(wsId),
       ]);
 
       setSources(srcs);
@@ -197,7 +198,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setQueue(queueItems);
 
     } catch (err) {
-      console.error('[AppContext] Failed to load workspace data from Supabase:', err);
+      console.error('[AppContext] Failed to load workspace data from Firestore:', err);
     }
   }, []);
 
@@ -206,64 +207,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     loadWorkspaceData(wsId);
   }, [currentWorkspaceId, loadWorkspaceData]);
 
-  // Auth Operations
+  // Auth Operations (No-op / Demo session)
   const login = async (email?: string, password?: string, isSignUp?: boolean, fullName?: string) => {
-    try {
-      if (email && password) {
-        if (isSignUp) {
-          const { data, error } = await supabase.auth.signUp({
-            email,
-            password,
-            options: { data: { full_name: fullName } },
-          });
-          if (error) return { success: false, error: error.message };
-          if (data.user) {
-            setUser({
-              id: data.user.id,
-              name: fullName || email.split('@')[0],
-              email: data.user.email || email,
-              avatarInitials: (fullName || email).slice(0, 2).toUpperCase(),
-            });
-            showToast('Account created successfully!', 'success');
-          }
-        } else {
-          const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-          if (error) return { success: false, error: error.message };
-          if (data.user) {
-            setUser({
-              id: data.user.id,
-              name: data.user.user_metadata?.full_name || email.split('@')[0],
-              email: data.user.email || email,
-              avatarInitials: (email).slice(0, 2).toUpperCase(),
-            });
-            showToast('Signed in successfully', 'success');
-          }
-        }
-      } else {
-        // Guest / Demo login
-        setUser(INITIAL_USER);
-        showToast('Signed in as Guest User', 'info');
-      }
-      return { success: true };
-    } catch (err: any) {
-      return { success: false, error: err.message || 'Auth failed' };
-    }
+    setUser(INITIAL_USER);
+    showToast('Session active', 'info');
+    return { success: true };
   };
 
   const loginWithGoogle = async () => {
-    try {
-      const { error } = await supabase.auth.signInWithOAuth({ provider: 'google' });
-      if (error) return { success: false, error: error.message };
-      return { success: true };
-    } catch (err: any) {
-      return { success: false, error: err.message };
-    }
+    return { success: true };
   };
 
   const logout = async () => {
-    try {
-      await supabase.auth.signOut();
-    } catch (_) {}
     setUser(INITIAL_USER);
     showToast('Session reset', 'info');
   };
@@ -272,7 +227,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setWorkspace(config);
     setIsOnboarded(true);
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await SupabaseWorkspaceRepo.updateWorkspace(wsId, config);
+    await FirebaseWorkspaceService.updateWorkspace(wsId, config);
     showToast('Workspace onboarding complete!', 'success');
     navigate('dashboard');
   };
@@ -280,7 +235,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const updateWorkspace = async (partial: Partial<WorkspaceConfig>) => {
     setWorkspace((prev) => ({ ...prev, ...partial }));
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await SupabaseWorkspaceRepo.updateWorkspace(wsId, partial);
+    await FirebaseWorkspaceService.updateWorkspace(wsId, partial);
     showToast('Workspace settings saved', 'success');
   };
 
@@ -289,7 +244,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setIsFetchingSources(true);
     setSourcesFetchError(null);
     try {
-      const data = await SupabaseSourcesRepo.getSources(wsId);
+      const data = await FirebaseSourcesService.getSources(wsId);
       setSources(data);
     } catch (err: any) {
       setSourcesFetchError(err.message || 'Failed to fetch sources');
@@ -300,7 +255,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteSource = async (sourceId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseSourcesRepo.deleteSource(sourceId, wsId);
+    const ok = await FirebaseSourcesService.deleteSource(sourceId, wsId);
     if (ok) {
       setSources((prev) => prev.filter((s) => s.id !== sourceId));
       setCandidates((prev) => prev.filter((c) => c.sourceVideoId !== sourceId));
@@ -313,7 +268,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const bulkDeleteSources = async (sourceIds: string[]) => {
     if (!sourceIds.length) return;
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseSourcesRepo.bulkDeleteSources(sourceIds, wsId);
+    const ok = await FirebaseSourcesService.bulkDeleteSources(sourceIds, wsId);
     if (ok) {
       const idSet = new Set(sourceIds);
       setSources((prev) => prev.filter((s) => !idSet.has(s.id)));
@@ -360,7 +315,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (res.videos && res.videos.length > 0) {
         await fetchSources(wsId);
-        showToast(`Discovered & persisted ${res.videos.length} new sources to Supabase!`, 'success');
+        showToast(`Discovered & persisted ${res.videos.length} new sources to Firestore!`, 'success');
       } else {
         showToast('Discovery completed, no new videos found.', 'info');
       }
@@ -379,7 +334,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setIsFetchingCandidates(true);
     setCandidatesFetchError(null);
     try {
-      const cands = await SupabaseCandidatesRepo.getCandidates(wsId);
+      const cands = await FirebaseCandidatesService.getCandidates(wsId);
       setCandidates(cands);
     } catch (err: any) {
       setCandidatesFetchError(err.message || 'Failed to fetch candidates');
@@ -390,7 +345,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteCandidate = async (candidateId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseCandidatesRepo.deleteCandidate(candidateId, wsId);
+    const ok = await FirebaseCandidatesService.deleteCandidate(candidateId, wsId);
     if (ok) {
       setCandidates((prev) => prev.filter((c) => c.id !== candidateId));
       setClips((prev) => prev.filter((cl) => cl.candidateId !== candidateId));
@@ -456,24 +411,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const addSource = async (newSource: { title: string; youtubeUrl: string; niche: string }) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const { data, error } = await supabase.from('source_videos').insert({
-      workspace_id: wsId,
+    const newId = crypto.randomUUID ? crypto.randomUUID() : 'src_' + Date.now();
+    const ok = await FirebaseSourcesService.addSource(wsId, {
+      id: newId,
       title: newSource.title,
-      channel_title: 'Manual Addition',
+      channelTitle: 'Manual Addition',
       duration: '15:00',
-      view_count: 50000,
-      published_at: 'Just now',
-      youtube_url: newSource.youtubeUrl,
+      viewCount: 50000,
+      publishedAt: 'Just now',
+      youtubeUrl: newSource.youtubeUrl,
       status: 'new',
-      relevance_score: 85,
-      freshness_tag: 'Added Manually',
-      candidates_count: 0,
+      relevanceScore: 85,
+      freshnessTag: 'Added Manually',
+      candidatesCount: 0,
       summary: `Manual video added for ${newSource.niche}`,
       niche: newSource.niche,
-      thumbnail_gradient: 'from-slate-900 via-indigo-950 to-slate-900',
-    }).select().single();
+      thumbnailGradient: 'from-slate-900 via-indigo-950 to-slate-900',
+    });
 
-    if (!error && data) {
+    if (ok) {
       await fetchSources(wsId);
       showToast('Source video added', 'success');
     } else {
@@ -483,7 +439,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const selectCandidate = async (candidateId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await SupabaseCandidatesRepo.updateCandidateStatus(candidateId, 'approved', wsId);
+    await FirebaseCandidatesService.updateCandidateStatus(candidateId, 'approved', wsId);
     setCandidates((prev) =>
       prev.map((c) => (c.id === candidateId ? { ...c, status: 'approved', selectionStatus: 'selected' } : c))
     );
@@ -496,7 +452,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const rejectCandidate = async (candidateId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await SupabaseCandidatesRepo.updateCandidateStatus(candidateId, 'rejected', wsId);
+    await FirebaseCandidatesService.updateCandidateStatus(candidateId, 'rejected', wsId);
     setCandidates((prev) =>
       prev.map((c) => (c.id === candidateId ? { ...c, status: 'rejected', selectionStatus: 'rejected' } : c))
     );
@@ -505,7 +461,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const fetchClips = async (workspaceId?: string) => {
     const wsId = workspaceId || currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const clps = await SupabaseClipsRepo.getClips(wsId);
+    const clps = await FirebaseClipsService.getClips(wsId);
     setClips(clps);
   };
 
@@ -550,7 +506,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const addClipToQueue = async (clipId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseClipsRepo.setClipInQueue(clipId, true, 'needs_review', wsId);
+    const ok = await FirebaseClipsService.setClipInQueue(clipId, true, 'needs_review', wsId);
     if (ok) {
       await fetchClips(wsId);
       showToast('Clip added to Queue for publishing review', 'success');
@@ -559,7 +515,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteClip = async (clipId: string) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseClipsRepo.deleteClip(clipId, wsId);
+    const ok = await FirebaseClipsService.deleteClip(clipId, wsId);
     if (ok) {
       setClips((prev) => prev.filter((c) => c.id !== clipId));
       setQueue((prev) => prev.filter((q) => q.clipId !== clipId));
@@ -571,11 +527,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const updateClipCaptions = async (clipId: string, hashtags: string[], sampleCaptions: string[]) => {
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await supabase
-      .from('clips')
-      .update({ hashtags, captions_sample: sampleCaptions, updated_at: new Date().toISOString() })
-      .eq('id', clipId)
-      .eq('workspace_id', wsId);
+    const clipRef = doc(db, 'workspaces', wsId, 'clips', clipId);
+    await setDoc(clipRef, { hashtags, captionsSample: sampleCaptions, updatedAt: new Date().toISOString() }, { merge: true });
 
     setClips((prev) =>
       prev.map((c) => (c.id === clipId ? { ...c, hashtags, captionsSample: sampleCaptions } : c))
@@ -588,7 +541,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!item) return;
 
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseClipsRepo.updateQueueItem(item.clipId, {
+    const ok = await FirebaseClipsService.updateQueueItem(item.clipId, {
       queueStatus: 'approved',
       scheduledSlot: 'Next slot (Auto-scheduled)',
     }, wsId);
@@ -606,7 +559,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!item) return;
 
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await SupabaseClipsRepo.updateQueueItem(item.clipId, {
+    await FirebaseClipsService.updateQueueItem(item.clipId, {
       queueStatus: updates.status,
       scheduledSlot: updates.scheduledSlot,
     }, wsId);
@@ -620,7 +573,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!item) return;
 
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    const ok = await SupabaseClipsRepo.setClipInQueue(item.clipId, false, 'needs_review', wsId);
+    const ok = await FirebaseClipsService.setClipInQueue(item.clipId, false, 'needs_review', wsId);
     if (ok) {
       setQueue((prev) => prev.filter((q) => q.id !== queueId));
       showToast('Removed from queue', 'info');
@@ -638,7 +591,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setIsOnboarded(true);
     setWorkspace(INITIAL_WORKSPACE);
     loadWorkspaceData(DEFAULT_WORKSPACE_ID);
-    showToast('Reset to default workspace state', 'info');
+    showToast('Reset workspace state', 'info');
     navigate('dashboard');
   };
 
@@ -649,7 +602,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         navigate,
         user,
         currentWorkspaceId,
-        isSupabaseActive: true,
+        isFirebaseActive: true,
         login,
         loginWithGoogle,
         logout,

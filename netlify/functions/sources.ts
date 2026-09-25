@@ -1,5 +1,6 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { supabase } from '../../src/lib/supabase';
+import { db, DEFAULT_WORKSPACE_ID } from '../../src/lib/firebase';
+import { collection, getDocs, query, orderBy } from 'firebase/firestore';
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -19,37 +20,24 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
 
   const workspaceId =
     event.queryStringParameters?.workspaceId ||
-    (event.body ? JSON.parse(event.body).workspaceId : '');
+    (event.body ? JSON.parse(event.body).workspaceId : DEFAULT_WORKSPACE_ID);
 
-  if (!workspaceId || typeof workspaceId !== 'string' || !workspaceId.trim()) {
-    return {
-      statusCode: 400,
-      headers: defaultHeaders,
-      body: JSON.stringify({
-        success: false,
-        error: 'BAD_REQUEST',
-        message: 'A valid workspaceId parameter is required to fetch sources.',
-      }),
-    };
-  }
+  const effectiveWsId = (workspaceId || DEFAULT_WORKSPACE_ID).trim();
 
   try {
-    const { data: records, error } = await supabase
-      .from('source_videos')
-      .select('*')
-      .eq('workspace_id', workspaceId.trim())
-      .order('created_at', { ascending: false });
-
-    if (error) throw new Error(error.message);
+    const sourcesColRef = collection(db, 'workspaces', effectiveWsId, 'sources');
+    const q = query(sourcesColRef, orderBy('createdAt', 'desc'));
+    const snapshot = await getDocs(q);
+    const records = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     return {
       statusCode: 200,
       headers: defaultHeaders,
       body: JSON.stringify({
         success: true,
-        sources: records || [],
-        workspaceId: workspaceId.trim(),
-        count: (records || []).length,
+        sources: records,
+        workspaceId: effectiveWsId,
+        count: records.length,
       }),
     };
   } catch (err: any) {
