@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "workspace": {
+      "title": "Workspace",
+      "description": "Workspace configuration and settings",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "mainNiche": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name"]
+    },
+    "sourceVideo": {
+      "title": "Source Video",
+      "description": "Discovered YouTube source video",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "maxLength": 300 },
+        "channelTitle": { "type": "string", "maxLength": 150 },
+        "duration": { "type": "string" },
+        "youtubeUrl": { "type": "string", "format": "uri" },
+        "status": { "type": "string", "enum": ["new", "processing", "analyzed", "failed"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "youtubeUrl"]
+    },
+    "clipCandidate": {
+      "title": "Clip Candidate",
+      "description": "AI-detected moment candidate",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sourceVideoId": { "type": "string" },
+        "hook": { "type": "string", "maxLength": 300 },
+        "score": { "type": "number" },
+        "status": { "type": "string", "enum": ["new", "in_review", "approved", "rejected", "generating"] }
+      },
+      "required": ["id", "sourceVideoId", "hook", "score"]
+    },
+    "clip": {
+      "title": "Clip",
+      "description": "Rendered vertical video clip",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "candidateId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 300 },
+        "videoUrl": { "type": "string" },
+        "status": { "type": "string" }
+      },
+      "required": ["id", "title"]
+    },
+    "job": {
+      "title": "Job",
+      "description": "Processing or render job",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled"] },
+        "progress": { "type": "number" }
+      },
+      "required": ["id", "status"]
+    }
+  },
+  "firestore": {
+    "/workspaces/{workspaceId}": {
+      "schema": { "$ref": "#/entities/workspace" },
+      "description": "Workspace root document"
+    },
+    "/workspaces/{workspaceId}/sources/{sourceId}": {
+      "schema": { "$ref": "#/entities/sourceVideo" },
+      "description": "Source videos in workspace"
+    },
+    "/workspaces/{workspaceId}/candidates/{candidateId}": {
+      "schema": { "$ref": "#/entities/clipCandidate" },
+      "description": "Clip candidates in workspace"
+    },
+    "/workspaces/{workspaceId}/clips/{clipId}": {
+      "schema": { "$ref": "#/entities/clip" },
+      "description": "Generated clips in workspace"
+    },
+    "/workspaces/{workspaceId}/jobs/{jobId}": {
+      "schema": { "$ref": "#/entities/job" },
+      "description": "Processing jobs in workspace"
+    }
+  }
+}

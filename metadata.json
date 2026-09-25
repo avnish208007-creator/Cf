@@ -1,0 +1,6 @@
+{
+  "name": "ClipFlow",
+  "description": "Automated short-form content creation and vertical clip pipeline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

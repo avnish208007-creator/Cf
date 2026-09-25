@@ -12,4 +12,7 @@ uploads/
 *.mp4
 *.jpg
 *.mp3
-*.json
+# Do not ignore package.json or config files
+!package.json
+!tsconfig.json
+!firebase-blueprint.json
