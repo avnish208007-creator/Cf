@@ -10,6 +10,7 @@ import {
   handleStartProcessing,
   handleGetJobStatus,
   handleCancelJob,
+  handleRetryJob,
 } from './src/server/processing/processingHandler';
 import { resolveYtDlp, resolveFfmpeg, resolveFfprobe } from './src/server/utils/binaries';
 
@@ -36,13 +37,6 @@ async function startServer() {
     next();
   });
 
-  // Serve processed uploads statically
-  const uploadsDir = path.resolve(process.cwd(), 'uploads');
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-  }
-  app.use('/uploads', express.static(uploadsDir));
-
   // Discovery server endpoints
   app.options('/api/discover', (req, res) => res.sendStatus(204));
   app.post('/api/discover', handleDiscoveryRequest);
@@ -57,8 +51,9 @@ async function startServer() {
   app.post('/api/processing/start', handleStartProcessing);
   app.get('/api/processing/jobs/:jobId', handleGetJobStatus);
   app.post('/api/processing/cancel/:jobId', handleCancelJob);
+  app.post('/api/processing/retry/:jobId', handleRetryJob);
 
-  // Health check endpoint (Problem 23)
+  // Health check endpoint
   app.get('/api/health', (req, res) => {
     const ytDlpPath = resolveYtDlp();
     const ffmpegPath = resolveFfmpeg();
@@ -78,7 +73,7 @@ async function startServer() {
         ytDlp: ytDlpExists,
         ffmpeg: ffmpegExists,
         ffprobe: ffprobeExists,
-        whisper: true,
+        transcription: true,
         gemini: geminiKeySet,
         storage: true,
       },
@@ -114,5 +109,3 @@ startServer().catch((err) => {
   console.error('Fatal error starting ClipFlow server:', err);
   process.exit(1);
 });
-
-

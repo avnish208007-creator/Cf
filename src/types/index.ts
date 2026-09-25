@@ -6,10 +6,7 @@ export type PageRoute =
   | 'candidates'
   | 'clips'
   | 'queue'
-  | 'settings'
-  | 'video-test'
-  | 'raw-video-test'
-  | 'video-reality-test';
+  | 'settings';
 
 export interface UserSession {
   id: string;

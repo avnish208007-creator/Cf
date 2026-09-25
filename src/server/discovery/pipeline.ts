@@ -18,7 +18,7 @@ import {
 } from '../providers/types';
 import { RealDiscoveryProvider } from '../providers/RealDiscoveryProvider';
 import { generateFocusedSearchQueries } from './queryGenerator';
-import { RankingEngine } from '../analysis/RankingEngine';
+import { RankingEngine } from './rankingEngine';
 import crypto from 'crypto';
 
 export function extractYouTubeId(urlOrId: string): string {
@@ -234,11 +234,11 @@ export async function runDiscoveryPipeline(
       id: newSourceId,
       workspaceId: authenticatedWorkspaceId,
       title: v.title,
-      channelTitle: v.channelTitle,
-      duration: v.duration,
-      viewCount: v.viewCount,
-      publishedAt: v.publishedAt,
-      youtubeUrl: v.youtubeUrl,
+      channelTitle: v.channelTitle || 'YouTube Creator',
+      duration: v.duration || '10:00',
+      viewCount: v.viewCount || 0,
+      publishedAt: v.publishedAt || 'Recently Published',
+      youtubeUrl: v.youtubeUrl || '',
       status: 'new',
       relevanceScore: v.overallScore,
       freshnessTag: `Overall: ${v.overallScore}% · Short-Form: ${v.shortFormScore}%`,
@@ -258,8 +258,17 @@ export async function runDiscoveryPipeline(
       insertedVideos.push({
         ...v,
         id: newSourceId,
+        title: v.title,
+        channelTitle: v.channelTitle || 'YouTube Creator',
+        duration: v.duration || '10:00',
+        durationSeconds: v.durationSeconds || 600,
+        viewCount: v.viewCount || 0,
+        youtubeUrl: v.youtubeUrl || '',
+        summary: v.summary || '',
+        niche: v.niche || activeNiche,
+        thumbnailGradient: v.thumbnailGradient || 'from-slate-900 via-indigo-950 to-slate-900',
         description: v.description,
-        publishedAt: v.publishedAt,
+        publishedAt: v.publishedAt || 'Recently Published',
         relevanceScore: v.relevanceScore,
         contentQualityScore: v.contentQualityScore,
         engagementScore: v.engagementScore,

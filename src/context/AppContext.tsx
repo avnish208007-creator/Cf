@@ -484,15 +484,56 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const cand = candidates.find((c) => c.id === candidateId);
     if (!cand) return;
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await selectCandidate(candidateId);
-    await fetchClips(wsId);
-    showToast('Clip generated from candidate moment!', 'success');
-    navigate('clips');
+
+    showToast('Starting vertical clip render...', 'info');
+    try {
+      const res = await fetch('/api/processing/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId: wsId,
+          sourceVideoId: cand.sourceVideoId,
+          candidateId: cand.id,
+          startTime: cand.startTime,
+          endTime: cand.endTime,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Failed to start clip rendering.');
+      }
+
+      const jobId = data.jobId;
+      if (jobId) {
+        const poll = setInterval(async () => {
+          try {
+            const jobRes = await fetch(`/api/processing/jobs/${jobId}?workspaceId=${wsId}`);
+            const jobData = await jobRes.json();
+            if (jobData.success && jobData.job) {
+              if (jobData.job.status === 'completed') {
+                clearInterval(poll);
+                await Promise.all([fetchCandidates(wsId), fetchClips(wsId)]);
+                showToast('Vertical clip rendered and saved to library!', 'success');
+                navigate('clips');
+              } else if (jobData.job.status === 'failed' || jobData.job.status === 'cancelled') {
+                clearInterval(poll);
+                showToast(`Rendering failed: ${jobData.job.error || 'Unknown error'}`, 'error');
+              }
+            }
+          } catch (e) {
+            console.error('Candidate render poll error:', e);
+          }
+        }, 3000);
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Failed to render candidate clip', 'error');
+    }
   };
 
   const batchApproveAndRenderClips = async (minScoreThreshold = workspace.minCandidateScore) => {
     const eligible = candidates.filter(
-      (c) => (c.status === 'new' || c.status === 'in_review') && c.score >= minScoreThreshold
+      (c) => (c.status === 'new' || c.status === 'in_review' || c.status === 'detected') && c.score >= minScoreThreshold
     );
 
     if (eligible.length === 0) {
@@ -584,9 +625,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const cancelJob = (jobId: string) => {
+  const cancelJob = async (jobId: string) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
     setJobs((prev) => prev.filter((j) => j.id !== jobId));
-    showToast('Job cancelled', 'info');
+    try {
+      await fetch(`/api/processing/cancel/${jobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: wsId }),
+      });
+      showToast('Processing job cancelled.', 'info');
+    } catch (err) {
+      console.error('Failed to cancel job on server:', err);
+    }
   };
 
   const resetToDemo = () => {
