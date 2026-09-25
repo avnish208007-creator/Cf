@@ -47,8 +47,17 @@ jobs:
         run: |
           pip install --no-cache-dir openai-whisper torch torchvision torchaudio requests
 
-      - name: Install Node Dependencies
+      - name: Locate Project Root & Install Node Dependencies
         run: |
+          PKG_PATH=$(find . -name "package.json" -print -quit)
+          if [ -z "$PKG_PATH" ]; then
+            echo "Error: package.json not found in repository."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PKG_PATH")
+          echo "Found package.json in: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          cd "$PROJECT_DIR"
           npm install
 
       - name: Run GitHub Runner Processing Worker
@@ -65,4 +74,14 @@ jobs:
           FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
           PIPED_INSTANCES: ${{ secrets.PIPED_INSTANCES }}
         run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          if [ -z "$PROJECT_DIR" ]; then
+            PKG_PATH=$(find . -name "package.json" -print -quit)
+            PROJECT_DIR=$(dirname "$PKG_PATH")
+          fi
+          if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "." ]; then
+            PROJECT_DIR="."
+          fi
+          echo "Running worker from project directory: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
           node worker/githubRunnerWorker.js
