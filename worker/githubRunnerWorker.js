@@ -1,11 +1,17 @@
 /**
  * GitHub Actions Runner Worker for ClipFlow V1 (Plain JavaScript)
- * Runs inside GitHub Actions runner: Resolves stream via automatic Piped discovery & failover,
- * downloads media, transcribes with local CPU Whisper, detects candidate moments from real transcript timestamps,
- * renders 9:16 vertical shorts with FFmpeg, and uploads to Firebase Storage & Firestore.
+ * Runs inside GitHub Actions runner:
+ * 1. Resolves stream via automatic Piped discovery & failover immediately before downloading.
+ * 2. Streams media directly to disk (no buffer in memory), combining separate audio/video if necessary via FFmpeg muxing.
+ * 3. Verifies using FFprobe that media contains valid video AND audio streams.
+ * 4. Transcribes audio with local CPU Whisper.
+ * 5. Detects candidate moments from transcript timestamps.
+ * 6. Renders 9:16 vertical shorts with FFmpeg and verifies rendered clips contain valid video/audio.
+ * 7. Uploads to Firebase Storage & Firestore with strict error handling.
  */
 import fs from 'fs';
 import path from 'path';
+import { pipeline } from 'node:stream/promises';
 import { execSync, execFileSync } from 'child_process';
 import fetch from 'node-fetch';
 import { initializeApp } from 'firebase/app';
@@ -44,13 +50,12 @@ const INSTANCE_SOURCES = [
 ];
 
 /**
- * Shared Worker-Compatible Piped Instance Manager with Automatic Discovery & Failover
+ * Worker Piped Instance Manager with Discovery & Failover
  */
 class WorkerPipedInstanceManager {
   constructor() {
     this.instances = [];
     this.healthMap = new Map();
-    this.lastRefreshTime = 0;
   }
 
   async getHealthyInstances(forceRefresh = false) {
@@ -96,19 +101,17 @@ class WorkerPipedInstanceManager {
     for (const def of DEFAULT_PIPED_INSTANCES) discovered.add(def);
 
     this.instances = Array.from(discovered);
-    this.lastRefreshTime = Date.now();
     console.log(`[WorkerPipedManager] Discovered ${this.instances.length} Piped API instances.`);
   }
 
   recordFailure(url) {
-    const cur = this.healthMap.get(url) || { consecutiveFailures: 0, isHealthy: true };
+    const cur = this.healthMap.get(url) || { consecutiveFailures: 0 };
     cur.consecutiveFailures += 1;
-    cur.isHealthy = cur.consecutiveFailures < 3;
     this.healthMap.set(url, cur);
   }
 
   recordSuccess(url) {
-    this.healthMap.set(url, { consecutiveFailures: 0, isHealthy: true });
+    this.healthMap.set(url, { consecutiveFailures: 0 });
   }
 }
 
@@ -135,7 +138,7 @@ async function resolveStream(urlOrId) {
   while (attempts < 2) {
     for (const instance of instances) {
       try {
-        console.log(`[GitHubRunnerWorker] Trying Piped instance "${instance}" for video ${videoId}...`);
+        console.log(`[GitHubRunnerWorker] Resolving stream from Piped instance "${instance}" for video ${videoId}...`);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 6000);
         const res = await fetch(`${instance}/streams/${videoId}`, {
@@ -151,27 +154,31 @@ async function resolveStream(urlOrId) {
         pipedManager.recordSuccess(instance);
 
         const videoStreams = data.videoStreams || [];
+        const audioStreams = data.audioStreams || [];
         const bestVideo = videoStreams.find((s) => s.url && s.mimeType?.includes('video/mp4')) || videoStreams[0];
-        const combined = data.url;
+        const bestAudio = audioStreams.find((s) => s.url && s.mimeType?.includes('audio/')) || audioStreams[0];
+        const combinedUrl = data.url;
 
-        if (bestVideo?.url || combined) {
-          console.log(`[GitHubRunnerWorker] Successfully resolved stream from ${instance}`);
+        if (bestVideo?.url || combinedUrl) {
+          console.log(`[GitHubRunnerWorker] Stream successfully resolved from ${instance}`);
           return {
-            videoStreamUrl: bestVideo?.url || combined,
-            audioStreamUrl: data.audioStreams?.[0]?.url || null,
+            combinedUrl,
+            videoStreamUrl: bestVideo?.url || null,
+            audioStreamUrl: bestAudio?.url || null,
             durationSeconds: Number(data.duration) || 0,
             title: data.title || 'YouTube Source Video',
+            instanceUsed: instance,
           };
         }
       } catch (e) {
-        console.warn(`[GitHubRunnerWorker] Instance "${instance}" failed:`, e.message);
+        console.warn(`[GitHubRunnerWorker] Piped instance "${instance}" failed:`, e.message);
         pipedManager.recordFailure(instance);
         lastError = e;
       }
     }
 
     if (attempts === 0) {
-      console.log(`[GitHubRunnerWorker] Refreshing Piped instance pool and retrying...`);
+      console.log(`[GitHubRunnerWorker] All instances failed. Refreshing Piped pool and retrying...`);
       instances = await pipedManager.getHealthyInstances(true);
     }
     attempts++;
@@ -193,14 +200,66 @@ async function updateStatus(stage, progress, status = 'processing', error = null
       updatedAt: new Date().toISOString(),
       ...(status === 'completed' || status === 'failed' ? { completedAt: new Date().toISOString() } : {}),
     });
-    console.log(`[GitHubRunnerWorker] Job status updated -> Stage: ${stage}, Progress: ${progress}%, Status: ${status}`);
+    console.log(`[GitHubRunnerWorker] Firestore job status -> Stage: ${stage}, Progress: ${progress}%, Status: ${status}`);
   } catch (err) {
     console.error('[GitHubRunnerWorker] Failed to update Firestore job status:', err);
   }
 }
 
 /**
- * Transcript-Based Moment Detector (Plain JS)
+ * Streaming Direct-to-Disk Download with Timeout & File Verification
+ */
+async function downloadFileStream(url, destPath, timeoutMs = 90000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'ClipFlow-Worker/1.0' },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+
+    const fileStream = fs.createWriteStream(destPath);
+    await pipeline(res.body, fileStream);
+
+    if (!fs.existsSync(destPath) || fs.statSync(destPath).size < 10000) {
+      if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+      throw new Error(`Downloaded file is empty or corrupted (<10KB) at ${destPath}`);
+    }
+  } catch (err) {
+    clearTimeout(timer);
+    if (fs.existsSync(destPath)) {
+      try { fs.unlinkSync(destPath); } catch {}
+    }
+    throw err;
+  }
+}
+
+/**
+ * FFprobe Check for Video AND Audio Streams
+ */
+function verifyMediaHasVideoAndAudio(filePath) {
+  try {
+    const output = execSync(
+      `ffprobe -v error -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+      { encoding: 'utf8' }
+    );
+    const streams = output.trim().split(/\r?\n/).map((s) => s.trim().toLowerCase());
+    const hasVideo = streams.includes('video');
+    const hasAudio = streams.includes('audio');
+    return { hasVideo, hasAudio };
+  } catch (err) {
+    console.warn(`[GitHubRunnerWorker] FFprobe inspection failed for ${filePath}:`, err.message);
+    return { hasVideo: false, hasAudio: false };
+  }
+}
+
+/**
+ * Transcript-Based Moment Detector
  */
 function detectMomentsFromTranscript(transcriptSegments, videoDuration) {
   if (!transcriptSegments || transcriptSegments.length === 0) {
@@ -280,25 +339,72 @@ async function run() {
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
+    // 1. RESOLVING STREAM
     await updateStatus('resolving', 10, 'processing');
     const streamInfo = await resolveStream(youtubeUrl);
 
+    // 2. DOWNLOADING MEDIA
     await updateStatus('downloading', 25, 'processing');
-    const videoPath = path.resolve(tmpDir, 'source.mp4');
+    const sourceVideoPath = path.resolve(tmpDir, 'source.mp4');
     const audioPath = path.resolve(tmpDir, 'audio.mp3');
 
-    console.log(`[GitHubRunnerWorker] Downloading video to ${videoPath}...`);
-    const resp = await fetch(streamInfo.videoStreamUrl);
-    const buffer = await resp.arrayBuffer();
-    fs.writeFileSync(videoPath, Buffer.from(buffer));
+    let acquisitionSuccess = false;
 
-    if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size < 1000) {
-      throw new Error('Downloaded source video file is empty or corrupted.');
+    // Try downloading combined stream if present
+    if (streamInfo.combinedUrl) {
+      try {
+        console.log(`[GitHubRunnerWorker] Downloading combined video+audio stream from ${streamInfo.instanceUsed}...`);
+        await downloadFileStream(streamInfo.combinedUrl, sourceVideoPath);
+        const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
+        if (hasVideo && hasAudio) {
+          acquisitionSuccess = true;
+          console.log('[GitHubRunnerWorker] Verified combined stream has both video and audio.');
+        } else {
+          console.warn(`[GitHubRunnerWorker] Combined stream check failed (video: ${hasVideo}, audio: ${hasAudio}). Falling back to separate stream acquisition.`);
+          if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
+        }
+      } catch (err) {
+        console.warn(`[GitHubRunnerWorker] Combined stream download failed: ${err.message}. Falling back to separate streams.`);
+      }
     }
 
+    // Mux separate video and audio streams if combined stream was not available or invalid
+    if (!acquisitionSuccess) {
+      if (!streamInfo.videoStreamUrl || !streamInfo.audioStreamUrl) {
+        throw new Error('[MEDIA_ACQUISITION_FAILED] Piped did not return both video and audio streams.');
+      }
+
+      const videoOnlyPath = path.resolve(tmpDir, 'video_only.mp4');
+      const audioOnlyPath = path.resolve(tmpDir, 'audio_only.m4a');
+
+      console.log('[GitHubRunnerWorker] Downloading separate video stream...');
+      await downloadFileStream(streamInfo.videoStreamUrl, videoOnlyPath);
+
+      console.log('[GitHubRunnerWorker] Downloading separate audio stream...');
+      await downloadFileStream(streamInfo.audioStreamUrl, audioOnlyPath);
+
+      console.log('[GitHubRunnerWorker] Muxing video and audio streams into source.mp4 with FFmpeg...');
+      execFileSync('ffmpeg', ['-y', '-i', videoOnlyPath, '-i', audioOnlyPath, '-c:v', 'copy', '-c:a', 'aac', '-shortest', sourceVideoPath], { stdio: 'inherit' });
+
+      // Clean up temp separate streams
+      try { fs.unlinkSync(videoOnlyPath); } catch {}
+      try { fs.unlinkSync(audioOnlyPath); } catch {}
+
+      const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
+      if (!hasVideo || !hasAudio) {
+        throw new Error(`[MEDIA_ACQUISITION_FAILED] Muxed media verification failed (hasVideo: ${hasVideo}, hasAudio: ${hasAudio}).`);
+      }
+      console.log('[GitHubRunnerWorker] Successfully acquired and verified media with video and audio streams.');
+    }
+
+    // 3. TRANSCRIBING WITH LOCAL WHISPER
     await updateStatus('transcribing', 45, 'processing');
     console.log('[GitHubRunnerWorker] Extracting audio for Whisper transcription...');
-    execSync(`ffmpeg -y -i "${videoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 "${audioPath}"`, { stdio: 'inherit' });
+    execSync(`ffmpeg -y -i "${sourceVideoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 "${audioPath}"`, { stdio: 'inherit' });
+
+    if (!fs.existsSync(audioPath) || fs.statSync(audioPath).size < 5000) {
+      throw new Error('[AUDIO_EXTRACTION_FAILED] Extracted audio file is empty or corrupted.');
+    }
 
     console.log('[GitHubRunnerWorker] Running local Whisper transcription (base model)...');
     execSync(`whisper "${audioPath}" --model base --output_dir "${tmpDir}" --output_format json`, { stdio: 'inherit' });
@@ -318,10 +424,16 @@ async function run() {
       throw new Error('[TRANSCRIPTION_FAILED] Whisper produced zero transcript segments.');
     }
 
+    // 4. DETECTING MOMENTS
     await updateStatus('detecting', 65, 'processing');
     console.log('[GitHubRunnerWorker] Analyzing real transcript for candidate moments...');
     const candidates = detectMomentsFromTranscript(transcriptSegments, streamInfo.durationSeconds || 60);
 
+    if (candidates.length === 0) {
+      throw new Error('[MOMENT_DETECTION_FAILED] Zero valid candidates detected from transcript.');
+    }
+
+    // 5. RENDERING CLIPS & UPLOADING TO FIREBASE
     await updateStatus('rendering', 80, 'processing');
     const clipsColRef = collection(db, 'workspaces', workspaceId, 'clips');
     const generatedClips = [];
@@ -338,7 +450,7 @@ async function run() {
         'ffmpeg', '-y',
         '-ss', String(cand.startTime),
         '-to', String(cand.endTime),
-        '-i', videoPath,
+        '-i', sourceVideoPath,
         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
@@ -346,6 +458,17 @@ async function run() {
       ];
       execFileSync(ffmpegCmd[0], ffmpegCmd.slice(1), { stdio: 'inherit' });
 
+      // Verify rendered clip
+      if (!fs.existsSync(clipOutputPath) || fs.statSync(clipOutputPath).size < 10000) {
+        throw new Error(`[RENDER_FAILED] Rendered clip ${i + 1} file is missing or corrupted.`);
+      }
+
+      const clipMediaCheck = verifyMediaHasVideoAndAudio(clipOutputPath);
+      if (!clipMediaCheck.hasVideo || !clipMediaCheck.hasAudio) {
+        throw new Error(`[RENDER_FAILED] Rendered clip ${i + 1} fails stream check (video: ${clipMediaCheck.hasVideo}, audio: ${clipMediaCheck.hasAudio}).`);
+      }
+
+      // Thumbnail generation
       const thumbCmd = [
         'ffmpeg', '-y',
         '-ss', '2',
@@ -357,6 +480,7 @@ async function run() {
         execFileSync(thumbCmd[0], thumbCmd.slice(1), { stdio: 'ignore' });
       } catch {}
 
+      // Upload to Firebase Storage
       await updateStatus('uploading', 90, 'processing');
       console.log(`[GitHubRunnerWorker] Uploading clip ${i + 1} to Firebase Storage...`);
 
@@ -375,6 +499,7 @@ async function run() {
         } catch {}
       }
 
+      // Save metadata to Firestore
       await addDoc(clipsColRef, {
         sourceVideoId: sourceVideoId || 'source',
         jobId,
@@ -393,8 +518,9 @@ async function run() {
       generatedClips.push(cand);
     }
 
+    // 6. COMPLETE JOB
     await updateStatus('completed', 100, 'completed');
-    console.log(`[GitHubRunnerWorker] Job ${jobId} successfully completed with ${generatedClips.length} clips.`);
+    console.log(`[GitHubRunnerWorker] Job ${jobId} successfully completed with ${generatedClips.length} verified clips.`);
   } catch (err) {
     console.error('[GitHubRunnerWorker] Job failed:', err);
     await updateStatus('failed', 100, 'failed', err.message, 'WORKER_EXECUTION_FAILED');

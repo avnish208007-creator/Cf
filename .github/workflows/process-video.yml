@@ -28,6 +28,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Verify Repository Root
+        run: |
+          echo "Current working directory:"
+          pwd
+          echo "Directory contents:"
+          ls -la
+          if [ ! -f package.json ]; then
+            echo "FATAL ERROR: package.json not found in repository root $(pwd)"
+            exit 1
+          fi
+          echo "Verified root package.json at: $(pwd)/package.json"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -47,18 +59,14 @@ jobs:
         run: |
           pip install --no-cache-dir openai-whisper torch torchvision torchaudio requests
 
-      - name: Locate Project Root & Install Node Dependencies
+      - name: Install Node Dependencies
         run: |
-          PKG_PATH=$(find . -name "package.json" -print -quit)
-          if [ -z "$PKG_PATH" ]; then
-            echo "Error: package.json not found in repository."
-            exit 1
-          fi
-          PROJECT_DIR=$(dirname "$PKG_PATH")
-          echo "Found package.json in: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-          cd "$PROJECT_DIR"
+          echo "Installing Node.js dependencies from repository root..."
           npm install
+
+      - name: Verify Worker Module Dependencies
+        run: |
+          node -e "import('node-fetch').then(() => console.log('node-fetch verification: OK'))"
 
       - name: Run GitHub Runner Processing Worker
         env:
@@ -74,14 +82,5 @@ jobs:
           FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
           PIPED_INSTANCES: ${{ secrets.PIPED_INSTANCES }}
         run: |
-          PROJECT_DIR="${{ env.PROJECT_DIR }}"
-          if [ -z "$PROJECT_DIR" ]; then
-            PKG_PATH=$(find . -name "package.json" -print -quit)
-            PROJECT_DIR=$(dirname "$PKG_PATH")
-          fi
-          if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "." ]; then
-            PROJECT_DIR="."
-          fi
-          echo "Running worker from project directory: $PROJECT_DIR"
-          cd "$PROJECT_DIR"
+          echo "Executing processing worker from $(pwd)/worker/githubRunnerWorker.js..."
           node worker/githubRunnerWorker.js
