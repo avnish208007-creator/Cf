@@ -17,6 +17,7 @@ import {
   ProviderUnavailableError,
 } from '../providers/types';
 import { RealDiscoveryProvider } from '../providers/RealDiscoveryProvider';
+import { RssDiscoveryProvider } from '../providers/RssDiscoveryProvider';
 import { generateFocusedSearchQueries } from './queryGenerator';
 import { RankingEngine } from './rankingEngine';
 import crypto from 'crypto';
@@ -131,8 +132,9 @@ export async function runDiscoveryPipeline(
   const queryStrings = queryContexts.map((qc) => qc.query);
   console.log(`[Discovery] Executing multi-angle search (${queryContexts.length} angles):`, queryStrings);
 
-  // 4. Initialize DiscoveryProvider
+  // 4. Initialize DiscoveryProviders (Real YouTube search + RSS Channel Feeds)
   const provider: IDiscoveryProvider = providerOverride || new RealDiscoveryProvider();
+  const rssProvider = new RssDiscoveryProvider();
 
   const availability = await provider.isAvailable();
   if (!availability.available) {
@@ -141,9 +143,24 @@ export async function runDiscoveryPipeline(
     );
   }
 
-  // 5. Gather raw candidate pool across all query angles
+  // 5. Gather raw candidate pool across query angles and RSS feeds
   const candidatePool: DiscoveredVideo[] = [];
   const seenThisRun = new Set<string>();
+
+  // Run RSS Discovery first
+  try {
+    const rssResults = await rssProvider.search({ niche: activeNiche, maxResults: 10 } as any);
+    for (const video of rssResults) {
+      const videoId = extractYouTubeId(video.id || video.youtubeUrl);
+      if (!videoId) continue;
+      if (knownSet.has(videoId) || seenThisRun.has(videoId)) continue;
+      seenThisRun.add(videoId);
+      candidatePool.push(video);
+    }
+    console.log(`[Discovery] RSS Channel Feed collected ${rssResults.length} videos.`);
+  } catch (rssErr) {
+    console.warn('[Discovery] RSS channel feed discovery warning:', rssErr);
+  }
 
   for (const qc of queryContexts) {
     try {

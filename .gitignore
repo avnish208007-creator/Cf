@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+tmp/
+temp_media/
+uploads/
+*.mp4
+*.jpg
+*.mp3
+*.json
