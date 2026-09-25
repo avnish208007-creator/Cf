@@ -59,9 +59,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onCloseMobile }) => {
       {/* Brand & Workspace Header */}
       <div className="h-16 flex items-center justify-between px-5 border-b border-slate-100 shrink-0">
         <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-md bg-blue-600 text-white font-bold text-xs flex items-center justify-center tracking-tight shadow-2xs">
-            CF
-          </div>
           <span className="font-semibold text-sm tracking-tight text-slate-900">
             ClipFlow
           </span>

@@ -34,8 +34,8 @@ export const OnboardingPage: React.FC = () => {
     <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
       <div className="w-full max-w-md bg-white border border-slate-200/80 rounded-2xl shadow-xl p-6 sm:p-8 space-y-6">
         <div className="space-y-2 text-center">
-          <div className="w-10 h-10 rounded-xl bg-blue-600 text-white font-bold text-base flex items-center justify-center mx-auto shadow-md">
-            CF
+          <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center mx-auto shadow-md">
+            <Compass className="w-5 h-5" />
           </div>
           <h1 className="text-xl font-bold tracking-tight text-slate-900">
             Setup your workspace

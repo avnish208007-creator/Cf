@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
-import { getFirestore, Firestore } from 'firebase/firestore';
+import { initializeFirestore, getFirestore, Firestore } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
@@ -16,8 +16,24 @@ const databaseId = process.env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.f
 
 const app: FirebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-export const db: Firestore = databaseId ? getFirestore(app, databaseId) : getFirestore(app);
+function createFirestoreInstance(): Firestore {
+  try {
+    if (getApps().length > 0) {
+      // If already initialized, try getFirestore first
+      try {
+        return databaseId ? getFirestore(app, databaseId) : getFirestore(app);
+      } catch {}
+    }
+    const settings = { experimentalAutoDetectLongPolling: true };
+    return databaseId ? initializeFirestore(app, settings, databaseId) : initializeFirestore(app, settings);
+  } catch {
+    return databaseId ? getFirestore(app, databaseId) : getFirestore(app);
+  }
+}
+
+export const db: Firestore = createFirestoreInstance();
 export const storage: FirebaseStorage = getStorage(app);
 export const DEFAULT_WORKSPACE_ID = 'default-workspace';
+
 
 
