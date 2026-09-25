@@ -1,11 +1,6 @@
 import { Request, Response } from 'express';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, getDoc, updateDoc } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import { SourceMediaProvider } from '../rendering/SourceMediaProvider';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleCandidateSelectRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -31,10 +26,13 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
   console.log(`[Render] candidate selected: ${candidateId}`);
 
   try {
-    const candRef = doc(db, 'clip_candidates', candidateId);
-    const candSnap = await getDoc(candRef);
+    const { data: candidate } = await supabase
+      .from('clip_candidates')
+      .select('*')
+      .eq('id', candidateId)
+      .maybeSingle();
 
-    if (!candSnap.exists()) {
+    if (!candidate) {
       res.status(404).json({
         success: false,
         error: 'CANDIDATE_NOT_FOUND',
@@ -43,16 +41,17 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       return;
     }
 
-    const candidate = { id: candSnap.id, ...candSnap.data() } as any;
     const effectiveWsId = candidate.workspace_id || workspaceId;
     const factors = (candidate.factors || {}) as any;
 
     let sourceVideo: any = null;
     if (candidate.source_video_id) {
-      const srcDoc = await getDoc(doc(db, 'source_videos', candidate.source_video_id));
-      if (srcDoc.exists()) {
-        sourceVideo = { id: srcDoc.id, ...srcDoc.data() };
-      }
+      const { data: srcData } = await supabase
+        .from('source_videos')
+        .select('*')
+        .eq('id', candidate.source_video_id)
+        .maybeSingle();
+      sourceVideo = srcData;
     }
 
     const updatedFactorsInitial = {
@@ -62,10 +61,14 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       selectedAt: new Date().toISOString(),
     };
 
-    await updateDoc(candRef, {
-      status: 'approved',
-      factors: updatedFactorsInitial,
-    });
+    await supabase
+      .from('clip_candidates')
+      .update({
+        status: 'approved',
+        factors: updatedFactorsInitial,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', candidateId);
 
     const mediaProvider = new SourceMediaProvider();
     let mediaResult: any;
@@ -101,21 +104,27 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
     if (mediaResult.success && mediaResult.status === 'available' && mediaResult.mediaPath) {
       finalRenderStatus = 'media_ready';
       if (sourceVideo?.id) {
-        await updateDoc(doc(db, 'source_videos', sourceVideo.id), {
-          media_status: 'available',
-          media_path: mediaResult.mediaPath,
-          media_url: mediaResult.mediaUrl,
-          media_updated_at: new Date().toISOString(),
-        });
+        await supabase
+          .from('source_videos')
+          .update({
+            media_status: 'available',
+            media_path: mediaResult.mediaPath,
+            media_url: mediaResult.mediaUrl,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', sourceVideo.id);
       }
     } else {
       finalRenderStatus = 'failed';
       if (sourceVideo?.id) {
-        await updateDoc(doc(db, 'source_videos', sourceVideo.id), {
-          media_status: 'unavailable',
-          media_error: mediaResult.errorMessage || mediaResult.errorCode,
-          media_updated_at: new Date().toISOString(),
-        });
+        await supabase
+          .from('source_videos')
+          .update({
+            media_status: 'unavailable',
+            media_error: mediaResult.errorMessage || mediaResult.errorCode,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', sourceVideo.id);
       }
     }
 
@@ -130,7 +139,13 @@ export async function handleCandidateSelectRequest(req: Request, res: Response):
       mediaUrl: mediaResult.mediaUrl,
     };
 
-    await updateDoc(candRef, { factors: finalFactors });
+    await supabase
+      .from('clip_candidates')
+      .update({
+        factors: finalFactors,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', candidateId);
 
     res.status(200).json({
       success: true,

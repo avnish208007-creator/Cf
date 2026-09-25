@@ -1,10 +1,5 @@
 import { Request, Response } from 'express';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import { supabase } from '../../lib/supabase';
 
 export async function handleCandidatesRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -24,34 +19,27 @@ export async function handleCandidatesRequest(req: Request, res: Response): Prom
 
   try {
     let sourcesForWorkspace: any[] = [];
-    const sourceMap = new Map<string, any>();
-    const sourceIds: string[] = [];
-
     if (workspaceId) {
-      const srcQuery = query(
-        collection(db, 'source_videos'),
-        where('workspace_id', '==', workspaceId)
-      );
-      const srcSnap = await getDocs(srcQuery);
-      sourcesForWorkspace = srcSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
-
-      for (const s of sourcesForWorkspace) {
-        sourceMap.set(s.id, s);
-        sourceIds.push(s.id);
-      }
+      const { data: srcData } = await supabase
+        .from('source_videos')
+        .select('*')
+        .eq('workspace_id', workspaceId);
+      sourcesForWorkspace = srcData || [];
     }
 
     let workspaceCandidates: any[] = [];
     if (workspaceId) {
-      const candQuery = query(
-        collection(db, 'clip_candidates'),
-        where('workspace_id', '==', workspaceId)
-      );
-      const candSnap = await getDocs(candQuery);
-      workspaceCandidates = candSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
-    }
+      const { data: candData, error } = await supabase
+        .from('clip_candidates')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('score', { ascending: false });
 
-    workspaceCandidates.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
+      if (error) {
+        throw new Error(error.message);
+      }
+      workspaceCandidates = candData || [];
+    }
 
     console.log(`[CandidatesHandler] Workspace: ${workspaceId} -> ${workspaceCandidates.length} candidates`);
 
@@ -67,7 +55,7 @@ export async function handleCandidatesRequest(req: Request, res: Response): Prom
     res.status(500).json({
       success: false,
       error: 'FETCH_CANDIDATES_FAILED',
-      message: err.message || 'An unexpected error occurred while querying candidates from Firebase.',
+      message: err.message || 'An unexpected error occurred while querying candidates from Supabase.',
     });
   }
 }

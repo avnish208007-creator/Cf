@@ -1,10 +1,5 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import { supabase } from '../../src/lib/supabase';
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -39,21 +34,22 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   }
 
   try {
-    const q = query(
-      collection(db, 'source_videos'),
-      where('workspace_id', '==', workspaceId.trim())
-    );
-    const querySnap = await getDocs(q);
-    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    const { data: records, error } = await supabase
+      .from('source_videos')
+      .select('*')
+      .eq('workspace_id', workspaceId.trim())
+      .order('created_at', { ascending: false });
+
+    if (error) throw new Error(error.message);
 
     return {
       statusCode: 200,
       headers: defaultHeaders,
       body: JSON.stringify({
         success: true,
-        sources: records,
+        sources: records || [],
         workspaceId: workspaceId.trim(),
-        count: records.length,
+        count: (records || []).length,
       }),
     };
   } catch (err: any) {

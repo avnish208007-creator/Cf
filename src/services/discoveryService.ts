@@ -19,6 +19,13 @@ export interface DiscoveryFilterOptions {
  * Calls the server-side Netlify Function / API endpoint backed by the DiscoveryProvider pipeline.
  */
 export class DiscoveryService {
+  public static async discover(
+    options: DiscoveryFilterOptions
+  ): Promise<{ success: boolean; videos: SourceVideo[] }> {
+    const videos = await this.discoverSources(options);
+    return { success: true, videos };
+  }
+
   /**
    * Discovers relevant long-form source videos automatically
    * based on active workspace niche, subtopics, and filters, and persists them to Supabase.

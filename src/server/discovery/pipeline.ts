@@ -1,16 +1,5 @@
 import 'dotenv/config';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  getDocs,
-  collection,
-  query,
-  where,
-} from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import {
   DiscoveredVideo,
   DiscoveryPipelineOptions,
@@ -21,10 +10,7 @@ import {
 import { RealDiscoveryProvider } from '../providers/RealDiscoveryProvider';
 import { generateFocusedSearchQueries } from './queryGenerator';
 import { RankingEngine } from '../analysis/RankingEngine';
-
-// Server-side Firebase Firestore instance
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import crypto from 'crypto';
 
 export function extractYouTubeId(urlOrId: string): string {
   if (!urlOrId) return '';
@@ -60,19 +46,22 @@ export async function runDiscoveryPipeline(
   } = options;
 
   if (!workspaceId || !workspaceId.trim()) {
-    throw new Error('Workspace ID is required to run discovery and persist records to Firebase.');
+    throw new Error('Workspace ID is required to run discovery and persist records to Supabase.');
   }
 
   const authenticatedWorkspaceId = workspaceId.trim();
   console.log(`[ClipFlow] DISCOVERY started for workspace: ${authenticatedWorkspaceId}`);
 
-  // 1. Authenticate / ensure workspace in Firestore
-  const wsDocRef = doc(db, 'workspaces', authenticatedWorkspaceId);
-  const wsSnap = await getDoc(wsDocRef);
+  // 1. Authenticate / ensure workspace in Supabase
+  const { data: wsData } = await supabase
+    .from('workspaces')
+    .select('id')
+    .eq('id', authenticatedWorkspaceId)
+    .maybeSingle();
 
-  if (!wsSnap.exists()) {
+  if (!wsData) {
     const ownerId = '791454a8-e110-430e-8a5d-c1b343a140c9';
-    await setDoc(wsDocRef, {
+    await supabase.from('workspaces').upsert({
       id: authenticatedWorkspaceId,
       name: workspaceName || 'Apex Media Lab',
       owner_id: ownerId,
@@ -82,12 +71,11 @@ export async function runDiscoveryPipeline(
   }
 
   // 2. Read active workspace configuration and history
-  const settingsQuery = query(
-    collection(db, 'workspace_settings'),
-    where('workspace_id', '==', authenticatedWorkspaceId)
-  );
-  const settingsSnap = await getDocs(settingsQuery);
-  const dbSettings = settingsSnap.empty ? null : settingsSnap.docs[0].data();
+  const { data: dbSettings } = await supabase
+    .from('workspace_settings')
+    .select('*')
+    .eq('workspace_id', authenticatedWorkspaceId)
+    .maybeSingle();
 
   const activeNiche = (optionNiche && optionNiche.trim()) || dbSettings?.main_niche || 'Fitness & Strength Training';
   const activeSubtopics = (optionSubtopics && optionSubtopics.length > 0)
@@ -107,14 +95,13 @@ export async function runDiscoveryPipeline(
 
   let totalExistingCount = 0;
   try {
-    const sourcesQuery = query(
-      collection(db, 'source_videos'),
-      where('workspace_id', '==', authenticatedWorkspaceId)
-    );
-    const sourcesSnap = await getDocs(sourcesQuery);
-    totalExistingCount = sourcesSnap.size;
-    sourcesSnap.docs.forEach((docSnap) => {
-      const data = docSnap.data();
+    const { data: sourcesData } = await supabase
+      .from('source_videos')
+      .select('youtube_url')
+      .eq('workspace_id', authenticatedWorkspaceId);
+
+    totalExistingCount = sourcesData?.length || 0;
+    (sourcesData || []).forEach((data) => {
       if (data.youtube_url) {
         const extracted = extractYouTubeId(data.youtube_url);
         if (extracted) knownSet.add(extracted);
@@ -237,8 +224,7 @@ export async function runDiscoveryPipeline(
     };
     const formattedSummary = `[CLIPFLOW_META:${JSON.stringify(metaPayload)}] ${v.scoreExplanation || ''} (Scores: Rel ${v.relevanceScore}% · Eng ${v.engagementScore}% · Short-Form ${v.shortFormScore}% · Quality ${v.contentQualityScore}%) — ${v.description || v.summary || ''}`;
 
-    const newSourceRef = doc(collection(db, 'source_videos'));
-    const newSourceId = newSourceRef.id;
+    const newSourceId = crypto.randomUUID();
     const now = new Date().toISOString();
 
     const insertPayload = {
@@ -256,30 +242,35 @@ export async function runDiscoveryPipeline(
       candidates_count: 0,
       summary: formattedSummary,
       niche: v.niche || activeNiche,
-      thumbnail_gradient: v.thumbnailGradient,
+      thumbnail_gradient: v.thumbnailGradient || 'from-slate-900 via-indigo-950 to-slate-900',
       created_at: now,
+      updated_at: now,
     };
 
-    await setDoc(newSourceRef, insertPayload);
+    const { error: insertErr } = await supabase.from('source_videos').insert(insertPayload);
 
-    console.log(`[ClipFlow] SOURCE INSERT: ${newSourceId} - "${v.title}"`);
+    if (insertErr) {
+      console.error(`[ClipFlow] SOURCE INSERT FAILED for "${v.title}":`, insertErr.message);
+    } else {
+      console.log(`[ClipFlow] SOURCE INSERT SUCCESS in Supabase: ${newSourceId} - "${v.title}"`);
 
-    insertedVideos.push({
-      ...v,
-      id: newSourceId,
-      description: v.description,
-      publishedAt: v.publishedAt,
-      relevanceScore: v.relevanceScore,
-      contentQualityScore: v.contentQualityScore,
-      engagementScore: v.engagementScore,
-      shortFormScore: v.shortFormScore,
-      overallScore: v.overallScore,
-      scoreExplanation: v.scoreExplanation,
-      matchedSubtopics: v.matchedSubtopics,
-      isSyntheticData: false,
-      is_development_source: isDevSource,
-      isDevelopmentSource: isDevSource,
-    });
+      insertedVideos.push({
+        ...v,
+        id: newSourceId,
+        description: v.description,
+        publishedAt: v.publishedAt,
+        relevanceScore: v.relevanceScore,
+        contentQualityScore: v.contentQualityScore,
+        engagementScore: v.engagementScore,
+        shortFormScore: v.shortFormScore,
+        overallScore: v.overallScore,
+        scoreExplanation: v.scoreExplanation,
+        matchedSubtopics: v.matchedSubtopics,
+        isSyntheticData: false,
+        is_development_source: isDevSource,
+        isDevelopmentSource: isDevSource,
+      });
+    }
   }
 
   return {

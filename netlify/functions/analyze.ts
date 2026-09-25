@@ -1,11 +1,6 @@
 import type { Handler, HandlerEvent, HandlerResponse } from '@netlify/functions';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs, limit } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { supabase } from '../../src/lib/supabase';
 import { MomentPipeline } from '../../src/server/moment-detection/MomentPipeline';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 const defaultHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -61,15 +56,13 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     let activeSubtopics: string[] = passedSubtopics || [];
 
     if (!passedNiche || activeSubtopics.length === 0) {
-      const settingsQuery = query(
-        collection(db, 'workspace_settings'),
-        where('workspace_id', '==', workspaceId),
-        limit(1)
-      );
-      const settingsSnap = await getDocs(settingsQuery);
+      const { data: settings } = await supabase
+        .from('workspace_settings')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .maybeSingle();
 
-      if (!settingsSnap.empty) {
-        const settings = settingsSnap.docs[0].data();
+      if (settings) {
         activeNiche = passedNiche || settings.main_niche || activeNiche;
         activeSubtopics = activeSubtopics.length > 0 ? activeSubtopics : settings.subtopics || [];
       }
@@ -81,14 +74,14 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     } else if (Array.isArray(passedSourceIds) && passedSourceIds.length > 0) {
       targetSourceIds = passedSourceIds;
     } else {
-      const sourcesQuery = query(
-        collection(db, 'source_videos'),
-        where('workspace_id', '==', workspaceId),
-        where('status', 'in', ['new', 'queued']),
-        limit(5)
-      );
-      const sourcesSnap = await getDocs(sourcesQuery);
-      targetSourceIds = sourcesSnap.docs.map((s) => s.id);
+      const { data: sources } = await supabase
+        .from('source_videos')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .in('status', ['new', 'queued'])
+        .limit(5);
+
+      targetSourceIds = (sources || []).map((s) => s.id);
     }
 
     if (targetSourceIds.length === 0) {

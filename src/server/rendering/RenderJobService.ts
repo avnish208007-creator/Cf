@@ -1,9 +1,4 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, updateDoc } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import { supabase } from '../../lib/supabase';
 
 export type JobStatus =
   | 'queued'
@@ -40,9 +35,16 @@ export class RenderJobService {
     }
 
     try {
-      await updateDoc(doc(db, 'render_jobs', jobId), updateData);
+      const { error } = await supabase
+        .from('render_jobs')
+        .update(updateData)
+        .eq('id', jobId);
+
+      if (error) {
+        console.warn(`[RenderJobService] Notice updating job ${jobId} in Supabase:`, error.message);
+      }
     } catch (error: any) {
-      console.error(`[RenderJobService] Failed to update job ${jobId} in Firestore:`, error.message);
+      console.error(`[RenderJobService] Exception updating job ${jobId}:`, error.message);
     }
   }
 }

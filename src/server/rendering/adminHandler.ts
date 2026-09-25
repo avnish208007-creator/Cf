@@ -3,13 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import http from 'http';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import { OutputValidator } from './OutputValidator';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 export async function handleValidateExistingClipsRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -24,15 +19,14 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
   const workspaceId = ((req.query.workspaceId as string) || '').trim();
 
   try {
-    let q;
+    let queryBuilder = supabase.from('clips').select('*');
     if (workspaceId) {
-      q = query(collection(db, 'clips'), where('workspace_id', '==', workspaceId));
-    } else {
-      q = query(collection(db, 'clips'));
+      queryBuilder = queryBuilder.eq('workspace_id', workspaceId);
     }
 
-    const querySnap = await getDocs(q);
-    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })) as any[];
+    const { data: records, error } = await queryBuilder;
+    if (error) throw new Error(error.message);
+
     const results = [];
 
     const tmpDir = path.resolve(process.cwd(), 'temp_media', 'validate');
@@ -42,7 +36,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
 
     const validator = new OutputValidator();
 
-    for (const cl of records) {
+    for (const cl of (records || [])) {
       const videoUrl = cl.video_url;
       if (!videoUrl) {
         results.push({
@@ -143,7 +137,7 @@ export async function handleValidateExistingClipsRequest(req: Request, res: Resp
     res.status(200).json({
       success: true,
       workspaceId,
-      totalCount: records.length,
+      totalCount: (records || []).length,
       validatedClips: results,
     });
   } catch (err: any) {

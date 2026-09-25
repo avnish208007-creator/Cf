@@ -1,13 +1,9 @@
 import { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import { RenderWorker } from './RenderWorker';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import crypto from 'crypto';
 
 const renderedDir = path.resolve(process.cwd(), 'temp_media', 'rendered');
 
@@ -27,57 +23,62 @@ export async function handleRenderRequest(req: Request, res: Response) {
       });
     }
 
-    const candRef = doc(db, 'clip_candidates', candidateId);
-    const candSnap = await getDoc(candRef);
-    const candidate = candSnap.exists() ? candSnap.data() : null;
+    const { data: candidate } = await supabase
+      .from('clip_candidates')
+      .select('*')
+      .eq('id', candidateId)
+      .maybeSingle();
 
     if (candidate && candidate.factors && candidate.factors.activeJobId) {
       const activeJobId = candidate.factors.activeJobId;
-      const jobSnap = await getDoc(doc(db, 'render_jobs', activeJobId));
-      if (jobSnap.exists()) {
-        const activeJob = jobSnap.data();
-        if (activeJob.status === 'queued' || activeJob.status === 'running') {
-          console.log(`[handleRenderRequest] Duplicate job active for candidate: ${activeJobId}`);
-          return res.status(202).json({
-            success: true,
-            jobId: activeJobId,
-            status: 'queued',
-            message: 'An active render is already in progress for this candidate. Reusing job.'
-          });
-        }
+      const { data: activeJob } = await supabase
+        .from('render_jobs')
+        .select('*')
+        .eq('id', activeJobId)
+        .maybeSingle();
+
+      if (activeJob && (activeJob.status === 'queued' || activeJob.status === 'running')) {
+        console.log(`[handleRenderRequest] Duplicate job active for candidate: ${activeJobId}`);
+        return res.status(202).json({
+          success: true,
+          jobId: activeJobId,
+          status: 'queued',
+          message: 'An active render is already in progress for this candidate. Reusing job.'
+        });
       }
     }
 
-    const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
-
+    const jobId = crypto.randomUUID();
     const now = new Date().toISOString();
 
-    await setDoc(doc(db, 'render_jobs', jobId), {
-      id: jobId,
-      workspace_id: workspaceId,
-      type: 'vertical_render',
-      target_title: `Render Clip: ${candidateId}`,
-      progress: 0,
-      stage: 'queued',
-      status: 'queued',
-      created_at: now,
-      metadata: { candidateId }
-    });
+    try {
+      await supabase.from('render_jobs').insert({
+        id: jobId,
+        workspace_id: workspaceId,
+        type: 'vertical_render',
+        target_title: `Render Clip: ${candidateId}`,
+        progress: 0,
+        stage: 'queued',
+        status: 'queued',
+        created_at: now,
+        metadata: { candidateId }
+      });
+    } catch (_) {}
 
     const existingFactors = (candidate?.factors || {}) as any;
-    if (candSnap.exists()) {
-      await updateDoc(candRef, {
-        status: 'generating',
-        factors: {
-          ...existingFactors,
-          renderStatus: 'rendering',
-          activeJobId: jobId,
-        }
-      });
+    if (candidate) {
+      await supabase
+        .from('clip_candidates')
+        .update({
+          status: 'generating',
+          factors: {
+            ...existingFactors,
+            renderStatus: 'rendering',
+            activeJobId: jobId,
+          },
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', candidateId);
     }
 
     const worker = new RenderWorker();
@@ -111,24 +112,22 @@ export async function handleDevRenderTestRequest(req: Request, res: Response) {
     }
 
     console.log(`[handleDevRenderTestRequest] Triggering isolated worker test using real moving MP4 at: ${testVideoPath}`);
-    
-    const jobId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
 
-    await setDoc(doc(db, 'render_jobs', jobId), {
-      id: jobId,
-      workspace_id: workspaceId || 'a0000000-0000-4000-a000-000000000001',
-      type: 'vertical_render',
-      target_title: `Test Render: ${candidateId || 'dev-test'}`,
-      progress: 0,
-      stage: 'queued',
-      status: 'queued',
-      created_at: new Date().toISOString(),
-      metadata: { candidateId: candidateId || 'dev-test' }
-    });
+    const jobId = crypto.randomUUID();
+
+    try {
+      await supabase.from('render_jobs').insert({
+        id: jobId,
+        workspace_id: workspaceId || 'a0000000-0000-4000-a000-000000000001',
+        type: 'vertical_render',
+        target_title: `Test Render: ${candidateId || 'dev-test'}`,
+        progress: 0,
+        stage: 'queued',
+        status: 'queued',
+        created_at: new Date().toISOString(),
+        metadata: { candidateId: candidateId || 'dev-test' }
+      });
+    } catch (_) {}
 
     const worker = new RenderWorker();
     const success = await worker.process(jobId);
@@ -147,16 +146,18 @@ export async function handleRenderJobStatus(req: Request, res: Response) {
   try {
     const { jobId } = req.params;
 
-    const jobSnap = await getDoc(doc(db, 'render_jobs', jobId));
+    const { data: job } = await supabase
+      .from('render_jobs')
+      .select('*')
+      .eq('id', jobId)
+      .maybeSingle();
 
-    if (!jobSnap.exists()) {
+    if (!job) {
       return res.status(404).json({
         success: false,
         message: `Job ${jobId} not found in database.`,
       });
     }
-
-    const job = jobSnap.data();
 
     return res.json({
       success: true,

@@ -29,13 +29,10 @@ const AppContent: React.FC = () => {
     return <VideoTestPage />;
   }
 
-  // If user is not logged in and not on onboarding or login, show login
-  if (!user && currentPage !== 'login' && currentPage !== 'onboarding') {
-    return <LoginPage />;
-  }
-
+  // Remove auth restrictions: always render app content
   if (currentPage === 'login') {
-    return <LoginPage />;
+    // If user navigates to login, send them to dashboard
+    return <AppLayout><DashboardPage /></AppLayout>;
   }
 
   if (currentPage === 'onboarding') {

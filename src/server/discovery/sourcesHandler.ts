@@ -1,10 +1,5 @@
 import { Request, Response } from 'express';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import { supabase } from '../../lib/supabase';
 
 export async function handleSourcesRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -27,27 +22,30 @@ export async function handleSourcesRequest(req: Request, res: Response): Promise
   }
 
   try {
-    const q = query(
-      collection(db, 'source_videos'),
-      where('workspace_id', '==', workspaceId)
-    );
-    const querySnap = await getDocs(q);
-    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    const { data: records, error } = await supabase
+      .from('source_videos')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .order('created_at', { ascending: false });
 
-    console.log(`[SourcesHandler] Fetched ${records.length} source records for workspace "${workspaceId}"`);
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    console.log(`[SourcesHandler] Fetched ${(records || []).length} source records for workspace "${workspaceId}"`);
 
     res.status(200).json({
       success: true,
-      sources: records,
+      sources: records || [],
       workspaceId,
-      count: records.length,
+      count: (records || []).length,
     });
   } catch (err: any) {
     console.error('[SourcesHandler] Unexpected error:', err);
     res.status(500).json({
       success: false,
       error: 'FETCH_SOURCES_FAILED',
-      message: err.message || 'An unexpected error occurred while querying sources from Firebase.',
+      message: err.message || 'An unexpected error occurred while querying sources from Supabase.',
     });
   }
 }

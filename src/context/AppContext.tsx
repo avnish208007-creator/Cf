@@ -18,19 +18,13 @@ import {
   INITIAL_WORKSPACE,
 } from '../services/mockData';
 import {
-  auth,
-  googleProvider,
-  isFirebaseConfigured,
-  FirebaseWorkspaceRepo,
-  FirebaseContentRepo,
-} from '../lib/firebase';
-import {
-  signInWithPopup,
-  signOut as firebaseSignOut,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-} from 'firebase/auth';
+  supabase,
+  DEFAULT_WORKSPACE_ID,
+  SupabaseWorkspaceRepo,
+  SupabaseSourcesRepo,
+  SupabaseCandidatesRepo,
+  SupabaseClipsRepo,
+} from '../lib/supabase';
 
 interface ToastState {
   id: number;
@@ -60,6 +54,8 @@ interface AppContextType {
   isFetchingSources: boolean;
   sourcesFetchError: string | null;
   fetchSources: (workspaceId?: string) => Promise<void>;
+  deleteSource: (sourceId: string) => Promise<void>;
+  bulkDeleteSources: (sourceIds: string[]) => Promise<void>;
   isDiscovering: boolean;
   isAnalyzing: boolean;
   discoveryProviderError: string | null;
@@ -77,6 +73,7 @@ interface AppContextType {
   isFetchingCandidates: boolean;
   candidatesFetchError: string | null;
   fetchCandidates: (workspaceId?: string) => Promise<void>;
+  deleteCandidate: (candidateId: string) => Promise<void>;
   selectCandidate: (candidateId: string) => Promise<void>;
   approveCandidate: (candidateId: string) => void;
   rejectCandidate: (candidateId: string) => void;
@@ -102,8 +99,6 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | null>(null);
 
-const STORAGE_KEY_PREFIX = 'clipflow_state_v2_';
-
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentPage, setCurrentPage] = useState<PageRoute>(() => {
     const hash = window.location.hash.replace('#/', '').replace('#', '');
@@ -123,457 +118,213 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return 'dashboard';
   });
 
-  const [currentWorkspaceId, setCurrentWorkspaceId] = useState<string | null>(() => {
-    return (
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001'
-    );
-  });
-
-  const [user, setUser] = useState<UserSession | null>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}user`);
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch {
-        return INITIAL_USER;
-      }
-    }
-    return INITIAL_USER;
-  });
-
-  const [isOnboarded, setIsOnboarded] = useState<boolean>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}onboarded`);
-    return saved ? saved === 'true' : true;
-  });
-
-  const [workspace, setWorkspace] = useState<WorkspaceConfig>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace`);
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch {
-        return INITIAL_WORKSPACE;
-      }
-    }
-    return INITIAL_WORKSPACE;
-  });
+  const [user, setUser] = useState<UserSession | null>(INITIAL_USER);
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState<string | null>(DEFAULT_WORKSPACE_ID);
+  const [workspace, setWorkspace] = useState<WorkspaceConfig>(INITIAL_WORKSPACE);
+  const [isOnboarded, setIsOnboarded] = useState<boolean>(true);
 
   const [sources, setSources] = useState<SourceVideo[]>([]);
-  const [isFetchingSources, setIsFetchingSources] = useState<boolean>(false);
+  const [isFetchingSources, setIsFetchingSources] = useState(false);
   const [sourcesFetchError, setSourcesFetchError] = useState<string | null>(null);
 
   const [candidates, setCandidates] = useState<ClipCandidate[]>([]);
-  const [isFetchingCandidates, setIsFetchingCandidates] = useState<boolean>(false);
+  const [isFetchingCandidates, setIsFetchingCandidates] = useState(false);
   const [candidatesFetchError, setCandidatesFetchError] = useState<string | null>(null);
 
   const [clips, setClips] = useState<Clip[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [jobs, setJobs] = useState<ActiveJob[]>([]);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
-  const [toasts, setToasts] = useState<ToastState[]>([]);
-  const [isDiscovering, setIsDiscovering] = useState<boolean>(false);
-  const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
+
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [discoveryProviderError, setDiscoveryProviderError] = useState<string | null>(null);
 
-  const clearDiscoveryProviderError = useCallback(() => {
-    setDiscoveryProviderError(null);
+  const [toasts, setToasts] = useState<ToastState[]>([]);
+
+  const showToast = useCallback((message: string, type: 'success' | 'info' | 'error' = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4000);
   }, []);
 
-  const navigate = useCallback((page: PageRoute) => {
-    window.location.hash = `#/${page}`;
-    setCurrentPage(page);
-    window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
-  }, []);
-
-  const showToast = useCallback(
-    (message: string, type: 'success' | 'info' | 'error' = 'success') => {
-      const id = Date.now();
-      setToasts((prev) => [...prev, { id, message, type }]);
-      setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 4000);
-    },
-    []
-  );
-
-  const dismissToast = (id: number) => {
+  const dismissToast = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const navigate = (page: PageRoute) => {
+    setCurrentPage(page);
+    window.location.hash = `#/${page}`;
   };
 
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}user`, JSON.stringify(user));
-  }, [user]);
-
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}onboarded`, String(isOnboarded));
-  }, [isOnboarded]);
-
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}workspace`, JSON.stringify(workspace));
-  }, [workspace]);
-
-  useEffect(() => {
-    if (currentWorkspaceId) {
-      localStorage.setItem(`${STORAGE_KEY_PREFIX}workspace_id`, currentWorkspaceId);
-    } else {
-      localStorage.removeItem(`${STORAGE_KEY_PREFIX}workspace_id`);
-    }
-  }, [currentWorkspaceId]);
-
-  useEffect(() => {
-    const handleHashChange = () => {
-      const hash = window.location.hash.replace('#/', '').replace('#', '');
-      const validPages: PageRoute[] = [
-        'login',
-        'onboarding',
-        'dashboard',
-        'discover',
-        'candidates',
-        'clips',
-        'queue',
-        'settings',
-      ];
-      if (hash && validPages.includes(hash as PageRoute)) {
-        setCurrentPage(hash as PageRoute);
+  // --- Initial Data Load from Supabase ---
+  const loadWorkspaceData = useCallback(async (wsId: string) => {
+    try {
+      const { config } = await SupabaseWorkspaceRepo.getWorkspace(wsId);
+      if (config) {
+        setWorkspace(config);
       }
-    };
-    window.addEventListener('hashchange', handleHashChange);
-    return () => window.removeEventListener('hashchange', handleHashChange);
+
+      const [srcs, cands, clps] = await Promise.all([
+        SupabaseSourcesRepo.getSources(wsId),
+        SupabaseCandidatesRepo.getCandidates(wsId),
+        SupabaseClipsRepo.getClips(wsId),
+      ]);
+
+      setSources(srcs);
+      setCandidates(cands);
+      setClips(clps);
+
+      // Derive queue items from clips
+      const queueItems: QueueItem[] = clps
+        .filter((c) => c.inQueue || c.queueStatus === 'approved' || c.queueStatus === 'scheduled')
+        .map((c) => ({
+          id: `queue_${c.id}`,
+          clipId: c.id,
+          title: c.title,
+          hook: c.hook,
+          duration: c.duration,
+          platforms: ['YouTube Shorts', 'Instagram Reels', 'TikTok'],
+          captionText: `${c.hook || ''}\n\n${(c.captionsSample || []).join(' ')}`,
+          hashtags: c.hashtags || ['#shorts', '#viral'],
+          status: c.queueStatus || 'needs_review',
+          scheduledSlot: c.scheduledSlot || undefined,
+          addedAt: 'Recently',
+          style: c.style,
+        }));
+      setQueue(queueItems);
+
+    } catch (err) {
+      console.error('[AppContext] Failed to load workspace data from Supabase:', err);
+    }
   }, []);
 
-  // Helper to load Firebase workspace and all associated data for a user
-  const loadUserWorkspaceFromFirebase = useCallback(
-    async (userId: string, userSession: UserSession) => {
-      if (!isFirebaseConfigured) return;
+  useEffect(() => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    loadWorkspaceData(wsId);
+  }, [currentWorkspaceId, loadWorkspaceData]);
 
-      try {
-        const { workspace: dbWs, settings: dbSettings } =
-          await FirebaseWorkspaceRepo.getWorkspaceForUser(userId);
-
-        if (dbWs && dbSettings) {
-          setCurrentWorkspaceId(dbWs.id);
-          setIsOnboarded(true);
-
-          const loadedConfig: WorkspaceConfig = {
-            workspaceName: dbWs.name,
-            brandName: dbWs.brand_name || undefined,
-            mainNiche: dbSettings.main_niche,
-            subtopics: dbSettings.subtopics || [],
-            contentLanguage: dbSettings.content_language,
-            contentStyle: dbSettings.content_style,
-            aspectRatio: (dbSettings.aspect_ratio as '9:16') || '9:16',
-            targetPlatforms: dbSettings.target_platforms || [],
-            minCandidateScore: dbSettings.min_candidate_score || 80,
-            targetDuration: dbSettings.target_duration || '30-60s',
-          };
-          setWorkspace(loadedConfig);
-
-          const [dbSources, dbCandidates, dbClips, dbQueue, dbJobs] = await Promise.all([
-            FirebaseContentRepo.getSources(dbWs.id),
-            FirebaseContentRepo.getCandidates(dbWs.id),
-            FirebaseContentRepo.getClips(dbWs.id),
-            FirebaseContentRepo.getQueue(dbWs.id),
-            FirebaseContentRepo.getJobs(dbWs.id),
-          ]);
-
-          setSources(dbSources);
-          setCandidates(dbCandidates);
-          setClips(dbClips);
-          setQueue(dbQueue);
-          if (dbJobs.length > 0) setJobs(dbJobs);
-
-          if (window.location.hash.includes('login') || window.location.hash.includes('onboarding')) {
-            navigate('dashboard');
+  // Auth Operations
+  const login = async (email?: string, password?: string, isSignUp?: boolean, fullName?: string) => {
+    try {
+      if (email && password) {
+        if (isSignUp) {
+          const { data, error } = await supabase.auth.signUp({
+            email,
+            password,
+            options: { data: { full_name: fullName } },
+          });
+          if (error) return { success: false, error: error.message };
+          if (data.user) {
+            setUser({
+              id: data.user.id,
+              name: fullName || email.split('@')[0],
+              email: data.user.email || email,
+              avatarInitials: (fullName || email).slice(0, 2).toUpperCase(),
+            });
+            showToast('Account created successfully!', 'success');
           }
         } else {
-          setCurrentWorkspaceId(null);
-          setIsOnboarded(false);
-          setSources([]);
-          setCandidates([]);
-          setClips([]);
-          setQueue([]);
-          navigate('onboarding');
+          const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+          if (error) return { success: false, error: error.message };
+          if (data.user) {
+            setUser({
+              id: data.user.id,
+              name: data.user.user_metadata?.full_name || email.split('@')[0],
+              email: data.user.email || email,
+              avatarInitials: (email).slice(0, 2).toUpperCase(),
+            });
+            showToast('Signed in successfully', 'success');
+          }
         }
-      } catch (err) {
-        console.error('Failed to load user workspace from Firebase:', err);
-      }
-    },
-    [navigate]
-  );
-
-  const fetchSources = useCallback(
-    async (targetWorkspaceId?: string) => {
-      const wsId =
-        targetWorkspaceId ||
-        currentWorkspaceId ||
-        localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-        'a0000000-0000-4000-a000-000000000001';
-
-      if (!wsId) return;
-
-      setIsFetchingSources(true);
-      setSourcesFetchError(null);
-
-      try {
-        const fetched = await FirebaseContentRepo.getSources(wsId);
-        setSources(fetched);
-      } catch (err: any) {
-        console.error(`[Discover] Error fetching source_videos for workspace "${wsId}":`, err);
-        setSourcesFetchError(err.message || 'Failed to load source videos from Firebase.');
-      } finally {
-        setIsFetchingSources(false);
-      }
-    },
-    [currentWorkspaceId]
-  );
-
-  const fetchCandidates = useCallback(
-    async (targetWorkspaceId?: string) => {
-      const wsId =
-        targetWorkspaceId ||
-        currentWorkspaceId ||
-        localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-        'a0000000-0000-4000-a000-000000000001';
-
-      if (!wsId || !isFirebaseConfigured) return;
-
-      setIsFetchingCandidates(true);
-      setCandidatesFetchError(null);
-
-      try {
-        const fetched = await FirebaseContentRepo.getCandidates(wsId);
-        setCandidates(fetched);
-      } catch (err: any) {
-        console.error(`[ClipFlow] Error fetching clip_candidates for workspace "${wsId}":`, err);
-        setCandidatesFetchError(err?.message || 'Failed to load clip candidates from Firebase.');
-      } finally {
-        setIsFetchingCandidates(false);
-      }
-    },
-    [currentWorkspaceId]
-  );
-
-  const fetchClips = useCallback(
-    async (targetWorkspaceId?: string) => {
-      const wsId =
-        targetWorkspaceId ||
-        currentWorkspaceId ||
-        localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-        'a0000000-0000-4000-a000-000000000001';
-
-      if (!wsId) return;
-
-      try {
-        const fetched = await FirebaseContentRepo.getClips(wsId);
-        setClips(fetched);
-      } catch (err: any) {
-        console.error(`[ClipFlow] Error fetching clips for workspace "${wsId}":`, err);
-      }
-    },
-    [currentWorkspaceId]
-  );
-
-  useEffect(() => {
-    const wsId =
-      currentWorkspaceId ||
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001';
-
-    if (!wsId || !isFirebaseConfigured) return;
-
-    FirebaseWorkspaceRepo.getWorkspaceById(wsId)
-      .then(({ workspace: dbWs, settings: dbSettings }) => {
-        if (dbWs && dbSettings) {
-          setWorkspace({
-            workspaceName: dbWs.name,
-            brandName: dbWs.brand_name || undefined,
-            mainNiche: dbSettings.main_niche,
-            subtopics: dbSettings.subtopics || [],
-            contentLanguage: dbSettings.content_language,
-            contentStyle: dbSettings.content_style,
-            aspectRatio: (dbSettings.aspect_ratio as '9:16') || '9:16',
-            targetPlatforms: dbSettings.target_platforms || [],
-            minCandidateScore: dbSettings.min_candidate_score || 80,
-            targetDuration: dbSettings.target_duration || '30-60s',
-          });
-        }
-      })
-      .catch((err) => {
-        console.warn('Could not load workspace settings from Firebase:', err);
-      });
-
-    fetchSources(wsId);
-    fetchCandidates(wsId);
-    fetchClips(wsId);
-  }, [currentWorkspaceId, fetchSources, fetchCandidates, fetchClips]);
-
-  // Subscribe to Firebase Auth state
-  useEffect(() => {
-    if (!isFirebaseConfigured) return;
-
-    const unsubscribe = onAuthStateChanged(auth, async (u) => {
-      if (u) {
-        const name = u.displayName || u.email?.split('@')[0] || 'Creator';
-        const sessionUser: UserSession = {
-          id: u.uid,
-          email: u.email || '',
-          name,
-          avatarInitials: (name[0] || 'C').toUpperCase(),
-        };
-        setUser(sessionUser);
-        await loadUserWorkspaceFromFirebase(u.uid, sessionUser);
       } else {
-        setUser(null);
-        setCurrentWorkspaceId(null);
-        setIsOnboarded(false);
+        // Guest / Demo login
+        setUser(INITIAL_USER);
+        showToast('Signed in as Guest User', 'info');
       }
-    });
-
-    return () => unsubscribe();
-  }, [loadUserWorkspaceFromFirebase]);
-
-  const loginWithGoogle = async (): Promise<{ success: boolean; error?: string }> => {
-    try {
-      const res = await signInWithPopup(auth, googleProvider);
-      const u = res.user;
-      const name = u.displayName || u.email?.split('@')[0] || 'Creator';
-      const sessionUser: UserSession = {
-        id: u.uid,
-        email: u.email || '',
-        name,
-        avatarInitials: (name[0] || 'C').toUpperCase(),
-      };
-      setUser(sessionUser);
-      showToast(`Signed in with Google as ${u.email}`, 'success');
-      await loadUserWorkspaceFromFirebase(u.uid, sessionUser);
       return { success: true };
     } catch (err: any) {
-      console.error('Google login error:', err);
-      showToast(err.message || 'Google sign in failed', 'error');
+      return { success: false, error: err.message || 'Auth failed' };
+    }
+  };
+
+  const loginWithGoogle = async () => {
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({ provider: 'google' });
+      if (error) return { success: false, error: error.message };
+      return { success: true };
+    } catch (err: any) {
       return { success: false, error: err.message };
     }
   };
 
-  const login = async (
-    email?: string,
-    password?: string,
-    isSignUp = false,
-    fullName?: string
-  ): Promise<{ success: boolean; error?: string }> => {
-    if (!email) {
-      return loginWithGoogle();
-    }
-
-    const trimmedEmail = email.trim();
-
-    if (isFirebaseConfigured && password) {
-      try {
-        let u;
-        if (isSignUp) {
-          const res = await createUserWithEmailAndPassword(auth, trimmedEmail, password);
-          u = res.user;
-        } else {
-          const res = await signInWithEmailAndPassword(auth, trimmedEmail, password);
-          u = res.user;
-        }
-
-        const name = fullName || u.displayName || trimmedEmail.split('@')[0] || 'Creator';
-        const sessionUser: UserSession = {
-          id: u.uid,
-          email: u.email || trimmedEmail,
-          name,
-          avatarInitials: (name[0] || 'C').toUpperCase(),
-        };
-        setUser(sessionUser);
-        showToast(isSignUp ? 'Account created successfully!' : `Signed in as ${sessionUser.email}`, 'success');
-        await loadUserWorkspaceFromFirebase(u.uid, sessionUser);
-        return { success: true };
-      } catch (err: any) {
-        const msg = err?.message || 'Authentication failed';
-        showToast(msg, 'error');
-        return { success: false, error: msg };
-      }
-    }
-
-    // Demo mode fallback
-    const displayName = fullName || trimmedEmail.split('@')[0] || 'Creator Lead';
-    const newUser: UserSession = {
-      id: `usr_${Date.now()}`,
-      email: trimmedEmail,
-      name: displayName,
-      avatarInitials: (displayName[0] || 'C').toUpperCase(),
-    };
-    setUser(newUser);
-    showToast(`Signed in to Demo Workspace (${newUser.email})`, 'success');
-
-    if (!isOnboarded) {
-      navigate('onboarding');
-    } else {
-      navigate('dashboard');
-    }
-    return { success: true };
-  };
-
   const logout = async () => {
-    if (isFirebaseConfigured) {
-      try {
-        await firebaseSignOut(auth);
-      } catch (e) {
-        console.warn('Firebase signout warning:', e);
-      }
-    }
-    setUser(null);
-    setCurrentWorkspaceId(null);
-    setIsOnboarded(false);
-    showToast('Signed out of ClipFlow', 'info');
-    navigate('login');
+    try {
+      await supabase.auth.signOut();
+    } catch (_) {}
+    setUser(INITIAL_USER);
+    showToast('Session reset', 'info');
   };
 
   const completeOnboarding = async (config: WorkspaceConfig) => {
     setWorkspace(config);
     setIsOnboarded(true);
-
-    if (user && isFirebaseConfigured) {
-      try {
-        const res = await FirebaseWorkspaceRepo.createWorkspace(user.id, config);
-        if (res?.workspaceId) {
-          setCurrentWorkspaceId(res.workspaceId);
-          setSources([]);
-          setCandidates([]);
-          setClips([]);
-          setQueue([]);
-          showToast(`Workspace "${config.workspaceName}" saved to Firebase!`, 'success');
-        } else {
-          showToast(`Workspace "${config.workspaceName}" initialized!`, 'success');
-        }
-      } catch (err) {
-        console.error('Failed to save workspace to Firebase:', err);
-        showToast(`Workspace initialized`, 'success');
-      }
-    } else {
-      if (!user) {
-        setUser({
-          id: `usr_${Date.now()}`,
-          email: 'creator@clipflow.ai',
-          name: config.brandName || config.workspaceName || 'Creator Lead',
-          avatarInitials: 'CF',
-        });
-      }
-      showToast(`Workspace "${config.workspaceName}" initialized!`, 'success');
-    }
-
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await SupabaseWorkspaceRepo.updateWorkspace(wsId, config);
+    showToast('Workspace onboarding complete!', 'success');
     navigate('dashboard');
   };
 
   const updateWorkspace = async (partial: Partial<WorkspaceConfig>) => {
     setWorkspace((prev) => ({ ...prev, ...partial }));
-
-    if (currentWorkspaceId && isFirebaseConfigured) {
-      await FirebaseWorkspaceRepo.updateWorkspace(currentWorkspaceId, partial);
-    }
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await SupabaseWorkspaceRepo.updateWorkspace(wsId, partial);
     showToast('Workspace settings saved', 'success');
   };
+
+  const fetchSources = async (workspaceId?: string) => {
+    const wsId = workspaceId || currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    setIsFetchingSources(true);
+    setSourcesFetchError(null);
+    try {
+      const data = await SupabaseSourcesRepo.getSources(wsId);
+      setSources(data);
+    } catch (err: any) {
+      setSourcesFetchError(err.message || 'Failed to fetch sources');
+    } finally {
+      setIsFetchingSources(false);
+    }
+  };
+
+  const deleteSource = async (sourceId: string) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseSourcesRepo.deleteSource(sourceId, wsId);
+    if (ok) {
+      setSources((prev) => prev.filter((s) => s.id !== sourceId));
+      setCandidates((prev) => prev.filter((c) => c.sourceVideoId !== sourceId));
+      showToast('Source video removed from discoveries', 'success');
+    } else {
+      showToast('Failed to remove source video', 'error');
+    }
+  };
+
+  const bulkDeleteSources = async (sourceIds: string[]) => {
+    if (!sourceIds.length) return;
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseSourcesRepo.bulkDeleteSources(sourceIds, wsId);
+    if (ok) {
+      const idSet = new Set(sourceIds);
+      setSources((prev) => prev.filter((s) => !idSet.has(s.id)));
+      setCandidates((prev) => prev.filter((c) => !idSet.has(c.sourceVideoId)));
+      showToast(`Removed ${sourceIds.length} videos from discoveries`, 'success');
+    } else {
+      showToast('Failed to delete selected sources', 'error');
+    }
+  };
+
+  const clearDiscoveryProviderError = () => setDiscoveryProviderError(null);
 
   const runDiscovery = async (filters?: {
     freshness?: 'all' | 'last_24h' | 'last_7d' | 'last_30d';
@@ -582,220 +333,200 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }) => {
     setIsDiscovering(true);
     setDiscoveryProviderError(null);
-    const targetSubtopics =
-      filters?.subtopic && filters.subtopic !== 'all'
-        ? [filters.subtopic]
-        : workspace.subtopics;
-
-    const activeWorkspaceId =
-      currentWorkspaceId ||
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001';
-
-    if (!currentWorkspaceId) {
-      setCurrentWorkspaceId(activeWorkspaceId);
-    }
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
 
     const jobId = `job_disc_${Date.now()}`;
     const newJob: ActiveJob = {
       id: jobId,
       type: 'discovery',
-      targetTitle: `Running discovery for "${workspace.mainNiche}"`,
+      targetTitle: `Discovery: ${workspace.mainNiche}`,
       progress: 30,
-      stage: 'Calling discovery function and persisting to Firebase',
+      stage: 'Searching YouTube RSS and public sources...',
       startedAt: 'Just now',
     };
     setJobs((prev) => [newJob, ...prev]);
-    showToast(`Discovering sources for "${workspace.mainNiche}"...`, 'info');
 
     try {
-      const userAccessToken = await auth.currentUser?.getIdToken();
-      const knownVideoIds = sources.map((s) => s.youtubeUrl || s.id);
-
-      const discovered = await DiscoveryService.discoverSources({
+      const knownVideoIds = sources.map((s) => s.youtubeUrl).filter(Boolean);
+      const res = await DiscoveryService.discover({
+        workspaceId: wsId,
+        workspaceName: workspace.workspaceName,
         niche: workspace.mainNiche,
-        subtopics: targetSubtopics,
-        language: workspace.contentLanguage,
+        subtopics: filters?.subtopic ? [filters.subtopic] : workspace.subtopics,
         freshness: filters?.freshness || 'all',
         contentType: filters?.contentType || 'all',
-        workspaceId: activeWorkspaceId,
-        workspaceName: workspace.workspaceName,
-        userAccessToken,
         knownVideoIds,
       });
 
-      if (!discovered || discovered.length === 0) {
-        showToast('No new sources found matching filters', 'info');
-        return;
+      if (res.videos && res.videos.length > 0) {
+        await fetchSources(wsId);
+        showToast(`Discovered & persisted ${res.videos.length} new sources to Supabase!`, 'success');
+      } else {
+        showToast('Discovery completed, no new videos found.', 'info');
       }
-
-      setSources((prev) => {
-        const existingIds = new Set(discovered.map((d) => d.id));
-        const remaining = prev.filter((p) => !existingIds.has(p.id));
-        return [...discovered, ...remaining];
-      });
-
-      fetchSources(activeWorkspaceId).catch((syncErr) => {
-        console.warn('[Discovery] Background verification notice:', syncErr);
-      });
-
-      setActivities((prev) => [
-        {
-          id: `act_${Date.now()}`,
-          type: 'source_discovered',
-          title: 'Source videos discovered',
-          subtitle: `${discovered.length} source records saved to Firebase`,
-          timestamp: 'Just now',
-        },
-        ...prev,
-      ]);
-
-      showToast(`Discovered & persisted ${discovered.length} sources to Firebase`, 'success');
     } catch (err: any) {
-      console.error('[Discovery] Discovery execution error:', err);
-      const message = err?.message || 'Automatic discovery failed';
-      setDiscoveryProviderError(message);
-      showToast(message, 'error');
+      console.error('[AppContext] Discovery failed:', err);
+      setDiscoveryProviderError(err.message || 'Discovery execution failed.');
+      showToast(err.message || 'Discovery failed', 'error');
     } finally {
       setJobs((prev) => prev.filter((j) => j.id !== jobId));
       setIsDiscovering(false);
     }
   };
 
+  const fetchCandidates = async (workspaceId?: string) => {
+    const wsId = workspaceId || currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    setIsFetchingCandidates(true);
+    setCandidatesFetchError(null);
+    try {
+      const cands = await SupabaseCandidatesRepo.getCandidates(wsId);
+      setCandidates(cands);
+    } catch (err: any) {
+      setCandidatesFetchError(err.message || 'Failed to fetch candidates');
+    } finally {
+      setIsFetchingCandidates(false);
+    }
+  };
+
+  const deleteCandidate = async (candidateId: string) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseCandidatesRepo.deleteCandidate(candidateId, wsId);
+    if (ok) {
+      setCandidates((prev) => prev.filter((c) => c.id !== candidateId));
+      setClips((prev) => prev.filter((cl) => cl.candidateId !== candidateId));
+      showToast('Candidate deleted', 'success');
+    } else {
+      showToast('Failed to delete candidate', 'error');
+    }
+  };
+
   const analyzeSource = async (sourceId: string) => {
-    const src = sources.find((s) => s.id === sourceId);
-    if (!src) return;
-
-    const activeWorkspaceId =
-      currentWorkspaceId ||
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001';
-
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
     setIsAnalyzing(true);
-    setSources((prev) =>
-      prev.map((s) => (s.id === sourceId ? { ...s, status: 'processing' } : s))
-    );
-
-    const jobId = `job_an_${Date.now()}`;
-    const newJob: ActiveJob = {
-      id: jobId,
-      type: 'moment_detection',
-      targetTitle: `Analyzing: ${src.title.slice(0, 36)}...`,
-      progress: 25,
-      stage: 'Extracting transcript and evaluating high-retention short-form moments...',
-      startedAt: 'Just now',
-    };
-    setJobs((prev) => [newJob, ...prev]);
+    setSources((prev) => prev.map((s) => (s.id === sourceId ? { ...s, status: 'processing' } : s)));
 
     try {
-      const userAccessToken = await auth.currentUser?.getIdToken();
-
-      const response = await MomentDetectionService.analyze({
-        workspaceId: activeWorkspaceId,
+      const res = await MomentDetectionService.analyze({
+        workspaceId: wsId,
         sourceId,
         niche: workspace.mainNiche,
         subtopics: workspace.subtopics,
-        userAccessToken,
       });
 
-      const singleResult = response.results?.[0];
+      await Promise.all([fetchSources(wsId), fetchCandidates(wsId)]);
 
-      if (isFirebaseConfigured) {
-        try {
-          const [updatedCandidates, updatedSources] = await Promise.all([
-            FirebaseContentRepo.getCandidates(activeWorkspaceId),
-            FirebaseContentRepo.getSources(activeWorkspaceId),
-          ]);
-
-          setCandidates(updatedCandidates);
-          setSources(updatedSources);
-        } catch (fetchErr: any) {
-          console.error('[ClipFlow] Failed to refresh candidates after detection:', fetchErr);
-        }
-      }
-
-      if (singleResult?.contentStatus === 'content_unavailable') {
-        showToast('Content unavailable for analysis', 'info');
-      } else if (singleResult && singleResult.candidatesFound === 0) {
-        showToast('No strong short-form moments found', 'info');
-      } else {
-        const found = singleResult ? singleResult.candidatesFound : 0;
-        showToast(`Analyzed! Found ${found} high-retention moments`, 'success');
-      }
+      const found = res.results?.[0]?.candidatesFound || 0;
+      showToast(`Analyzed! Found ${found} moments`, 'success');
     } catch (err: any) {
-      console.error('[AppContext] analyzeSource error:', err);
-      setSources((prev) =>
-        prev.map((s) => (s.id === sourceId ? { ...s, status: 'new' } : s))
-      );
-      showToast(err?.message || 'Moment analysis failed for this source', 'error');
+      showToast(err.message || 'Moment analysis failed', 'error');
     } finally {
-      setJobs((prev) => prev.filter((j) => j.id !== jobId));
       setIsAnalyzing(false);
     }
   };
 
   const analyzeAllSources = async () => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
     const unanalyzed = sources.filter((s) => s.status === 'new' || s.status === 'queued');
     if (unanalyzed.length === 0) {
-      showToast('All discovered sources are already analyzed!', 'info');
+      showToast('All sources are already analyzed!', 'info');
       return;
     }
 
-    const activeWorkspaceId =
-      currentWorkspaceId ||
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001';
-
     setIsAnalyzing(true);
-    showToast(`Analyzing ${unanalyzed.length} sources with AI Moment Detection...`, 'info');
-
-    const jobId = `job_batch_an_${Date.now()}`;
-    const newJob: ActiveJob = {
-      id: jobId,
-      type: 'moment_detection',
-      targetTitle: `Batch Analysis (${unanalyzed.length} videos)`,
-      progress: 20,
-      stage: 'Running multi-factor moment detection on transcripts and outlines...',
-      startedAt: 'Just now',
-    };
-    setJobs((prev) => [newJob, ...prev]);
-
     try {
-      const userAccessToken = await auth.currentUser?.getIdToken();
-      const sourceIds = unanalyzed.map((s) => s.id);
-
-      const response = await MomentDetectionService.analyze({
-        workspaceId: activeWorkspaceId,
-        sourceIds,
+      const res = await MomentDetectionService.analyze({
+        workspaceId: wsId,
+        sourceIds: unanalyzed.map((s) => s.id),
         niche: workspace.mainNiche,
         subtopics: workspace.subtopics,
-        userAccessToken,
       });
 
-      if (isFirebaseConfigured) {
-        try {
-          const [updatedCandidates, updatedSources] = await Promise.all([
-            FirebaseContentRepo.getCandidates(activeWorkspaceId),
-            FirebaseContentRepo.getSources(activeWorkspaceId),
-          ]);
-
-          setCandidates(updatedCandidates);
-          setSources(updatedSources);
-        } catch (fetchErr: any) {
-          console.error('[ClipFlow] Failed to refresh candidates:', fetchErr);
-        }
-      }
-
-      showToast(
-        `Batch analysis complete: Found ${response.candidatesCount || 0} moments across ${response.analyzedCount || 0} sources`,
-        'success'
-      );
+      await Promise.all([fetchSources(wsId), fetchCandidates(wsId)]);
+      showToast(`Batch analysis complete: ${res.candidatesCount || 0} moments found`, 'success');
     } catch (err: any) {
-      console.error('[AppContext] analyzeAllSources error:', err);
-      showToast(err?.message || 'Batch moment detection failed', 'error');
+      showToast(err.message || 'Batch analysis failed', 'error');
     } finally {
-      setJobs((prev) => prev.filter((j) => j.id !== jobId));
       setIsAnalyzing(false);
+    }
+  };
+
+  const runMomentDetection = (sourceId: string) => {
+    analyzeSource(sourceId);
+  };
+
+  const addSource = async (newSource: { title: string; youtubeUrl: string; niche: string }) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const { data, error } = await supabase.from('source_videos').insert({
+      workspace_id: wsId,
+      title: newSource.title,
+      channel_title: 'Manual Addition',
+      duration: '15:00',
+      view_count: 50000,
+      published_at: 'Just now',
+      youtube_url: newSource.youtubeUrl,
+      status: 'new',
+      relevance_score: 85,
+      freshness_tag: 'Added Manually',
+      candidates_count: 0,
+      summary: `Manual video added for ${newSource.niche}`,
+      niche: newSource.niche,
+      thumbnail_gradient: 'from-slate-900 via-indigo-950 to-slate-900',
+    }).select().single();
+
+    if (!error && data) {
+      await fetchSources(wsId);
+      showToast('Source video added', 'success');
+    } else {
+      showToast('Failed to add source video', 'error');
+    }
+  };
+
+  const selectCandidate = async (candidateId: string) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await SupabaseCandidatesRepo.updateCandidateStatus(candidateId, 'approved', wsId);
+    setCandidates((prev) =>
+      prev.map((c) => (c.id === candidateId ? { ...c, status: 'approved', selectionStatus: 'selected' } : c))
+    );
+    showToast('Candidate selected for clip generation', 'success');
+  };
+
+  const approveCandidate = (candidateId: string) => {
+    selectCandidate(candidateId);
+  };
+
+  const rejectCandidate = async (candidateId: string) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await SupabaseCandidatesRepo.updateCandidateStatus(candidateId, 'rejected', wsId);
+    setCandidates((prev) =>
+      prev.map((c) => (c.id === candidateId ? { ...c, status: 'rejected', selectionStatus: 'rejected' } : c))
+    );
+    showToast('Candidate rejected', 'info');
+  };
+
+  const fetchClips = async (workspaceId?: string) => {
+    const wsId = workspaceId || currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const clps = await SupabaseClipsRepo.getClips(wsId);
+    setClips(clps);
+  };
+
+  const generateClipFromCandidate = async (candidateId: string) => {
+    const cand = candidates.find((c) => c.id === candidateId);
+    if (!cand) return;
+
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    showToast(`Queued render for "${cand.hook.slice(0, 30)}..."`, 'info');
+
+    try {
+      const res = await ClientRenderService.renderClip({ candidateId, workspaceId: wsId });
+      if (res.success) {
+        await fetchClips(wsId);
+        await fetchCandidates(wsId);
+        showToast('Vertical clip rendered successfully!', 'success');
+      } else {
+        showToast(res.message || 'Clip rendering failed', 'error');
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Render request error', 'error');
     }
   };
 
@@ -813,442 +544,87 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       await generateClipFromCandidate(cand.id);
     }
 
-    showToast(`Rendered ${eligible.length} vertical clips from top moments!`, 'success');
+    showToast(`Triggered clip rendering for ${eligible.length} moments`, 'success');
     navigate('clips');
   };
 
-  const addSource = async (newSource: { title: string; youtubeUrl: string; niche: string }) => {
-    const tempId = `src_${Date.now()}`;
-    const urlStr = newSource.youtubeUrl.trim();
-    const isYoutube = urlStr.includes('youtube.com') || urlStr.includes('youtu.be');
-    const isDirectMedia = urlStr.startsWith('http') && !isYoutube;
-
-    const source: SourceVideo = {
-      id: tempId,
-      title: newSource.title,
-      channelTitle: isYoutube ? 'Discovered YouTube Channel' : 'Direct Media Provider',
-      duration: '32:10',
-      viewCount: Math.floor(Math.random() * 80000) + 12000,
-      publishedAt: 'Today',
-      youtubeUrl: isYoutube ? urlStr : '',
-      mediaUrl: isDirectMedia ? urlStr : undefined,
-      status: 'analyzed',
-      candidatesCount: 2,
-      summary: `Automated analysis for ${newSource.niche}. High density of structured discussion found.`,
-      niche: newSource.niche,
-      thumbnailGradient: 'from-slate-800 to-slate-950',
-    };
-
-    if (currentWorkspaceId && isFirebaseConfigured) {
-      const dbId = await FirebaseContentRepo.insertSource(currentWorkspaceId, source);
-      if (dbId) source.id = dbId;
-    }
-
-    setSources((prev) => [source, ...prev]);
-
-    const newCandidates: ClipCandidate[] = [
-      {
-        id: `cand_${Date.now()}_1`,
-        sourceVideoId: source.id,
-        sourceTitle: source.title,
-        channelTitle: source.channelTitle,
-        startTime: '03:15',
-        endTime: '04:01',
-        duration: '46s',
-        hook: `Key insight on ${newSource.niche}: Why standard workflows fail at scale.`,
-        summary: 'Concrete breakdown of the main bottleneck and tactical steps to resolve it.',
-        score: 92,
-        factors: { hookStrength: 94, standaloneContext: 90, pacing: 92 },
-        status: 'new',
-        createdAt: 'Just now',
-      },
-      {
-        id: `cand_${Date.now()}_2`,
-        sourceVideoId: source.id,
-        sourceTitle: source.title,
-        channelTitle: source.channelTitle,
-        startTime: '12:40',
-        endTime: '13:22',
-        duration: '42s',
-        hook: `The counter-intuitive metric every creator and builder should track in ${newSource.niche}.`,
-        summary: 'Dispels a common myth with empirical evidence and clear takeaway.',
-        score: 88,
-        factors: { hookStrength: 90, standaloneContext: 86, pacing: 88 },
-        status: 'new',
-        createdAt: 'Just now',
-      },
-    ];
-
-    if (currentWorkspaceId && isFirebaseConfigured) {
-      for (const cand of newCandidates) {
-        const dbId = await FirebaseContentRepo.insertCandidate(currentWorkspaceId, cand);
-        if (dbId) cand.id = dbId;
-      }
-    }
-
-    setCandidates((prev) => [...newCandidates, ...prev]);
-    showToast(`Source added! 2 clip candidates detected.`, 'success');
-  };
-
-  const runMomentDetection = (sourceId: string) => {
-    const src = sources.find((s) => s.id === sourceId);
-    if (!src) return;
-
-    const newJob: ActiveJob = {
-      id: `job_${Date.now()}`,
-      type: 'moment_detection',
-      targetTitle: `Transcript analysis: ${src.title.slice(0, 40)}...`,
-      progress: 15,
-      stage: 'Scanning speech cadence and high-retention inflection points',
-      startedAt: 'Just now',
-    };
-    setJobs((prev) => [newJob, ...prev]);
-
-    showToast(`Moment detection initiated for "${src.title.slice(0, 30)}..."`, 'info');
-
-    setTimeout(() => {
-      setJobs((prev) => prev.filter((j) => j.id !== newJob.id));
-      showToast(`Analysis complete: 2 new moments found`, 'success');
-    }, 3500);
-  };
-
-  const selectCandidate = async (candidateId: string) => {
-    setCandidates((prev) =>
-      prev.map((c) =>
-        c.id === candidateId
-          ? {
-              ...c,
-              status: 'selected',
-              selectionStatus: 'selected',
-              factors: { ...c.factors, selectionStatus: 'selected' },
-            }
-          : c
-      )
-    );
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.updateCandidateStatus(candidateId, 'selected');
-    }
-    showToast('Candidate selected for rendering', 'success');
-  };
-
-  const approveCandidate = async (candidateId: string) => {
-    setCandidates((prev) =>
-      prev.map((c) =>
-        c.id === candidateId
-          ? {
-              ...c,
-              status: 'approved',
-              selectionStatus: 'selected',
-              factors: { ...c.factors, selectionStatus: 'selected' },
-            }
-          : c
-      )
-    );
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.updateCandidateStatus(candidateId, 'approved');
-    }
-    showToast('Candidate approved for generation', 'success');
-  };
-
-  const rejectCandidate = async (candidateId: string) => {
-    setCandidates((prev) =>
-      prev.map((c) =>
-        c.id === candidateId
-          ? {
-              ...c,
-              status: 'rejected',
-              selectionStatus: 'rejected',
-              factors: { ...c.factors, selectionStatus: 'rejected' },
-            }
-          : c
-      )
-    );
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.updateCandidateStatus(candidateId, 'rejected');
-    }
-    showToast('Candidate marked as rejected', 'info');
-  };
-
-  const generateClipFromCandidate = async (candidateId: string) => {
-    const cand = candidates.find((c) => c.id === candidateId);
-    if (!cand) return;
-
-    const activeWorkspaceId =
-      currentWorkspaceId ||
-      localStorage.getItem(`${STORAGE_KEY_PREFIX}workspace_id`) ||
-      'a0000000-0000-4000-a000-000000000001';
-
-    const src = sources.find((s) => s.id === cand.sourceVideoId || s.title === cand.sourceTitle);
-
-    setCandidates((prev) =>
-      prev.map((c) => (c.id === candidateId ? { ...c, status: 'generating' } : c))
-    );
-
-    const jobId = `job_rend_${Date.now()}`;
-    const newJob: ActiveJob = {
-      id: jobId,
-      type: 'vertical_render',
-      targetTitle: `Rendering: ${cand.hook.slice(0, 36)}...`,
-      progress: 25,
-      stage: 'Acquiring source media & preparing render...',
-      startedAt: 'Just now',
-    };
-    setJobs((prev) => [newJob, ...prev]);
-
-    try {
-      const userAccessToken = await auth.currentUser?.getIdToken();
-
-      const renderResult = await ClientRenderService.renderClip({
-        candidateId: cand.id,
-        workspaceId: activeWorkspaceId,
-        sourceVideoId: cand.sourceVideoId,
-        sourceTitle: cand.sourceTitle,
-        channelTitle: cand.channelTitle,
-        startTime: cand.startTime,
-        endTime: cand.endTime,
-        hook: cand.hook,
-        transcriptText: cand.transcriptText || cand.hook,
-        summary: cand.summary,
-        sourceYoutubeUrl: cand.sourceYoutubeUrl || src?.youtubeUrl,
-        mediaUrl: src?.mediaUrl,
-        mediaPath: src?.mediaPath,
-        reframeMode: 'centered_crop',
-        subtitles: {
-          style: 'clean',
-          fontSize: 22,
-        },
-        branding: workspace.brandingWatermark
-          ? {
-              enabled: true,
-              brandName: workspace.brandName || workspace.workspaceName,
-            }
-          : undefined,
-        userAccessToken,
-      });
-
-      if (!renderResult.success) {
-        setCandidates((prev) =>
-          prev.map((c) =>
-            c.id === candidateId
-              ? {
-                  ...c,
-                  status: c.selectionStatus === 'selected' ? 'selected' : 'new',
-                  explanation: renderResult.errorMessage || 'Source media could not be acquired automatically.',
-                }
-              : c
-          )
-        );
-
-        if (cand.sourceVideoId) {
-          setSources((prev) =>
-            prev.map((s) =>
-              s.id === cand.sourceVideoId
-                ? {
-                    ...s,
-                    mediaStatus: 'failed',
-                    mediaError: renderResult.errorMessage,
-                  }
-                : s
-            )
-          );
-
-          if (isFirebaseConfigured) {
-            await FirebaseContentRepo.updateSourceMedia(
-              cand.sourceVideoId,
-              'failed',
-              undefined,
-              undefined,
-              'compliant_media_provider',
-              undefined,
-              renderResult.errorMessage
-            );
-          }
-        }
-
-        const errorMsg = renderResult.errorMessage || 'Source media could not be acquired automatically.';
-        showToast(errorMsg, 'error');
-        return;
-      }
-
-      const newClip: Clip = {
-        id: renderResult.clipId,
-        candidateId: cand.id,
-        sourceVideoId: cand.sourceVideoId,
-        workspaceId: activeWorkspaceId,
-        title: cand.hook.split(':')[0] || cand.hook.slice(0, 45),
-        hook: cand.hook,
-        sourceTitle: cand.sourceTitle,
-        channelTitle: cand.channelTitle,
-        duration: renderResult.durationFormatted || cand.duration,
-        aspectRatio: '9:16',
-        style: workspace.contentStyle,
-        status: 'ready',
-        thumbnailBg: 'from-slate-900 via-neutral-900 to-black',
-        thumbnailUrl: renderResult.thumbnailUrl,
-        videoUrl: renderResult.videoUrl,
-        score: cand.score,
-        captionsSample: [
-          cand.hook,
-          cand.summary?.split('.')[0] || 'Key takeaway highlights.',
-        ],
-        hashtags: workspace.subtopics
-          .map((s) => `#${s.toLowerCase().replace(/[^a-z0-9]/g, '')}`)
-          .slice(0, 4),
-        createdAt: 'Just now',
-      };
-
-      setClips((prev) => [newClip, ...prev]);
-
-      setCandidates((prev) =>
-        prev.map((c) =>
-          c.id === candidateId
-            ? {
-                ...c,
-                status: 'rendered',
-                selectionStatus: 'selected',
-                renderedClipId: newClip.id,
-              }
-            : c
-        )
-      );
-
-      setActivities((prev) => [
-        {
-          id: `act_${Date.now()}`,
-          type: 'clip_rendered',
-          title: 'New vertical clip rendered',
-          subtitle: `${newClip.title} (9:16 MP4, ${newClip.duration})`,
-          timestamp: 'Just now',
-        },
-        ...prev,
-      ]);
-
-      showToast(`Vertical clip rendered: "${newClip.title}"`, 'success');
-    } catch (err: any) {
-      console.error('[generateClipFromCandidate] Render error:', err);
-      setCandidates((prev) =>
-        prev.map((c) => (c.id === candidateId ? { ...c, status: 'approved' } : c))
-      );
-      showToast(err?.message || 'Rendering failed.', 'error');
-    } finally {
-      setJobs((prev) => prev.filter((j) => j.id !== jobId));
-    }
-  };
-
   const addClipToQueue = async (clipId: string) => {
-    const clip = clips.find((c) => c.id === clipId);
-    if (!clip) return;
-
-    const existing = queue.find((q) => q.clipId === clipId);
-    if (existing) {
-      showToast('This clip is already in your publishing queue', 'info');
-      navigate('queue');
-      return;
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseClipsRepo.setClipInQueue(clipId, true, 'needs_review', wsId);
+    if (ok) {
+      await fetchClips(wsId);
+      showToast('Clip added to Queue for publishing review', 'success');
     }
-
-    const queueId = `queue_${Date.now()}`;
-    const newQueueItem: QueueItem = {
-      id: queueId,
-      clipId: clip.id,
-      title: clip.title,
-      hook: clip.hook,
-      duration: clip.duration,
-      platforms: workspace.targetPlatforms,
-      captionText: `${clip.hook || ''}\n\n${(clip.captionsSample || []).join(' ')}\n\nWhat are your thoughts on this? Leave a comment below.`,
-      hashtags: clip.hashtags,
-      status: 'needs_review',
-      addedAt: 'Just now',
-      style: clip.style,
-    };
-
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.setClipInQueue(clipId, true, 'needs_review');
-    }
-
-    setQueue((prev) => [newQueueItem, ...prev]);
-
-    setClips((prev) =>
-      prev.map((c) => (c.id === clipId ? { ...c, status: 'queued' } : c))
-    );
-
-    showToast(`Clip added to Queue for publishing review`, 'success');
   };
 
   const deleteClip = async (clipId: string) => {
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.deleteClip(clipId);
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseClipsRepo.deleteClip(clipId, wsId);
+    if (ok) {
+      setClips((prev) => prev.filter((c) => c.id !== clipId));
+      setQueue((prev) => prev.filter((q) => q.clipId !== clipId));
+      showToast('Clip deleted', 'info');
+    } else {
+      showToast('Failed to delete clip', 'error');
     }
-    setClips((prev) => prev.filter((c) => c.id !== clipId));
-    setQueue((prev) => prev.filter((q) => q.clipId !== clipId));
-    showToast('Clip removed', 'info');
   };
 
-  const updateClipCaptions = async (
-    clipId: string,
-    hashtags: string[],
-    sampleCaptions: string[]
-  ) => {
-    if (isFirebaseConfigured) {
-      await FirebaseContentRepo.updateClip(clipId, {
-        hashtags,
-        captionsSample: sampleCaptions,
-      });
-    }
+  const updateClipCaptions = async (clipId: string, hashtags: string[], sampleCaptions: string[]) => {
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await supabase
+      .from('clips')
+      .update({ hashtags, captions_sample: sampleCaptions, updated_at: new Date().toISOString() })
+      .eq('id', clipId)
+      .eq('workspace_id', wsId);
+
     setClips((prev) =>
-      prev.map((c) =>
-        c.id === clipId
-          ? { ...c, hashtags, captionsSample: sampleCaptions }
-          : c
-      )
+      prev.map((c) => (c.id === clipId ? { ...c, hashtags, captionsSample: sampleCaptions } : c))
     );
     showToast('Captions and hashtags updated', 'success');
   };
 
   const approveQueueItem = async (queueId: string) => {
     const item = queue.find((q) => q.id === queueId);
-    if (item && isFirebaseConfigured) {
-      await FirebaseContentRepo.updateQueueItem(item.clipId, {
-        status: 'approved',
-        scheduledSlot: 'Next slot (Auto-scheduled)',
-      });
-    }
+    if (!item) return;
 
-    setQueue((prev) =>
-      prev.map((q) =>
-        q.id === queueId
-          ? {
-              ...q,
-              status: 'approved',
-              scheduledSlot: 'Next slot (Auto-scheduled)',
-            }
-          : q
-      )
-    );
-    showToast('Clip marked as Approved for publishing', 'success');
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseClipsRepo.updateQueueItem(item.clipId, {
+      queueStatus: 'approved',
+      scheduledSlot: 'Next slot (Auto-scheduled)',
+    }, wsId);
+
+    if (ok) {
+      setQueue((prev) =>
+        prev.map((q) => (q.id === queueId ? { ...q, status: 'approved', scheduledSlot: 'Next slot' } : q))
+      );
+      showToast('Approved for publishing', 'success');
+    }
   };
 
   const updateQueueItem = async (queueId: string, updates: Partial<QueueItem>) => {
     const item = queue.find((q) => q.id === queueId);
-    if (item && isFirebaseConfigured) {
-      await FirebaseContentRepo.updateQueueItem(item.clipId, {
-        status: updates.status,
-        scheduledSlot: updates.scheduledSlot,
-      });
-    }
+    if (!item) return;
 
-    setQueue((prev) =>
-      prev.map((q) => (q.id === queueId ? { ...q, ...updates } : q))
-    );
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    await SupabaseClipsRepo.updateQueueItem(item.clipId, {
+      queueStatus: updates.status,
+      scheduledSlot: updates.scheduledSlot,
+    }, wsId);
+
+    setQueue((prev) => prev.map((q) => (q.id === queueId ? { ...q, ...updates } : q)));
     showToast('Queue item updated', 'success');
   };
 
   const removeFromQueue = async (queueId: string) => {
     const item = queue.find((q) => q.id === queueId);
-    if (item && isFirebaseConfigured) {
-      await FirebaseContentRepo.setClipInQueue(item.clipId, false);
+    if (!item) return;
+
+    const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
+    const ok = await SupabaseClipsRepo.setClipInQueue(item.clipId, false, 'needs_review', wsId);
+    if (ok) {
+      setQueue((prev) => prev.filter((q) => q.id !== queueId));
+      showToast('Removed from queue', 'info');
     }
-    setQueue((prev) => prev.filter((q) => q.id !== queueId));
-    showToast('Removed from publishing queue', 'info');
   };
 
   const cancelJob = (jobId: string) => {
@@ -1257,18 +633,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const resetToDemo = () => {
-    localStorage.clear();
-    setCurrentWorkspaceId(null);
+    setCurrentWorkspaceId(DEFAULT_WORKSPACE_ID);
     setUser(INITIAL_USER);
     setIsOnboarded(true);
     setWorkspace(INITIAL_WORKSPACE);
-    setSources([]);
-    setCandidates([]);
-    setClips([]);
-    setQueue([]);
-    setJobs([]);
-    setActivities([]);
-    showToast('Reset to clean workspace state', 'info');
+    loadWorkspaceData(DEFAULT_WORKSPACE_ID);
+    showToast('Reset to default workspace state', 'info');
     navigate('dashboard');
   };
 
@@ -1279,7 +649,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         navigate,
         user,
         currentWorkspaceId,
-        isSupabaseActive: isFirebaseConfigured,
+        isSupabaseActive: true,
         login,
         loginWithGoogle,
         logout,
@@ -1291,6 +661,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isFetchingSources,
         sourcesFetchError,
         fetchSources,
+        deleteSource,
+        bulkDeleteSources,
         isDiscovering,
         isAnalyzing,
         discoveryProviderError,
@@ -1304,6 +676,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isFetchingCandidates,
         candidatesFetchError,
         fetchCandidates,
+        deleteCandidate,
         selectCandidate,
         approveCandidate,
         rejectCandidate,

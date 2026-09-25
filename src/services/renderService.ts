@@ -4,12 +4,12 @@ export interface ClientRenderParams {
   candidateId: string;
   workspaceId: string;
   sourceVideoId?: string;
-  sourceTitle: string;
-  channelTitle: string;
-  startTime: string;
-  endTime: string;
+  sourceTitle?: string;
+  channelTitle?: string;
+  startTime?: string;
+  endTime?: string;
   durationSeconds?: number;
-  hook: string;
+  hook?: string;
   transcriptText?: string;
   summary?: string;
   sourceYoutubeUrl?: string;
@@ -31,12 +31,12 @@ export interface ClientRenderParams {
   userAccessToken?: string;
 }
 
+export interface ClientRenderResult extends RenderResult {
+  message?: string;
+}
+
 export class ClientRenderService {
-  /**
-   * Invokes the backend rendering pipeline for a selected candidate.
-   * The backend automatically acquires source media via the CompliantMediaProvider.
-   */
-  public static async renderClip(params: ClientRenderParams): Promise<RenderResult> {
+  public static async renderClip(params: ClientRenderParams): Promise<ClientRenderResult> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -49,12 +49,12 @@ export class ClientRenderService {
       candidateId: params.candidateId,
       workspaceId: params.workspaceId,
       sourceVideoId: params.sourceVideoId,
-      sourceTitle: params.sourceTitle,
-      channelTitle: params.channelTitle,
-      startTime: params.startTime,
-      endTime: params.endTime,
-      durationSeconds: params.durationSeconds,
-      hook: params.hook,
+      sourceTitle: params.sourceTitle || 'Discovered Video',
+      channelTitle: params.channelTitle || 'YouTube Channel',
+      startTime: params.startTime || '00:00',
+      endTime: params.endTime || '00:30',
+      durationSeconds: params.durationSeconds || 30,
+      hook: params.hook || 'High-retention clip moment',
       transcriptText: params.transcriptText || params.hook,
       summary: params.summary,
       sourceYoutubeUrl: params.sourceYoutubeUrl,
@@ -65,7 +65,6 @@ export class ClientRenderService {
       branding: params.branding,
     };
 
-    // Try primary API route and fallback to Netlify Function route
     const endpoints = ['/api/render', '/.netlify/functions/render'];
     let lastError: any = null;
 
@@ -78,7 +77,7 @@ export class ClientRenderService {
         });
 
         const data = await response.json();
-        return data as RenderResult;
+        return data as ClientRenderResult;
       } catch (err: any) {
         lastError = err;
         console.warn(`[ClientRenderService] Failed calling ${endpoint}:`, err);
@@ -87,6 +86,7 @@ export class ClientRenderService {
 
     return {
       success: false,
+      message: 'Failed to connect to rendering service.',
       clipId: `clip_${params.candidateId.slice(0, 8)}`,
       jobId: `job_${Date.now()}`,
       status: 'failed',

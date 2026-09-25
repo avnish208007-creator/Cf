@@ -165,6 +165,8 @@ export interface Clip {
   createdAt?: string;
   publishedUrl?: string;
   inQueue?: boolean;
+  queueStatus?: string;
+  scheduledSlot?: string;
 }
 
 export interface PlatformQueueItem {

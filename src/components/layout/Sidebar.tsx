@@ -7,10 +7,7 @@ import {
   Send,
   Settings,
   Flame,
-  Layers,
-  LogOut,
   Sliders,
-  ChevronRight,
   X,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
@@ -194,35 +191,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ onCloseMobile }) => {
 
       {/* User Account / Footer */}
       <div className="p-3 border-t border-slate-800/80 bg-slate-950/40 shrink-0">
-        {user ? (
-          <div className="flex items-center justify-between gap-2 px-1">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded bg-slate-800 text-slate-200 flex items-center justify-center font-mono text-xs font-semibold shrink-0 border border-slate-700">
-                {user.avatarInitials}
-              </div>
-              <div className="min-w-0">
-                <div className="text-xs font-medium text-slate-200 truncate">{user.name}</div>
-                <div className="text-[11px] text-slate-400 truncate">{user.email}</div>
-              </div>
-            </div>
-            <button
-              onClick={logout}
-              className="p-1.5 text-slate-400 hover:text-rose-400 transition-colors rounded hover:bg-slate-800/80 shrink-0"
-              title="Sign out"
-              aria-label="Sign out"
-            >
-              <LogOut className="w-4 h-4" />
-            </button>
+        <div className="flex items-center gap-2.5 px-1 min-w-0">
+          <div className="w-8 h-8 rounded bg-slate-800 text-slate-200 flex items-center justify-center font-mono text-xs font-semibold shrink-0 border border-slate-700">
+            {user?.avatarInitials || 'CU'}
           </div>
-        ) : (
-          <button
-            onClick={() => handleNavClick('login')}
-            className="w-full py-2 px-3 bg-slate-800 hover:bg-slate-700 text-white rounded text-xs font-medium flex items-center justify-center gap-1.5 transition-colors"
-          >
-            <span>Sign In to ClipFlow</span>
-            <ChevronRight className="w-3.5 h-3.5" />
-          </button>
-        )}
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-medium text-slate-200 truncate">{user?.name || 'ClipFlow User'}</div>
+            <div className="text-[11px] text-slate-400 truncate">{user?.email || 'user@clipflow.app'}</div>
+          </div>
+        </div>
       </div>
     </aside>
   );

@@ -1,16 +1,4 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  getDocs,
-  collection,
-  query,
-  where,
-} from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import {
   ExtractedContent,
   MomentDetectionPipelineOptions,
@@ -20,9 +8,7 @@ import {
 import { IContentExtractor, ModularContentExtractor } from './ContentExtractor';
 import { IMomentDetector, HybridMomentDetector } from './MomentDetector';
 import { IMomentScorer, MultiFactorMomentScorer } from './MomentScorer';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import crypto from 'crypto';
 
 export class MomentPipeline {
   private contentExtractor: IContentExtractor;
@@ -57,11 +43,14 @@ export class MomentPipeline {
     sourceId: string,
     options: MomentDetectionPipelineOptions
   ): Promise<MomentDetectionSourceResult> {
-    // 1. Fetch source video from Firestore
-    const srcDocRef = doc(db, 'source_videos', sourceId);
-    const srcSnap = await getDoc(srcDocRef);
+    // 1. Fetch source video from Supabase
+    const { data: source } = await supabase
+      .from('source_videos')
+      .select('*')
+      .eq('id', sourceId)
+      .maybeSingle();
 
-    if (!srcSnap.exists()) {
+    if (!source) {
       return {
         sourceId,
         videoTitle: 'Unknown Source',
@@ -70,14 +59,12 @@ export class MomentPipeline {
         contentStatus: 'content_unavailable',
         candidatesFound: 0,
         candidates: [],
-        message: 'Source video record not found in Firebase.',
+        message: 'Source video record not found in Supabase.',
       };
     }
 
-    const source = { id: srcSnap.id, ...srcSnap.data() } as any;
-
     // 2. Mark source as analyzing / processing
-    await updateDoc(srcDocRef, { status: 'processing' });
+    await supabase.from('source_videos').update({ status: 'processing', updated_at: new Date().toISOString() }).eq('id', sourceId);
 
     console.log(`[MomentPipeline] Analyzing source "${source.title}" (${source.youtube_url})...`);
 
@@ -110,11 +97,12 @@ export class MomentPipeline {
       const failureReason = extracted.reason || 'Content unavailable for analysis: No transcript or chapter outline available for this video.';
       console.log(`[MomentPipeline] Source "${source.title}" content unavailable.`);
 
-      await updateDoc(srcDocRef, {
+      await supabase.from('source_videos').update({
         status: 'analyzed',
         candidates_count: 0,
         summary: `${failureReason} · ${source.summary || ''}`,
-      });
+        updated_at: new Date().toISOString(),
+      }).eq('id', sourceId);
 
       return {
         sourceId,
@@ -139,11 +127,12 @@ export class MomentPipeline {
       });
     } catch (err: any) {
       console.error(`[MomentPipeline] Error during moment detection:`, err);
-      await updateDoc(srcDocRef, {
+      await supabase.from('source_videos').update({
         status: 'analyzed',
         candidates_count: 0,
         summary: `Analysis error: ${err.message || 'AI detection error'}. ${source.summary || ''}`,
-      });
+        updated_at: new Date().toISOString(),
+      }).eq('id', sourceId);
 
       return {
         sourceId,
@@ -160,11 +149,12 @@ export class MomentPipeline {
     if (rawMoments.length === 0) {
       const msg = 'Analyzed video content — no plausible short-form segments found in the dialogue.';
       console.log(`[MomentPipeline] ${msg} ("${source.title}")`);
-      await updateDoc(srcDocRef, {
+      await supabase.from('source_videos').update({
         status: 'analyzed',
         candidates_count: 0,
         summary: `${msg} ${source.summary || ''}`,
-      });
+        updated_at: new Date().toISOString(),
+      }).eq('id', sourceId);
 
       return {
         sourceId,
@@ -203,17 +193,14 @@ export class MomentPipeline {
       minSelectionScore: options.minCandidateScore ?? 75,
     });
 
-    // Check existing candidates in Firestore
-    const existingCandQuery = query(
-      collection(db, 'clip_candidates'),
-      where('source_video_id', '==', sourceId)
-    );
-    const existingCandSnap = await getDocs(existingCandQuery);
+    // Check existing candidates in Supabase
+    const { data: existingCands } = await supabase
+      .from('clip_candidates')
+      .select('start_time, end_time')
+      .eq('source_video_id', sourceId);
+
     const existingTimeKeys = new Set(
-      existingCandSnap.docs.map((d) => {
-        const data = d.data();
-        return `${data.start_time}_${data.end_time}`;
-      })
+      (existingCands || []).map((d) => `${d.start_time}_${d.end_time}`)
     );
 
     let savedCount = 0;
@@ -264,11 +251,10 @@ export class MomentPipeline {
           ? 'rejected'
           : 'new';
 
-      const newCandRef = doc(collection(db, 'clip_candidates'));
-      const newCandId = newCandRef.id;
+      const newCandId = crypto.randomUUID();
       const now = new Date().toISOString();
 
-      await setDoc(newCandRef, {
+      await supabase.from('clip_candidates').insert({
         id: newCandId,
         workspace_id: options.workspaceId,
         source_video_id: sourceId,
@@ -283,6 +269,7 @@ export class MomentPipeline {
         factors: factorsPayload,
         status: candidateDbStatus,
         created_at: now,
+        updated_at: now,
       });
 
       console.log(`[ClipFlow] MOMENT INSERT: ${sourceId} [${moment.candidate.startTime} -> ${moment.candidate.endTime}] score: ${moment.overallScore} - "${moment.candidate.hook}"`);
@@ -290,10 +277,11 @@ export class MomentPipeline {
       savedCount++;
     }
 
-    await updateDoc(srcDocRef, {
+    await supabase.from('source_videos').update({
       status: 'analyzed',
       candidates_count: savedCount,
-    });
+      updated_at: new Date().toISOString(),
+    }).eq('id', sourceId);
 
     const breakdownMsg = `${savedCount} candidates found (${selectionCounts.selected} auto-selected, ${selectionCounts.candidate} potential, ${selectionCounts.rejected} downranked)`;
 

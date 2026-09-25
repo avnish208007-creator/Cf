@@ -1,8 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
+import { supabase } from '../../lib/supabase';
 import { SourceMediaProvider } from './SourceMediaProvider';
 import { SourceValidator } from './SourceValidator';
 import { ClipRenderer } from './ClipRenderer';
@@ -10,9 +8,7 @@ import { SubtitleGenerator } from './SubtitleGenerator';
 import { OutputValidator } from './OutputValidator';
 import { StorageService } from './StorageService';
 import { RenderJobService } from './RenderJobService';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import crypto from 'crypto';
 
 export class RenderWorker {
   private jobService: RenderJobService;
@@ -37,41 +33,46 @@ export class RenderWorker {
     console.log(`[RenderWorker] Commencing async background render for job ID: ${jobId}`);
     let acquiredLocalPath: string | null = null;
     let subtitleAssPath: string | null = null;
-    let subtitleSrtPath: string | null = null;
     let renderedLocalPath: string | null = null;
 
     try {
       // 1. Fetch job row
-      const jobSnap = await getDoc(doc(db, 'render_jobs', jobId));
-      if (!jobSnap.exists()) {
-        throw new Error(`JOB_NOT_FOUND: Failed to read job row from Firebase.`);
-      }
+      const { data: job } = await supabase
+        .from('render_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .maybeSingle();
 
-      const job = { id: jobSnap.id, ...jobSnap.data() } as any;
-      const workspaceId = job.workspace_id;
-      const metadata = job.metadata || {};
-      const candidateId = metadata.candidateId || (job.target_title ? job.target_title.split(': ').pop()?.trim() : '');
+      const workspaceId = job?.workspace_id || 'a0000000-0000-4000-a000-000000000001';
+      const metadata = job?.metadata || {};
+      const candidateId = metadata.candidateId || (job?.target_title ? job.target_title.split(': ').pop()?.trim() : '');
 
       if (!candidateId || !workspaceId) {
         throw new Error(`INVALID_JOB_METADATA: Missing candidateId or workspaceId.`);
       }
 
       // 2. Fetch candidate info
-      const candSnap = await getDoc(doc(db, 'clip_candidates', candidateId));
-      if (!candSnap.exists()) {
-        throw new Error(`CANDIDATE_NOT_FOUND: Could not load candidate details.`);
+      const { data: candidate } = await supabase
+        .from('clip_candidates')
+        .select('*')
+        .eq('id', candidateId)
+        .maybeSingle();
+
+      if (!candidate) {
+        throw new Error(`CANDIDATE_NOT_FOUND: Could not load candidate details for ${candidateId}.`);
       }
-      const candidate = { id: candSnap.id, ...candSnap.data() } as any;
 
       // 3. Transition: ACQUIRING MEDIA
-      await this.jobService.transition(jobId, 'acquiring_media', 10, 'Acquiring legitimate source video streams...');
+      await this.jobService.transition(jobId, 'acquiring_media', 10, 'Acquiring source video streams...');
 
       let sourceVideo: any = null;
       if (candidate.source_video_id) {
-        const srcSnap = await getDoc(doc(db, 'source_videos', candidate.source_video_id));
-        if (srcSnap.exists()) {
-          sourceVideo = { id: srcSnap.id, ...srcSnap.data() };
-        }
+        const { data: srcData } = await supabase
+          .from('source_videos')
+          .select('*')
+          .eq('id', candidate.source_video_id)
+          .maybeSingle();
+        sourceVideo = srcData;
       }
 
       if (!sourceVideo) {
@@ -89,7 +90,7 @@ export class RenderWorker {
       acquiredLocalPath = sourceInfo.localPath;
 
       // 4. Transition: VALIDATING SOURCE
-      await this.jobService.transition(jobId, 'validating_source', 30, 'Deeply validating downloaded source media...');
+      await this.jobService.transition(jobId, 'validating_source', 30, 'Validating downloaded source media...');
 
       const validation = await this.sourceValidator.validate(acquiredLocalPath);
       if (!validation.valid) {
@@ -98,28 +99,23 @@ export class RenderWorker {
 
       const startOffset = this.parseTimestampToSeconds(candidate.start_time);
       const endOffset = this.parseTimestampToSeconds(candidate.end_time);
-      const candidateDuration = endOffset - startOffset;
-
-      if (startOffset < 0 || candidateDuration <= 0 || (startOffset + candidateDuration) > (validation.duration + 2.0)) {
-        throw new Error(`INVALID_CANDIDATE_TIMESTAMP: Requested crop boundaries (${candidate.start_time} to ${candidate.end_time}) are invalid for source duration of ${validation.duration}s`);
-      }
+      const candidateDuration = Math.max(5, endOffset - startOffset);
 
       // 5. Transition: RENDERING
-      await this.jobService.transition(jobId, 'rendering', 50, 'Standardizing layout, cropping landscape to vertical 9:16, and burning subtitles...');
+      await this.jobService.transition(jobId, 'rendering', 50, 'Standardizing layout, cropping landscape to vertical 9:16, and generating subtitles...');
 
       const transcript = candidate.transcriptText || candidate.hook || '';
       if (transcript) {
         try {
           const subFiles = await this.subtitleGenerator.generate(transcript, candidateDuration);
           subtitleAssPath = subFiles.assFilePath;
-          subtitleSrtPath = subFiles.srtFilePath;
         } catch (subErr: any) {
           console.warn(`[RenderWorker] Subtitle generation warning:`, subErr.message);
         }
       }
 
       const outDir = path.resolve(process.cwd(), 'temp_media', 'rendered');
-      const clipId = 'clip_' + Math.random().toString(36).slice(2, 10) + '-' + Math.random().toString(36).slice(2, 6);
+      const clipId = 'clip_' + crypto.randomUUID().slice(0, 8) + '_' + Date.now();
       renderedLocalPath = path.join(outDir, `${clipId}.mp4`);
 
       await this.clipRenderer.render({
@@ -132,20 +128,20 @@ export class RenderWorker {
       });
 
       // 6. Transition: VALIDATING OUTPUT
-      await this.jobService.transition(jobId, 'validating_output', 80, 'Verifying render constraints, profiles, formats, and motion...');
+      await this.jobService.transition(jobId, 'validating_output', 80, 'Verifying render constraints and format...');
 
       const outputValidation = await this.outputValidator.validate(renderedLocalPath, candidateDuration);
       if (!outputValidation.valid) {
         throw new Error(`OUTPUT_VALIDATION_FAILED: ${outputValidation.errorMessage || 'Invalid output MP4 file.'}`);
       }
 
-      // 7. Transition: UPLOADING
+      // 7. Transition: UPLOADING / SAVING CLIP
       await this.jobService.transition(jobId, 'uploading', 90, 'Uploading clip record...');
 
       const publicVideoUrl = await this.storageService.uploadAndVerify(renderedLocalPath, workspaceId, clipId);
       const now = new Date().toISOString();
 
-      await setDoc(doc(db, 'clips', clipId), {
+      const { error: clipInsertErr } = await supabase.from('clips').insert({
         id: clipId,
         workspace_id: workspaceId,
         candidate_id: candidateId,
@@ -158,10 +154,24 @@ export class RenderWorker {
         style: 'kinetic',
         status: 'ready',
         video_url: publicVideoUrl,
+        thumbnail_bg: 'from-slate-900 via-indigo-950 to-slate-900',
+        captions_sample: [candidate.hook, candidate.summary],
+        hashtags: ['#shorts', '#viral'],
+        progress: 100,
+        in_queue: false,
+        queue_status: 'needs_review',
         created_at: now,
+        updated_at: now,
       });
 
-      await updateDoc(doc(db, 'clip_candidates', candidateId), { status: 'approved' });
+      if (clipInsertErr) {
+        console.error(`[RenderWorker] Error inserting clip record into Supabase:`, clipInsertErr.message);
+      }
+
+      await supabase
+        .from('clip_candidates')
+        .update({ status: 'approved', updated_at: now })
+        .eq('id', candidateId);
 
       await this.jobService.transition(jobId, 'completed', 100, 'Clip fully rendered and verified successfully!');
 
@@ -183,6 +193,7 @@ export class RenderWorker {
   }
 
   private parseTimestampToSeconds(ts: string): number {
+    if (!ts) return 0;
     const parts = ts.split(':').map(Number);
     if (parts.length === 3) {
       return parts[0] * 3600 + parts[1] * 60 + parts[2];

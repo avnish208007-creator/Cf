@@ -2,26 +2,20 @@ import React, { useState, useMemo } from 'react';
 import {
   Compass,
   Search,
-  Filter,
-  Play,
   Sparkles,
   ExternalLink,
+  MoreVertical,
+  Trash2,
+  CheckSquare,
+  Square,
+  AlertTriangle,
+  Play,
   Clock,
   Eye,
-  CheckCircle2,
   RefreshCw,
-  ArrowRight,
-  Sliders,
-  Radio,
-  ChevronDown,
-  ChevronUp,
-  Link,
-  Layers,
-  Settings,
-  AlertTriangle,
+  Plus,
   X,
-  FlaskConical,
-  Database,
+  Filter,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { SourceVideo } from '../types';
@@ -32,663 +26,527 @@ export const DiscoverPage: React.FC = () => {
     isFetchingSources,
     sourcesFetchError,
     fetchSources,
+    deleteSource,
+    bulkDeleteSources,
     runDiscovery,
     analyzeSource,
     analyzeAllSources,
     isDiscovering,
     isAnalyzing,
-    discoveryProviderError,
-    clearDiscoveryProviderError,
     addSource,
     workspace,
-    navigate,
-    showToast,
   } = useApp();
 
-  // Filter & discovery control states
+  // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedFreshness, setSelectedFreshness] = useState<'all' | 'last_24h' | 'last_7d' | 'last_30d'>('all');
-  const [selectedContentType, setSelectedContentType] = useState<'all' | 'deep_dive' | 'interviews' | 'keynote'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'new' | 'analyzed' | 'processing'>('all');
   const [selectedSubtopic, setSelectedSubtopic] = useState<string>('all');
-  const [minRelevanceFilter, setMinRelevanceFilter] = useState<number>(0);
 
-  // De-emphasized optional manual source override state
-  const [showManualOverride, setShowManualOverride] = useState(false);
-  const [manualTitle, setManualTitle] = useState('');
-  const [manualUrl, setManualUrl] = useState('');
-  const [manualSubtopic, setManualSubtopic] = useState(workspace.subtopics[0] || workspace.mainNiche);
+  // Bulk Selection State
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  // Filter sources based on controls and sort by overall score descending
+  // Delete Confirmation Modal State
+  const [deleteConfirmTarget, setDeleteConfirmTarget] = useState<{
+    type: 'single' | 'bulk';
+    sourceId?: string;
+    sourceTitle?: string;
+    count?: number;
+  } | null>(null);
+
+  // Overflow Menu active state
+  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+
+  // Manual source add drawer state
+  const [showAddDrawer, setShowAddDrawer] = useState(false);
+  const [addTitle, setAddTitle] = useState('');
+  const [addUrl, setAddUrl] = useState('');
+  const [addSubtopic, setAddSubtopic] = useState(workspace.subtopics[0] || workspace.mainNiche);
+
+  // Filter sources
   const filteredSources = useMemo(() => {
-    return sources
-      .filter((src) => {
-        const matchesSearch =
-          src.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          src.channelTitle.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          src.summary.toLowerCase().includes(searchQuery.toLowerCase());
+    return sources.filter((src) => {
+      const matchesSearch =
+        src.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        src.channelTitle.toLowerCase().includes(searchQuery.toLowerCase());
 
-        const matchesSubtopic =
-          selectedSubtopic === 'all' || src.niche === selectedSubtopic;
+      const matchesStatus =
+        statusFilter === 'all' ||
+        (statusFilter === 'new' && (src.status === 'new' || src.status === 'queued')) ||
+        (statusFilter === 'analyzed' && src.status === 'analyzed') ||
+        (statusFilter === 'processing' && src.status === 'processing');
 
-        const score = src.overallScore ?? src.relevanceScore ?? 88;
-        const matchesRelevance = score >= minRelevanceFilter;
+      const matchesSubtopic =
+        selectedSubtopic === 'all' || src.niche === selectedSubtopic;
 
-        return matchesSearch && matchesSubtopic && matchesRelevance;
-      })
-      .sort((a, b) => (b.overallScore ?? b.relevanceScore ?? 0) - (a.overallScore ?? a.relevanceScore ?? 0));
-  }, [sources, searchQuery, selectedSubtopic, minRelevanceFilter]);
+      return matchesSearch && matchesStatus && matchesSubtopic;
+    });
+  }, [sources, searchQuery, statusFilter, selectedSubtopic]);
 
-  const unanalyzedCount = useMemo(() => {
-    return sources.filter((s) => s.status === 'new' || s.status === 'queued').length;
-  }, [sources]);
+  const allVisibleSelected = useMemo(() => {
+    if (filteredSources.length === 0) return false;
+    return filteredSources.every((src) => selectedIds.has(src.id));
+  }, [filteredSources, selectedIds]);
 
-  const handleRunDiscovery = () => {
-    runDiscovery({
-      freshness: selectedFreshness,
-      contentType: selectedContentType,
-      subtopic: selectedSubtopic !== 'all' ? selectedSubtopic : undefined,
+  // Toggle selection
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
     });
   };
 
-  const handleManualOverrideSubmit = (e: React.FormEvent) => {
+  const toggleSelectAllVisible = () => {
+    if (allVisibleSelected) {
+      setSelectedIds(new Set());
+    } else {
+      const next = new Set<string>();
+      filteredSources.forEach((src) => next.add(src.id));
+      setSelectedIds(next);
+    }
+  };
+
+  const handleSingleDeleteRequest = (source: SourceVideo) => {
+    setActiveMenuId(null);
+    setDeleteConfirmTarget({
+      type: 'single',
+      sourceId: source.id,
+      sourceTitle: source.title,
+    });
+  };
+
+  const handleBulkDeleteRequest = () => {
+    setDeleteConfirmTarget({
+      type: 'bulk',
+      count: selectedIds.size,
+    });
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteConfirmTarget) return;
+
+    if (deleteConfirmTarget.type === 'single' && deleteConfirmTarget.sourceId) {
+      await deleteSource(deleteConfirmTarget.sourceId);
+    } else if (deleteConfirmTarget.type === 'bulk') {
+      await bulkDeleteSources(Array.from(selectedIds));
+      setSelectedIds(new Set());
+    }
+
+    setDeleteConfirmTarget(null);
+  };
+
+  const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!manualTitle.trim()) return;
-
-    addSource({
-      title: manualTitle.trim(),
-      youtubeUrl: manualUrl.trim() || `https://youtube.com/watch?v=override_${Date.now()}`,
-      niche: manualSubtopic,
+    if (!addTitle.trim()) return;
+    await addSource({
+      title: addTitle.trim(),
+      youtubeUrl: addUrl.trim() || `https://www.youtube.com/watch?v=${Date.now()}`,
+      niche: addSubtopic,
     });
-
-    setManualTitle('');
-    setManualUrl('');
-    setShowManualOverride(false);
-    showToast('Manual source override added to discovery pool', 'success');
-  };
-
-  const getOverallScoreBadge = (source: SourceVideo) => {
-    const val = source.overallScore ?? source.relevanceScore ?? 88;
-    if (val >= 90) {
-      return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200/80">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-          {val}% High Short-Form Potential
-        </span>
-      );
-    }
-    if (val >= 75) {
-      return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200/80">
-          <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-          {val}% Solid Candidate
-        </span>
-      );
-    }
-    return (
-      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700 border border-slate-200/80">
-        <span className="w-1.5 h-1.5 rounded-full bg-slate-400" />
-        {val}% Moderate Potential
-      </span>
-    );
+    setAddTitle('');
+    setAddUrl('');
+    setShowAddDrawer(false);
   };
 
   return (
-    <div className="space-y-6">
-      {/* Top Page Header with Primary Actions */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-            Source Video Discovery
-          </h1>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Set your niche once. ClipFlow automatically monitors feeds, discovers long-form talks, and extracts moments.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-          {/* Secondary Action: Analyze Sources */}
-          <button
-            onClick={() => analyzeAllSources()}
-            disabled={isAnalyzing || unanalyzedCount === 0}
-            className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200/90 rounded-md transition-colors shadow-xs disabled:opacity-50"
-            title="Scan speech cadence and extract moments from un-indexed videos"
-          >
-            <Sparkles className={`w-3.5 h-3.5 text-blue-600 ${isAnalyzing ? 'animate-spin' : ''}`} />
-            <span>
-              {isAnalyzing
-                ? 'Analyzing Sources...'
-                : unanalyzedCount > 0
-                ? `Analyze Sources (${unanalyzedCount})`
-                : 'All Sources Analyzed'}
-            </span>
-          </button>
-
-          {/* Primary Action: Run Discovery */}
-          <button
-            onClick={handleRunDiscovery}
-            disabled={isDiscovering}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-md transition-colors shadow-xs"
-          >
-            <Compass className={`w-3.5 h-3.5 ${isDiscovering ? 'animate-spin' : ''}`} />
-            <span>{isDiscovering ? 'Crawling Repositories...' : 'Run Discovery'}</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Provider Unavailable Alert State */}
-      {discoveryProviderError && (
-        <div className="bg-amber-50/90 border border-amber-200 rounded-xl p-4 text-xs text-amber-900 flex items-start justify-between gap-3 shadow-xs">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <div className="font-semibold text-amber-950">
-                YouTube discovery provider unavailable
-              </div>
-              <p className="text-[11px] text-amber-800 leading-relaxed">
-                {discoveryProviderError}
-              </p>
-              <p className="text-[11px] text-amber-700">
-                The discovery provider interface is intact. When run in an environment with the necessary runtime binaries, automated YouTube search executes seamlessly.
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={clearDiscoveryProviderError}
-            className="text-amber-500 hover:text-amber-800 p-1 transition-colors"
-            title="Dismiss message"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
-      {/* Selected Niche and Monitored Subtopics Card */}
-      <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white rounded-xl p-4 sm:p-5 shadow-sm space-y-3">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-700/60 pb-3">
-          <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-            <span className="text-xs font-medium text-slate-300">Automated Pipeline Targeting:</span>
-            <span className="text-sm font-bold text-white tracking-tight">
-              {workspace.mainNiche}
-            </span>
-          </div>
-
-          <button
-            onClick={() => navigate('settings')}
-            className="flex items-center gap-1 text-xs text-blue-300 hover:text-blue-200 transition-colors font-medium self-start sm:self-auto"
-          >
-            <Settings className="w-3.5 h-3.5" />
-            <span>Configure Niche & Subtopics</span>
-          </button>
-        </div>
-
-        <div className="space-y-1.5">
-          <div className="text-[11px] text-slate-400 uppercase tracking-wider font-semibold">
-            Monitored Subtopics
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {workspace.subtopics.map((sub) => (
-              <span
-                key={sub}
-                className="px-2.5 py-1 text-xs bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-200 rounded-md transition-colors"
-              >
-                {sub}
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
+      {/* Page Header */}
+      <div className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-20 px-6 py-4">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-xl font-semibold tracking-tight text-white">
+                Discover Sources
+              </h1>
+              <span className="text-xs font-medium text-slate-400 font-mono bg-slate-800/80 px-2 py-0.5 rounded">
+                {sources.length} videos
               </span>
-            ))}
-          </div>
-        </div>
-
-        <div className="text-[11px] text-slate-400 pt-1">
-          ClipFlow continuously scans technical podcasts, keynotes, and demonstrations for these subtopics. No manual URL input is necessary.
-        </div>
-      </div>
-
-      {/* Discovery Controls & Freshness / Content Filters */}
-      <div className="bg-white border border-slate-200/80 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Sliders className="w-3.5 h-3.5 text-slate-600" />
-            <h2 className="font-semibold text-xs text-slate-900 uppercase tracking-wider">
-              Discovery Controls & Freshness Filters
-            </h2>
-          </div>
-          <span className="text-[11px] text-slate-500">
-            Showing {filteredSources.length} of {sources.length} sources
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-          {/* Subtopic Filter */}
-          <div>
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Subtopic Focus
-            </label>
-            <select
-              value={selectedSubtopic}
-              onChange={(e) => setSelectedSubtopic(e.target.value)}
-              className="w-full px-2.5 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-slate-900"
-            >
-              <option value="all">All Subtopics ({workspace.subtopics.length})</option>
-              {workspace.subtopics.map((st) => (
-                <option key={st} value={st}>
-                  {st}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Freshness Filter */}
-          <div>
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Publishing Freshness
-            </label>
-            <select
-              value={selectedFreshness}
-              onChange={(e) => setSelectedFreshness(e.target.value as any)}
-              className="w-full px-2.5 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-slate-900"
-            >
-              <option value="all">Any Freshness (All Time)</option>
-              <option value="last_24h">Past 24 Hours</option>
-              <option value="last_7d">Past 7 Days</option>
-              <option value="last_30d">Past 30 Days</option>
-            </select>
-          </div>
-
-          {/* Content Type Filter */}
-          <div>
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Content Format
-            </label>
-            <select
-              value={selectedContentType}
-              onChange={(e) => setSelectedContentType(e.target.value as any)}
-              className="w-full px-2.5 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-slate-900"
-            >
-              <option value="all">All Formats</option>
-              <option value="deep_dive">Deep Dives (30m+)</option>
-              <option value="interviews">Podcasts & Interviews</option>
-              <option value="keynote">Keynotes & Conferences</option>
-            </select>
-          </div>
-
-          {/* Relevance Threshold */}
-          <div>
-            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-              Min Relevance Score
-            </label>
-            <select
-              value={minRelevanceFilter}
-              onChange={(e) => setMinRelevanceFilter(Number(e.target.value))}
-              className="w-full px-2.5 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-slate-900"
-            >
-              <option value="0">All Matches (Any score)</option>
-              <option value="90">Strong Match (90%+)</option>
-              <option value="94">Top Tier Match (94%+)</option>
-            </select>
-          </div>
-        </div>
-
-        {/* Search Query Input */}
-        <div className="relative pt-1">
-          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search discovered video titles, guest speakers, or concepts..."
-            className="w-full pl-9 pr-3 py-2 text-xs rounded-md border border-slate-200 focus:outline-hidden focus:ring-1 focus:ring-slate-900 bg-white"
-          />
-        </div>
-      </div>
-
-      {/* Supabase Error Banner if fetch failed */}
-      {sourcesFetchError && (
-        <div className="bg-rose-50 border border-rose-200 rounded-xl p-4 sm:p-5 text-rose-900 shadow-xs mb-4">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-            <div className="flex-1 min-w-0">
-              <h3 className="font-semibold text-sm">Supabase Sync Error</h3>
-              <p className="text-xs text-rose-700 mt-1 leading-relaxed">{sourcesFetchError}</p>
-              <div className="mt-3 flex items-center gap-2">
-                <button
-                  onClick={() => fetchSources()}
-                  disabled={isFetchingSources}
-                  className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white rounded text-xs font-semibold transition-colors flex items-center gap-1.5"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isFetchingSources ? 'animate-spin' : ''}`} />
-                  <span>Retry Supabase Fetch</span>
-                </button>
-              </div>
             </div>
+            <p className="text-xs text-slate-400 mt-1">
+              Find long-form YouTube videos worth turning into short-form clips for{' '}
+              <span className="text-slate-200 font-medium">{workspace.mainNiche}</span>.
+            </p>
+          </div>
+
+          {/* Primary Action Buttons */}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => runDiscovery()}
+              disabled={isDiscovering}
+              className="px-3.5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+            >
+              <Compass className={`w-3.5 h-3.5 ${isDiscovering ? 'animate-spin' : ''}`} />
+              <span>{isDiscovering ? 'Searching...' : 'Run Discovery'}</span>
+            </button>
+
+            <button
+              onClick={() => analyzeAllSources()}
+              disabled={isAnalyzing || sources.filter((s) => s.status === 'new').length === 0}
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
+            >
+              <Sparkles className={`w-3.5 h-3.5 text-amber-400 ${isAnalyzing ? 'animate-spin' : ''}`} />
+              <span>{isAnalyzing ? 'Analyzing...' : 'Analyze All New'}</span>
+            </button>
+
+            <button
+              onClick={() => setShowAddDrawer(!showAddDrawer)}
+              className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add URL</span>
+            </button>
           </div>
         </div>
-      )}
+      </div>
 
-      {/* Discovered Source Videos Appearing Automatically */}
-      <div className="space-y-3">
-        {isFetchingSources && sources.length === 0 ? (
-          <div className="bg-white border border-slate-200/80 rounded-xl p-10 text-center shadow-xs">
-            <RefreshCw className="w-7 h-7 text-blue-600 animate-spin mx-auto mb-3" />
-            <h3 className="font-semibold text-sm text-slate-900">Querying Supabase source_videos</h3>
-            <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
-              Filtering records by workspace "{workspace.workspaceName || 'Apex Media Lab'}"...
-            </p>
-          </div>
-        ) : filteredSources.length === 0 ? (
-          <div className="bg-white border border-slate-200/80 rounded-xl p-8 sm:p-12 text-center shadow-xs">
-            <Compass className="w-8 h-8 text-slate-300 mx-auto mb-3" />
-            <h3 className="font-semibold text-sm text-slate-900">
-              {sources.length === 0 ? 'No source videos in this workspace' : 'No discovered sources match this filter'}
-            </h3>
-            <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
-              {sources.length === 0
-                ? `Run discovery to find, rank, and persist sources for "${workspace.mainNiche}" in Supabase.`
-                : `Adjust your search or freshness filters, or run discovery again.`}
-            </p>
-            <div className="mt-4 flex items-center justify-center gap-2">
-              <button
-                onClick={handleRunDiscovery}
-                disabled={isDiscovering}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 shadow-xs"
-              >
-                {isDiscovering ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Running Discovery...</span>
-                  </>
-                ) : (
-                  <>
-                    <Compass className="w-3.5 h-3.5" />
-                    <span>Run Discovery Now</span>
-                  </>
-                )}
+      {/* Main Content Area */}
+      <div className="max-w-7xl mx-auto w-full px-6 py-6 flex-1 space-y-5">
+        {/* Manual Add Drawer */}
+        {showAddDrawer && (
+          <div className="p-4 bg-slate-900/90 border border-slate-800 rounded-xl space-y-3">
+            <div className="flex items-center justify-between text-xs font-semibold text-white">
+              <span>Manually Add Source Video</span>
+              <button onClick={() => setShowAddDrawer(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
               </button>
-              {sources.length > 0 && (
-                <button
-                  onClick={() => {
-                    setSearchQuery('');
-                    setSelectedSubtopic('all');
-                    setSelectedFreshness('all');
-                    setSelectedContentType('all');
-                    setMinRelevanceFilter(0);
-                  }}
-                  className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium rounded-md transition-colors"
-                >
-                  Reset Filters
-                </button>
-              )}
             </div>
-          </div>
-        ) : (
-          filteredSources.map((source) => {
-            const isDev = Boolean(
-              source.is_development_source ||
-              source.isDevelopmentSource ||
-              source.youtubeUrl?.startsWith('dev://') ||
-              source.youtubeUrl?.includes('test-source')
-            );
-
-            return (
-              <div
-                key={source.id}
-                className="bg-white border border-slate-200/80 rounded-xl p-4 sm:p-5 hover:border-slate-300 transition-colors shadow-xs flex flex-col md:flex-row md:items-start justify-between gap-4 sm:gap-5"
+            <form onSubmit={handleAddSubmit} className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <input
+                type="text"
+                placeholder="Video Title..."
+                value={addTitle}
+                onChange={(e) => setAddTitle(e.target.value)}
+                required
+                className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500"
+              />
+              <input
+                type="url"
+                placeholder="YouTube URL..."
+                value={addUrl}
+                onChange={(e) => setAddUrl(e.target.value)}
+                className="px-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500"
+              />
+              <button
+                type="submit"
+                className="py-1.5 px-4 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
               >
-                {/* Thumbnail preview if real image exists */}
-                {source.thumbnailUrl && (
-                  <div className="w-full md:w-44 md:h-28 rounded-lg overflow-hidden shrink-0 bg-slate-900 relative">
-                    <img
-                      src={source.thumbnailUrl}
-                      alt={source.title}
-                      className="w-full h-full object-cover"
-                      loading="lazy"
-                    />
-                    <div className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/80 font-mono text-[10px] text-white font-medium">
-                      {source.duration}
-                    </div>
-                  </div>
-                )}
-
-                {/* Left Details */}
-                <div className="space-y-2 flex-1 min-w-0">
-                  {/* Meta details & Source Relevance Status */}
-                  <div className="flex items-center gap-2 text-[11px] text-slate-500 flex-wrap">
-                    {getOverallScoreBadge(source)}
-                    {isDev && (
-                      <>
-                        <span>·</span>
-                        <span className="px-1.5 py-0.5 bg-amber-50 text-amber-800 border border-amber-200/60 rounded text-[10px] font-semibold flex items-center gap-1">
-                          <FlaskConical className="w-3 h-3 text-amber-600" />
-                          <span>Dev Test Source</span>
-                        </span>
-                      </>
-                    )}
-                    <span>·</span>
-                    <span className="font-semibold text-slate-800">{source.channelTitle}</span>
-                    <span>·</span>
-                    <span className="px-1.5 py-0.5 bg-slate-100 rounded text-slate-700 font-medium">
-                      {source.niche}
-                    </span>
-                    <span>·</span>
-                    <span className="font-mono tabular-nums">{source.duration}</span>
-                    <span>·</span>
-                    <span className="font-mono tabular-nums">
-                      {source.viewCount.toLocaleString()} views
-                    </span>
-                    {source.likeCount !== undefined && (
-                      <>
-                        <span>·</span>
-                        <span className="font-mono tabular-nums">{source.likeCount.toLocaleString()} likes</span>
-                      </>
-                    )}
-                    <span>·</span>
-                    <span>{source.publishedAt}</span>
-                  </div>
-
-                  <h2 className="text-sm sm:text-base font-semibold text-slate-900 leading-snug">
-                    {source.title}
-                  </h2>
-
-                  {/* Explainable Rationale */}
-                  {source.scoreExplanation && (
-                    <div className="text-[11px] text-slate-700 bg-slate-50/90 border border-slate-200/70 rounded-md px-2.5 py-1.5 flex items-start gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0 mt-0.5" />
-                      <span>
-                        <strong className="text-slate-900">Ranking Rationale:</strong> {source.scoreExplanation}
-                      </span>
-                    </div>
-                  )}
-
-                  <p className="text-xs text-slate-600 leading-relaxed line-clamp-2">
-                    {source.summary}
-                  </p>
-
-                  {/* Transparent 4-Factor Weighted Score Breakdown */}
-                  <div className="flex items-center gap-2 text-[10px] text-slate-500 flex-wrap pt-0.5 font-mono">
-                    <span>Overall: <strong className="text-slate-900 font-semibold">{source.overallScore ?? source.relevanceScore ?? 88}%</strong></span>
-                    <span>·</span>
-                    <span>Rel (30%): <strong className="text-slate-700">{source.relevanceScore ?? 88}%</strong></span>
-                    <span>·</span>
-                    <span>Eng (30%): <strong className="text-slate-700">{source.engagementScore ?? 85}%</strong></span>
-                    <span>·</span>
-                    <span>Short-Form (25%): <strong className="text-slate-700">{source.shortFormScore ?? 80}%</strong></span>
-                    <span>·</span>
-                    <span>Qual (15%): <strong className="text-slate-700">{source.contentQualityScore ?? 80}%</strong></span>
-                  </div>
-
-                  {/* Real Status indicator */}
-                  <div className="pt-1 flex items-center gap-2 text-xs text-slate-600 flex-wrap">
-                    {source.status === 'processing' ? (
-                      <span className="flex items-center gap-1.5 text-blue-600 font-medium">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Analyzing speech cadence & moment hooks...</span>
-                      </span>
-                    ) : source.status === 'analyzed' && (source.candidatesCount ?? 0) > 0 ? (
-                      <span className="flex items-center gap-1.5 text-emerald-700 font-medium">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                        <span>Analyzed · {source.candidatesCount} candidate{source.candidatesCount === 1 ? '' : 's'} detected</span>
-                      </span>
-                    ) : source.status === 'analyzed' && (source.candidatesCount ?? 0) === 0 ? (
-                      <span className="flex items-center gap-1.5 text-slate-500 font-medium">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Analyzed · No candidates found</span>
-                      </span>
-                    ) : source.status === 'failed' ? (
-                      <span className="flex items-center gap-1.5 text-rose-600 font-medium">
-                        <AlertTriangle className="w-3.5 h-3.5 text-rose-500" />
-                        <span>Analysis failed</span>
-                      </span>
-                    ) : (
-                      <span className="flex items-center gap-1.5 text-slate-500">
-                        <Clock className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Unanalyzed Source · Ready for moment detection</span>
-                      </span>
-                    )}
-
-                    <span>·</span>
-                    {source.mediaStatus === 'available' || source.mediaPath ? (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                        <span>Media: Available</span>
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
-                        <Clock className="w-3 h-3 text-slate-500" />
-                        <span>Media: Auto-Acquisition on Render</span>
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Right Action buttons */}
-                <div className="flex flex-wrap sm:flex-nowrap md:flex-col items-center md:items-end justify-between md:justify-start gap-2 shrink-0 border-t md:border-t-0 pt-3 md:pt-0 border-slate-100">
-                  {source.status === 'analyzed' ? (
-                    <button
-                      onClick={() => navigate('candidates')}
-                      className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-md transition-colors flex items-center gap-1.5 shadow-xs whitespace-nowrap cursor-pointer"
-                    >
-                      <span>View Detected Moments</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => analyzeSource(source.id)}
-                      disabled={isAnalyzing || source.status === 'processing'}
-                      className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-semibold text-xs rounded-md transition-colors flex items-center gap-1.5 shadow-xs whitespace-nowrap cursor-pointer"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Analyze Source</span>
-                    </button>
-                  )}
-
-                  {isDev ? (
-                    <div
-                      className="text-[11px] text-amber-800 bg-amber-50/80 border border-amber-200/60 rounded px-2.5 py-1 flex items-center gap-1.5 select-none"
-                      title="Development test source - intentionally non-clickable test URL"
-                    >
-                      <FlaskConical className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                      <span className="font-medium">Test Source (Non-clickable)</span>
-                    </div>
-                  ) : (
-                    <a
-                      href={source.youtubeUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1 py-1 font-medium transition-colors"
-                    >
-                      <span>Reference Video</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-
-      {/* De-emphasized Optional Manual Override Accordion */}
-      <div className="border border-slate-200/70 rounded-xl bg-slate-50/50 p-3.5 transition-colors">
-        <button
-          type="button"
-          onClick={() => setShowManualOverride(!showManualOverride)}
-          className="w-full flex items-center justify-between text-xs text-slate-500 hover:text-slate-800 font-medium py-1"
-        >
-          <div className="flex items-center gap-2">
-            <Link className="w-3.5 h-3.5 text-slate-400" />
-            <span>Optional: Manual Source Override (For testing specific external videos)</span>
-          </div>
-          {showManualOverride ? (
-            <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
-          ) : (
-            <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
-          )}
-        </button>
-
-        {showManualOverride && (
-          <div className="pt-3 mt-2 border-t border-slate-200/60 text-xs space-y-3 animate-in fade-in duration-150">
-            <p className="text-[11px] text-slate-500 leading-relaxed">
-              ClipFlow operates as an automated discovery engine based on your niche. This override is provided strictly as an optional testing utility. If automated YouTube downloads are blocked by platform bot detection on this server's IP address, you can paste any direct HTTP/HTTPS video URL (e.g., an MP4 link) to test the complete rendering pipeline.
-            </p>
-
-            <form onSubmit={handleManualOverrideSubmit} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-              <div className="sm:col-span-5">
-                <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                  Video Title <span className="text-rose-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={manualTitle}
-                  onChange={(e) => setManualTitle(e.target.value)}
-                  placeholder="e.g. In-Depth Autonomous Agent Benchmark"
-                  className="w-full px-3 py-1.5 text-xs rounded-md border border-slate-200 focus:outline-hidden focus:ring-1 focus:ring-slate-900 bg-white"
-                />
-              </div>
-
-              <div className="sm:col-span-4">
-                <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                  Video / YouTube URL <span className="text-slate-400 font-normal">(Direct MP4 or YouTube)</span>
-                </label>
-                <input
-                  type="url"
-                  value={manualUrl}
-                  onChange={(e) => setManualUrl(e.target.value)}
-                  placeholder="https://example.com/video.mp4 or YouTube link"
-                  className="w-full px-3 py-1.5 text-xs rounded-md border border-slate-200 focus:outline-hidden focus:ring-1 focus:ring-slate-900 bg-white"
-                />
-              </div>
-
-              <div className="sm:col-span-3">
-                <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                  Subtopic
-                </label>
-                <select
-                  value={manualSubtopic}
-                  onChange={(e) => setManualSubtopic(e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-xs rounded-md border border-slate-200 focus:outline-hidden focus:ring-1 focus:ring-slate-900 bg-white"
-                >
-                  <option value={workspace.mainNiche}>{workspace.mainNiche}</option>
-                  {workspace.subtopics.map((st) => (
-                    <option key={st} value={st}>
-                      {st}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="sm:col-span-12 flex justify-end">
-                <button
-                  type="submit"
-                  className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs rounded transition-colors"
-                >
-                  Ingest Specific Override
-                </button>
-              </div>
+                Add Video Record
+              </button>
             </form>
           </div>
         )}
+
+        {/* Filter Controls & Search Bar */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-slate-900/40 p-2.5 rounded-xl border border-slate-800/80">
+          {/* Status Tabs (Interactive Segmented Control) */}
+          <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-lg border border-slate-800/60">
+            {(['all', 'new', 'analyzed', 'processing'] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setStatusFilter(tab)}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-all cursor-pointer capitalize ${
+                  statusFilter === tab
+                    ? 'bg-slate-800 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {tab}
+              </button>
+            ))}
+          </div>
+
+          {/* Search Input & Subtopic Filter */}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1 sm:w-64">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input
+                type="text"
+                placeholder="Search title or channel..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-white focus:outline-hidden focus:border-blue-500 placeholder:text-slate-500"
+              />
+            </div>
+
+            {workspace.subtopics.length > 0 && (
+              <select
+                value={selectedSubtopic}
+                onChange={(e) => setSelectedSubtopic(e.target.value)}
+                className="px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-300 focus:outline-hidden focus:border-blue-500 cursor-pointer"
+              >
+                <option value="all">All Subtopics</option>
+                {workspace.subtopics.map((st) => (
+                  <option key={st} value={st}>
+                    {st}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        </div>
+
+        {/* Bulk Actions Contextual Toolbar */}
+        {selectedIds.size > 0 && (
+          <div className="flex items-center justify-between px-4 py-2.5 bg-blue-950/70 border border-blue-800/80 rounded-xl text-xs text-blue-200 animate-in fade-in duration-150">
+            <div className="flex items-center gap-2 font-medium">
+              <span className="font-semibold text-white">{selectedIds.size} selected</span>
+              <span className="text-slate-400">·</span>
+              <button
+                onClick={toggleSelectAllVisible}
+                className="text-blue-300 hover:text-white underline cursor-pointer"
+              >
+                {allVisibleSelected ? 'Deselect all' : 'Select all visible'}
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleBulkDeleteRequest}
+                className="px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Delete Selected</span>
+              </button>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="px-2.5 py-1 text-slate-400 hover:text-white cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Source Content List */}
+        {filteredSources.length === 0 ? (
+          <div className="p-12 text-center border border-dashed border-slate-800 rounded-2xl bg-slate-900/20">
+            <Compass className="w-8 h-8 text-slate-600 mx-auto mb-3" />
+            <h3 className="text-sm font-semibold text-slate-200">No discovered videos found</h3>
+            <p className="text-xs text-slate-500 max-w-md mx-auto mt-1 mb-4">
+              Run automatic discovery to query YouTube RSS feeds for videos matching your niche.
+            </p>
+            <button
+              onClick={() => runDiscovery()}
+              disabled={isDiscovering}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+            >
+              Run Discovery
+            </button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredSources.map((source) => {
+              const isSelected = selectedIds.has(source.id);
+              const youtubeId = source.youtubeUrl ? source.youtubeUrl.split('v=').pop()?.split('&')[0] : null;
+              const thumbUrl = youtubeId ? `https://i.ytimg.com/vi/${youtubeId}/mqdefault.jpg` : null;
+
+              return (
+                <div
+                  key={source.id}
+                  className={`group relative bg-slate-900/70 border transition-all rounded-xl overflow-hidden flex flex-col justify-between ${
+                    isSelected ? 'border-blue-500 ring-1 ring-blue-500 bg-slate-900' : 'border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  {/* Card Header & Thumbnail */}
+                  <div>
+                    <div className="relative aspect-video bg-slate-950 overflow-hidden">
+                      {thumbUrl ? (
+                        <img
+                          src={thumbUrl}
+                          alt={source.title}
+                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                        />
+                      ) : (
+                        <div className={`w-full h-full bg-gradient-to-br ${source.thumbnailGradient || 'from-slate-900 to-indigo-950'} flex items-center justify-center text-slate-600`}>
+                          <Play className="w-8 h-8 opacity-40" />
+                        </div>
+                      )}
+
+                      {/* Select Checkbox */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleSelectOne(source.id);
+                        }}
+                        className="absolute top-2 left-2 p-1 rounded-md bg-slate-950/80 hover:bg-slate-900 text-white backdrop-blur-xs cursor-pointer z-10"
+                      >
+                        {isSelected ? (
+                          <CheckSquare className="w-4 h-4 text-blue-400" />
+                        ) : (
+                          <Square className="w-4 h-4 text-slate-400 opacity-80 group-hover:opacity-100" />
+                        )}
+                      </button>
+
+                      {/* Duration Tag */}
+                      <div className="absolute bottom-2 right-2 px-1.5 py-0.5 bg-slate-950/90 text-[10px] font-mono font-medium text-slate-200 rounded backdrop-blur-xs">
+                        {source.duration || '12:00'}
+                      </div>
+
+                      {/* Status Overlay */}
+                      <div className="absolute top-2 right-2">
+                        {source.status === 'analyzed' ? (
+                          <span className="px-2 py-0.5 text-[10px] font-medium bg-emerald-950/90 text-emerald-300 border border-emerald-800/80 rounded backdrop-blur-xs">
+                            Analyzed
+                          </span>
+                        ) : source.status === 'processing' ? (
+                          <span className="px-2 py-0.5 text-[10px] font-medium bg-blue-950/90 text-blue-300 border border-blue-800/80 rounded backdrop-blur-xs flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping" />
+                            Analyzing
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 text-[10px] font-medium bg-slate-950/90 text-slate-400 border border-slate-800 rounded backdrop-blur-xs">
+                            New
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Card Body */}
+                    <div className="p-4 space-y-2">
+                      <h2 className="text-sm font-semibold text-slate-100 line-clamp-2 leading-snug group-hover:text-blue-400 transition-colors">
+                        {source.title}
+                      </h2>
+
+                      {/* Anti-Slop Clean Text Metadata */}
+                      <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                        <span className="font-medium text-slate-300 truncate">{source.channelTitle}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{source.publishedAt || 'Recently'}</span>
+                        {source.relevanceScore !== undefined && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-emerald-400 font-mono text-[11px] font-semibold">
+                              {source.relevanceScore}% fit
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card Actions & Overflow Menu */}
+                  <div className="p-4 pt-0 flex items-center justify-between gap-2 border-t border-slate-800/60 mt-3 pt-3">
+                    {source.status === 'new' ? (
+                      <button
+                        onClick={() => analyzeSource(source.id)}
+                        disabled={isAnalyzing}
+                        className="flex-1 py-1.5 px-3 bg-blue-600/90 hover:bg-blue-500 text-white font-medium text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Analyze Moments</span>
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => analyzeSource(source.id)}
+                        className="flex-1 py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5 text-slate-400" />
+                        <span>Re-analyze</span>
+                      </button>
+                    )}
+
+                    {/* Overflow Menu (···) */}
+                    <div className="relative">
+                      <button
+                        onClick={() => setActiveMenuId(activeMenuId === source.id ? null : source.id)}
+                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                        title="More options"
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+
+                      {activeMenuId === source.id && (
+                        <div className="absolute right-0 bottom-full mb-1 w-44 bg-slate-900 border border-slate-800 rounded-xl shadow-xl z-30 p-1 text-xs space-y-0.5 animate-in fade-in duration-100">
+                          <button
+                            onClick={() => {
+                              setActiveMenuId(null);
+                              analyzeSource(source.id);
+                            }}
+                            className="w-full text-left px-3 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg flex items-center gap-2 cursor-pointer"
+                          >
+                            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                            <span>Analyze</span>
+                          </button>
+
+                          {source.youtubeUrl && (
+                            <a
+                              href={source.youtubeUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={() => setActiveMenuId(null)}
+                              className="w-full text-left px-3 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg flex items-center gap-2 cursor-pointer"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
+                              <span>Open YouTube</span>
+                            </a>
+                          )}
+
+                          <div className="border-t border-slate-800/80 my-1" />
+
+                          <button
+                            onClick={() => handleSingleDeleteRequest(source)}
+                            className="w-full text-left px-3 py-2 text-rose-400 hover:bg-rose-950/60 rounded-lg flex items-center gap-2 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Remove from discoveries</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
+
+      {/* Delete Confirmation Modal */}
+      {deleteConfirmTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+            <div className="flex items-start gap-3 text-rose-400">
+              <div className="p-2 bg-rose-950/80 border border-rose-800/60 rounded-xl shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">
+                  {deleteConfirmTarget.type === 'single'
+                    ? 'Remove this video?'
+                    : `Remove ${deleteConfirmTarget.count} selected videos?`}
+                </h3>
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                  Removing it will permanently delete the source record from Supabase and remove associated candidates and clips.
+                </p>
+                {deleteConfirmTarget.sourceTitle && (
+                  <p className="text-xs font-medium text-slate-300 mt-2 italic line-clamp-2">
+                    "{deleteConfirmTarget.sourceTitle}"
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                onClick={() => setDeleteConfirmTarget(null)}
+                className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors cursor-pointer"
+              >
+                {deleteConfirmTarget.type === 'single' ? 'Remove video' : 'Remove selected'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

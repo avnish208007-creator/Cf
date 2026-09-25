@@ -1,10 +1,5 @@
 import { Request, Response } from 'express';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs } from 'firebase/firestore';
-import firebaseConfig from '../../../firebase-applet-config.json';
-
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+import { supabase } from '../../lib/supabase';
 
 export async function handleClipsRequest(req: Request, res: Response): Promise<void> {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -23,30 +18,30 @@ export async function handleClipsRequest(req: Request, res: Response): Promise<v
   ).trim();
 
   try {
-    let q;
+    let queryBuilder = supabase.from('clips').select('*');
     if (workspaceId) {
-      q = query(collection(db, 'clips'), where('workspace_id', '==', workspaceId));
-    } else {
-      q = query(collection(db, 'clips'));
+      queryBuilder = queryBuilder.eq('workspace_id', workspaceId);
+    }
+    const { data: records, error } = await queryBuilder.order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(error.message);
     }
 
-    const querySnap = await getDocs(q);
-    const records = querySnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
-
-    console.log(`[ClipsHandler] Fetched ${records.length} clip records for workspace "${workspaceId}"`);
+    console.log(`[ClipsHandler] Fetched ${(records || []).length} clip records for workspace "${workspaceId}"`);
 
     res.status(200).json({
       success: true,
-      clips: records,
+      clips: records || [],
       workspaceId,
-      count: records.length,
+      count: (records || []).length,
     });
   } catch (err: any) {
     console.error('[ClipsHandler] Unexpected error:', err);
     res.status(500).json({
       success: false,
       error: 'FETCH_CLIPS_FAILED',
-      message: err.message || 'An unexpected error occurred while querying clips from Firebase.',
+      message: err.message || 'An unexpected error occurred while querying clips from Supabase.',
     });
   }
 }
