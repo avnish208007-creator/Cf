@@ -1,6 +1,8 @@
-export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'queued' | 'dispatching' | 'resolving' | 'processing' | 'completed' | 'failed' | 'cancelled';
 export type JobStage =
   | 'queued'
+  | 'dispatching'
+  | 'resolving'
   | 'downloading'
   | 'extracting_media'
   | 'transcribing'
@@ -22,6 +24,7 @@ export interface ProcessingJob {
   candidateId?: string;
   clipId?: string;
   error?: string;
+  errorCode?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;

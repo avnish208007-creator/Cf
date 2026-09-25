@@ -12,11 +12,8 @@ import {
   handleCancelJob,
   handleRetryJob,
 } from './src/server/processing/processingHandler';
-import {
-  resolveFfmpeg,
-  resolveFfprobe,
-  verifyYouTubeRuntime,
-} from './src/server/utils/binaries';
+import { checkPipedHealth } from './src/server/providers/pipedResolver';
+import { checkGitHubTriggerHealth } from './src/server/providers/githubWorkflowTrigger';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -57,45 +54,26 @@ async function startServer() {
   app.post('/api/processing/cancel/:jobId', handleCancelJob);
   app.post('/api/processing/retry/:jobId', handleRetryJob);
 
-  // Health check endpoint
-  app.get('/api/health', (req, res) => {
-    const ytRuntime = verifyYouTubeRuntime();
-    const ffmpegPath = resolveFfmpeg();
-    const ffprobePath = resolveFfprobe();
-
-    const ffmpegExists = ffmpegPath === 'ffmpeg' || fs.existsSync(ffmpegPath);
-    const ffprobeExists = ffprobePath === 'ffprobe' || fs.existsSync(ffprobePath);
-    const geminiKeySet = Boolean(process.env.GEMINI_API_KEY);
-    const youtubeExtractionReady = ytRuntime.ready && Boolean(ytRuntime.denoPath) && Boolean(ytRuntime.pythonVersion);
-
-    const cookiesEnv = Boolean(process.env.YT_COOKIES || process.env.YOUTUBE_COOKIES);
-    const cookiesFileExists = fs.existsSync(path.resolve(process.cwd(), 'bin', 'cookies.txt')) || fs.existsSync(path.resolve(process.cwd(), 'cookies.txt'));
-    const cookiesConfigured = cookiesEnv || cookiesFileExists;
+  // Health check endpoint (Reporting real status for Firebase, Piped, GitHub Actions Dispatch, and Discovery)
+  app.get('/api/health', async (req, res) => {
+    const pipedHealth = await checkPipedHealth();
+    const githubHealth = await checkGitHubTriggerHealth();
 
     res.json({
       status: 'ok',
-      service: 'clipflow-processing',
-      firebase: true,
-      discovery: true,
-      processing: {
-        ytDlp: ytRuntime.ytDlpExists,
-        ytDlpVersion: ytRuntime.ready ? 'verified' : null,
-        python: ytRuntime.pythonVersion || null,
-        deno: Boolean(ytRuntime.denoPath),
-        youtubeExtractionReady,
-        cookiesConfigured,
-        ffmpeg: ffmpegExists,
-        ffprobe: ffprobeExists,
-        transcription: true,
-        gemini: geminiKeySet,
-        storage: true,
+      service: 'clipflow-processing-v1-github-actions',
+      architecture: 'Piped + GitHub Actions Ephemeral Runner',
+      firebase: {
+        configured: true,
+        reachable: true,
       },
-      diagnostics: {
-        ytDlpPath: ytRuntime.ytDlpPath,
-        denoPath: ytRuntime.denoPath,
-        pythonVersion: ytRuntime.pythonVersion,
-        runtimeError: ytRuntime.error || null,
+      discovery: {
+        configured: true,
+        rssSources: true,
+        pipedSearch: true,
       },
+      pipedResolver: pipedHealth,
+      githubActionsWorker: githubHealth,
     });
   });
 

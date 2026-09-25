@@ -46,7 +46,7 @@ export async function handleStartProcessing(req: Request, res: Response) {
         .map((d) => d.data())
         .find(
           (j: any) =>
-            (j.status === 'queued' || j.status === 'processing') &&
+            (j.status === 'queued' || j.status === 'processing' || j.status === 'resolving') &&
             (!candidateId || j.candidateId === candidateId)
         );
 
@@ -65,13 +65,11 @@ export async function handleStartProcessing(req: Request, res: Response) {
     const jobId = 'job_' + crypto.randomUUID();
     const now = new Date().toISOString();
 
-    const isCandidateRender = Boolean(candidateId);
-
     const jobRef = doc(db, 'workspaces', effectiveWsId, 'jobs', jobId);
     await setDoc(jobRef, {
       id: jobId,
       workspaceId: effectiveWsId,
-      type: isCandidateRender ? 'candidate_render' : 'video_processing',
+      type: 'video_processing',
       status: 'queued',
       stage: 'queued',
       progress: 0,
@@ -81,23 +79,15 @@ export async function handleStartProcessing(req: Request, res: Response) {
       updatedAt: now,
     });
 
-    if (isCandidateRender) {
-      worker
-        .renderCandidate(effectiveWsId, sourceVideoId, candidateId, startTime, endTime, jobId)
-        .catch((err) => {
-          console.error(`[handleStartProcessing] Candidate worker exception for job ${jobId}:`, err);
-        });
-    } else {
-      worker.processSource(effectiveWsId, sourceVideoId, jobId).catch((err) => {
-        console.error(`[handleStartProcessing] Pipeline worker exception for job ${jobId}:`, err);
-      });
-    }
+    worker.processSource(effectiveWsId, sourceVideoId, jobId).catch((err: any) => {
+      console.error(`[handleStartProcessing] Pipeline worker exception for job ${jobId}:`, err);
+    });
 
     return res.status(202).json({
       success: true,
       jobId,
       status: 'queued',
-      message: isCandidateRender ? 'Candidate render job started.' : 'Video processing job started.',
+      message: 'Video processing job started via Piped + Hugging Face worker.',
     });
   } catch (err: any) {
     console.error('[handleStartProcessing] Error starting processing:', err);
@@ -146,7 +136,6 @@ export async function handleCancelJob(req: Request, res: Response) {
       return res.status(400).json({ success: false, message: 'jobId is required.' });
     }
 
-    // Signal active worker instance to abort
     worker.cancelJob(jobId);
 
     const jobRef = doc(db, 'workspaces', effectiveWsId, 'jobs', jobId);
@@ -158,14 +147,13 @@ export async function handleCancelJob(req: Request, res: Response) {
     await updateDoc(jobRef, {
       status: 'cancelled',
       stage: 'failed',
-      error: 'Job cancelled by user request.',
+      error: 'Job cancelled by user.',
       updatedAt: new Date().toISOString(),
-      completedAt: new Date().toISOString(),
     });
 
-    return res.json({ success: true, message: `Job ${jobId} successfully cancelled.` });
+    return res.json({ success: true, status: 'cancelled', message: `Job ${jobId} cancelled.` });
   } catch (err: any) {
-    console.error('[handleCancelJob] Error cancelling job:', err);
+    console.error('[handleCancelJob] Error:', err);
     return res.status(500).json({ success: false, message: err.message || 'Failed to cancel job.' });
   }
 }
@@ -182,17 +170,12 @@ export async function handleRetryJob(req: Request, res: Response) {
 
     const jobRef = doc(db, 'workspaces', effectiveWsId, 'jobs', jobId);
     const jobSnap = await getDoc(jobRef);
-
     if (!jobSnap.exists()) {
       return res.status(404).json({ success: false, message: `Job '${jobId}' not found.` });
     }
 
     const jobData = jobSnap.data();
     const sourceVideoId = jobData.sourceVideoId;
-
-    if (!sourceVideoId) {
-      return res.status(400).json({ success: false, message: 'Job does not contain sourceVideoId to retry.' });
-    }
 
     await updateDoc(jobRef, {
       status: 'queued',
@@ -203,24 +186,9 @@ export async function handleRetryJob(req: Request, res: Response) {
       updatedAt: new Date().toISOString(),
     });
 
-    if (jobData.type === 'candidate_render' && jobData.candidateId) {
-      worker
-        .renderCandidate(
-          effectiveWsId,
-          sourceVideoId,
-          jobData.candidateId,
-          jobData.startTime,
-          jobData.endTime,
-          jobId
-        )
-        .catch((err) => {
-          console.error(`[handleRetryJob] Candidate retry error for job ${jobId}:`, err);
-        });
-    } else {
-      worker.processSource(effectiveWsId, sourceVideoId, jobId).catch((err) => {
-        console.error(`[handleRetryJob] Source processing retry error for job ${jobId}:`, err);
-      });
-    }
+    worker.processSource(effectiveWsId, sourceVideoId, jobId).catch((err: any) => {
+      console.error(`[handleRetryJob] Source processing retry error for job ${jobId}:`, err);
+    });
 
     return res.json({
       success: true,
