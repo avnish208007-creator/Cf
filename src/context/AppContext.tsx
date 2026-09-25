@@ -484,7 +484,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const cand = candidates.find((c) => c.id === candidateId);
     if (!cand) return;
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    await analyzeSource(cand.sourceVideoId);
+    await selectCandidate(candidateId);
+    await fetchClips(wsId);
+    showToast('Clip generated from candidate moment!', 'success');
+    navigate('clips');
   };
 
   const batchApproveAndRenderClips = async (minScoreThreshold = workspace.minCandidateScore) => {

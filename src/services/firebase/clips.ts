@@ -7,7 +7,8 @@ import {
   query,
   orderBy,
 } from 'firebase/firestore';
-import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { db, storage, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
+import { ref, deleteObject } from 'firebase/storage';
 import { Clip } from '../../types';
 
 export const FirebaseClipsService = {
@@ -75,6 +76,15 @@ export const FirebaseClipsService = {
 
   async deleteClip(clipId: string, workspaceId: string = DEFAULT_WORKSPACE_ID): Promise<boolean> {
     try {
+      try {
+        const videoRef = ref(storage, `workspaces/${workspaceId}/clips/${clipId}/video.mp4`);
+        await deleteObject(videoRef);
+      } catch {}
+      try {
+        const thumbRef = ref(storage, `workspaces/${workspaceId}/clips/${clipId}/thumbnail.jpg`);
+        await deleteObject(thumbRef);
+      } catch {}
+
       const docRef = doc(db, 'workspaces', workspaceId, 'clips', clipId);
       await deleteDoc(docRef);
       return true;

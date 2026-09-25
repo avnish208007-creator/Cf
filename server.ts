@@ -2,17 +2,16 @@ import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { handleDiscoveryRequest } from './src/server/discovery/handler';
 import { handleSourcesRequest } from './src/server/discovery/sourcesHandler';
-import { handleCandidatesRequest } from './src/server/moment-detection/candidatesHandler';
-import { handleCandidateSelectRequest } from './src/server/moment-detection/selectHandler';
-import { handleClipsRequest } from './src/server/rendering/clipsHandler';
 import {
   handleStartProcessing,
   handleGetJobStatus,
   handleCancelJob,
 } from './src/server/processing/processingHandler';
+import { resolveYtDlp, resolveFfmpeg, resolveFfprobe } from './src/server/utils/binaries';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,21 +46,36 @@ async function startServer() {
   // Sources endpoints
   app.get('/api/sources', handleSourcesRequest);
 
-  // Candidates endpoints
-  app.get('/api/candidates', handleCandidatesRequest);
-  app.post('/api/candidates/select', handleCandidateSelectRequest);
-
-  // Clips endpoints
-  app.get('/api/clips', handleClipsRequest);
-
   // Processing pipeline endpoints
   app.post('/api/processing/start', handleStartProcessing);
   app.get('/api/processing/jobs/:jobId', handleGetJobStatus);
   app.post('/api/processing/cancel/:jobId', handleCancelJob);
 
-  // Health check endpoint
+  // Health check endpoint (Problem 23)
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', service: 'clipflow-processing' });
+    const ytDlpPath = resolveYtDlp();
+    const ffmpegPath = resolveFfmpeg();
+    const ffprobePath = resolveFfprobe();
+
+    const ytDlpExists = ytDlpPath === 'yt-dlp' || fs.existsSync(ytDlpPath);
+    const ffmpegExists = ffmpegPath === 'ffmpeg' || fs.existsSync(ffmpegPath);
+    const ffprobeExists = ffprobePath === 'ffprobe' || fs.existsSync(ffprobePath);
+    const geminiKeySet = Boolean(process.env.GEMINI_API_KEY);
+
+    res.json({
+      status: 'ok',
+      service: 'clipflow-processing',
+      firebase: true,
+      discovery: true,
+      processing: {
+        ytDlp: ytDlpExists,
+        ffmpeg: ffmpegExists,
+        ffprobe: ffprobeExists,
+        whisper: true,
+        gemini: geminiKeySet,
+        storage: true,
+      },
+    });
   });
 
   const isProduction = process.env.NODE_ENV === 'production';
@@ -93,4 +107,5 @@ startServer().catch((err) => {
   console.error('Fatal error starting ClipFlow server:', err);
   process.exit(1);
 });
+
 

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { db, DEFAULT_WORKSPACE_ID } from '../../lib/firebase';
-import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, collection, getDocs, query, where } from 'firebase/firestore';
 import { PipelineWorker } from './pipelineWorker';
 import crypto from 'crypto';
 
@@ -28,6 +28,24 @@ export async function handleStartProcessing(req: Request, res: Response) {
         error: 'SOURCE_NOT_FOUND',
         message: 'Source video not found in database.',
       });
+    }
+
+    // PROBLEM 14: No duplicate processing protection
+    try {
+      const jobsRef = collection(db, 'workspaces', effectiveWsId, 'jobs');
+      const q = query(jobsRef, where('sourceVideoId', '==', sourceVideoId));
+      const existingSnap = await getDocs(q);
+      const activeJob = existingSnap.docs.map(d => d.data()).find((j: any) => j.status === 'queued' || j.status === 'processing');
+      if (activeJob) {
+        return res.status(200).json({
+          success: true,
+          jobId: activeJob.id,
+          status: activeJob.status,
+          message: 'A processing job is already active for this source video.',
+        });
+      }
+    } catch (dupErr) {
+      console.warn('[handleStartProcessing] Duplicate check warning:', dupErr);
     }
 
     const jobId = 'job_' + crypto.randomUUID();
@@ -66,6 +84,7 @@ export async function handleStartProcessing(req: Request, res: Response) {
     });
   }
 }
+
 
 export async function handleGetJobStatus(req: Request, res: Response) {
   try {
