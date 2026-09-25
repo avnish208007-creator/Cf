@@ -11,8 +11,6 @@ import {
   ActivityItem,
 } from '../types';
 import { DiscoveryService } from '../services/discoveryService';
-import { MomentDetectionService } from '../services/momentDetectionService';
-import { ClientRenderService } from '../services/renderService';
 import {
   INITIAL_USER,
   INITIAL_WORKSPACE,
@@ -361,21 +359,51 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSources((prev) => prev.map((s) => (s.id === sourceId ? { ...s, status: 'processing' } : s)));
 
     try {
-      const res = await MomentDetectionService.analyze({
-        workspaceId: wsId,
-        sourceId,
-        niche: workspace.mainNiche,
-        subtopics: workspace.subtopics,
+      const response = await fetch('/api/processing/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: wsId, sourceVideoId: sourceId }),
       });
 
-      await Promise.all([fetchSources(wsId), fetchCandidates(wsId)]);
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || 'Failed to start video processing');
+      }
 
-      const found = res.results?.[0]?.candidatesFound || 0;
-      showToast(`Analyzed! Found ${found} moments`, 'success');
+      showToast('Video processing started! Downloading & cutting shorts...', 'info');
+
+      const jobId = data.jobId;
+      if (jobId) {
+        const pollInterval = setInterval(async () => {
+          try {
+            const jobRes = await fetch(`/api/processing/jobs/${jobId}?workspaceId=${wsId}`);
+            const jobData = await jobRes.json();
+            if (jobData.success && jobData.job) {
+              const job = jobData.job;
+              if (job.status === 'completed') {
+                clearInterval(pollInterval);
+                await Promise.all([fetchSources(wsId), fetchCandidates(wsId), fetchClips(wsId)]);
+                setIsAnalyzing(false);
+                showToast('Video processed successfully! Rendered MP4 clips ready.', 'success');
+              } else if (job.status === 'failed') {
+                clearInterval(pollInterval);
+                setIsAnalyzing(false);
+                showToast(`Processing failed: ${job.error || 'Unknown error'}`, 'error');
+                await fetchSources(wsId);
+              }
+            }
+          } catch (pollErr) {
+            console.error('Polling error:', pollErr);
+          }
+        }, 4000);
+      } else {
+        setIsAnalyzing(false);
+        await Promise.all([fetchSources(wsId), fetchCandidates(wsId), fetchClips(wsId)]);
+      }
     } catch (err: any) {
-      showToast(err.message || 'Moment analysis failed', 'error');
-    } finally {
+      showToast(err.message || 'Video processing failed', 'error');
       setIsAnalyzing(false);
+      await fetchSources(wsId);
     }
   };
 
@@ -387,21 +415,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
-    setIsAnalyzing(true);
-    try {
-      const res = await MomentDetectionService.analyze({
-        workspaceId: wsId,
-        sourceIds: unanalyzed.map((s) => s.id),
-        niche: workspace.mainNiche,
-        subtopics: workspace.subtopics,
-      });
-
-      await Promise.all([fetchSources(wsId), fetchCandidates(wsId)]);
-      showToast(`Batch analysis complete: ${res.candidatesCount || 0} moments found`, 'success');
-    } catch (err: any) {
-      showToast(err.message || 'Batch analysis failed', 'error');
-    } finally {
-      setIsAnalyzing(false);
+    for (const s of unanalyzed) {
+      await analyzeSource(s.id);
     }
   };
 
@@ -443,7 +458,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCandidates((prev) =>
       prev.map((c) => (c.id === candidateId ? { ...c, status: 'approved', selectionStatus: 'selected' } : c))
     );
-    showToast('Candidate selected for clip generation', 'success');
+    showToast('Candidate selected', 'success');
   };
 
   const approveCandidate = (candidateId: string) => {
@@ -468,22 +483,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const generateClipFromCandidate = async (candidateId: string) => {
     const cand = candidates.find((c) => c.id === candidateId);
     if (!cand) return;
-
     const wsId = currentWorkspaceId || DEFAULT_WORKSPACE_ID;
-    showToast(`Queued render for "${cand.hook.slice(0, 30)}..."`, 'info');
-
-    try {
-      const res = await ClientRenderService.renderClip({ candidateId, workspaceId: wsId });
-      if (res.success) {
-        await fetchClips(wsId);
-        await fetchCandidates(wsId);
-        showToast('Vertical clip rendered successfully!', 'success');
-      } else {
-        showToast(res.message || 'Clip rendering failed', 'error');
-      }
-    } catch (err: any) {
-      showToast(err.message || 'Render request error', 'error');
-    }
+    await analyzeSource(cand.sourceVideoId);
   };
 
   const batchApproveAndRenderClips = async (minScoreThreshold = workspace.minCandidateScore) => {

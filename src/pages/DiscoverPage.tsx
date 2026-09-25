@@ -45,6 +45,7 @@ export const DiscoverPage: React.FC = () => {
   const [showBulkConfirm, setShowBulkConfirm] = useState(false);
   const [showAddUrlModal, setShowAddUrlModal] = useState(false);
   const [detailVideo, setDetailVideo] = useState<SourceVideo | null>(null);
+  const [processTargetVideo, setProcessTargetVideo] = useState<SourceVideo | null>(null);
 
   // Filtered sources
   const filteredSources = useMemo(() => {
@@ -305,11 +306,11 @@ export const DiscoverPage: React.FC = () => {
                       {video.status !== 'analyzed' && (
                         <button
                           type="button"
-                          onClick={() => analyzeSource(video.id)}
+                          onClick={() => setProcessTargetVideo(video)}
                           className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-xs font-medium transition-colors shadow-2xs flex items-center gap-1 cursor-pointer"
                         >
                           <Sparkles className="w-3 h-3" />
-                          <span>Analyze</span>
+                          <span>Process video</span>
                         </button>
                       )}
 
@@ -396,6 +397,22 @@ export const DiscoverPage: React.FC = () => {
         isDestructive={true}
         onConfirm={handleConfirmBulkDelete}
         onCancel={() => setShowBulkConfirm(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(processTargetVideo)}
+        title="Process this video?"
+        description="Only process videos you own or have permission to use."
+        confirmLabel="Process video"
+        cancelLabel="Cancel"
+        isDestructive={false}
+        onConfirm={() => {
+          if (processTargetVideo) {
+            analyzeSource(processTargetVideo.id);
+            setProcessTargetVideo(null);
+          }
+        }}
+        onCancel={() => setProcessTargetVideo(null)}
       />
 
       <AddUrlModal
