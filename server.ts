@@ -12,7 +12,11 @@ import {
   handleCancelJob,
   handleRetryJob,
 } from './src/server/processing/processingHandler';
-import { resolveYtDlp, resolveFfmpeg, resolveFfprobe } from './src/server/utils/binaries';
+import {
+  resolveFfmpeg,
+  resolveFfprobe,
+  verifyYouTubeRuntime,
+} from './src/server/utils/binaries';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,14 +59,14 @@ async function startServer() {
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {
-    const ytDlpPath = resolveYtDlp();
+    const ytRuntime = verifyYouTubeRuntime();
     const ffmpegPath = resolveFfmpeg();
     const ffprobePath = resolveFfprobe();
 
-    const ytDlpExists = ytDlpPath === 'yt-dlp' || fs.existsSync(ytDlpPath);
     const ffmpegExists = ffmpegPath === 'ffmpeg' || fs.existsSync(ffmpegPath);
     const ffprobeExists = ffprobePath === 'ffprobe' || fs.existsSync(ffprobePath);
     const geminiKeySet = Boolean(process.env.GEMINI_API_KEY);
+    const youtubeExtractionReady = ytRuntime.ready && Boolean(ytRuntime.denoPath || ytRuntime.nodePath);
 
     res.json({
       status: 'ok',
@@ -70,12 +74,23 @@ async function startServer() {
       firebase: true,
       discovery: true,
       processing: {
-        ytDlp: ytDlpExists,
+        ytDlp: ytRuntime.ytDlpExists,
+        python: Boolean(ytRuntime.pythonPath),
+        deno: Boolean(ytRuntime.denoPath),
+        node: Boolean(ytRuntime.nodePath),
+        youtubeExtractionReady,
         ffmpeg: ffmpegExists,
         ffprobe: ffprobeExists,
         transcription: true,
         gemini: geminiKeySet,
         storage: true,
+      },
+      diagnostics: {
+        ytDlpPath: ytRuntime.ytDlpPath,
+        denoPath: ytRuntime.denoPath,
+        nodePath: ytRuntime.nodePath,
+        pythonVersion: ytRuntime.pythonVersion,
+        runtimeError: ytRuntime.error || null,
       },
     });
   });

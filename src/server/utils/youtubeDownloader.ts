@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { resolveYtDlp, resolveFfprobe } from './binaries';
+import { resolveYtDlp, resolveFfprobe, verifyYouTubeRuntime } from './binaries';
 
 const execFileAsync = promisify(execFile);
 
@@ -24,29 +24,85 @@ export async function downloadYouTubeSource(
   outputDir: string,
   filePrefix: string
 ): Promise<DownloadedMediaInfo> {
+  // 1. Verify YouTube execution environment and JS runtime
+  const runtimeStatus = verifyYouTubeRuntime();
+  if (!runtimeStatus.ready) {
+    throw new Error(
+      `[YOUTUBE_RUNTIME_NOT_READY] ${runtimeStatus.error || 'YouTube downloader runtime is not properly configured.'}`
+    );
+  }
+
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
   const destPath = path.resolve(outputDir, `${filePrefix}_source.mp4`);
-  const ytDlpExecutable = resolveYtDlp();
+  const ytDlpExecutable = runtimeStatus.ytDlpPath || resolveYtDlp();
 
-  console.log(`[YouTubeDownloader] Downloading source video from "${youtubeUrl}" to "${destPath}" using ${ytDlpExecutable}...`);
+  console.log(
+    `[YouTubeDownloader] Downloading source video from "${youtubeUrl}" to "${destPath}" using ${ytDlpExecutable}...`
+  );
 
-  const ytDlpArgs = [
+  const ytDlpArgs: string[] = [
     '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
     '--no-playlist',
     '--merge-output-format', 'mp4',
-    '-o', destPath,
-    youtubeUrl,
+    '--extractor-args', 'youtube:player_client=ios,android,web',
   ];
 
+  // Utilize runtime diagnostics for deno and python via --js-runtime / --js-runtimes
+  if (runtimeStatus.denoPath) {
+    ytDlpArgs.push('--js-runtime', `deno:${runtimeStatus.denoPath}`);
+    ytDlpArgs.push('--js-runtimes', `deno:${runtimeStatus.denoPath}`);
+  }
+  if (runtimeStatus.jsRuntimeArg && !runtimeStatus.denoPath) {
+    ytDlpArgs.push('--js-runtime', runtimeStatus.jsRuntimeArg);
+    ytDlpArgs.push('--js-runtimes', runtimeStatus.jsRuntimeArg);
+  }
+
+  const cookiesEnv = process.env.YT_COOKIES;
+  const cookiesFile = path.resolve(process.cwd(), 'bin', 'cookies.txt');
+  let cookiesPath: string | null = null;
+  let tmpCookiesPath: string | null = null;
+
+  if (cookiesEnv) {
+    tmpCookiesPath = path.resolve(outputDir, `${filePrefix}_cookies.txt`);
+    fs.writeFileSync(tmpCookiesPath, cookiesEnv, 'utf8');
+    cookiesPath = tmpCookiesPath;
+  } else if (fs.existsSync(cookiesFile)) {
+    cookiesPath = cookiesFile;
+  }
+
+  if (cookiesPath) {
+    ytDlpArgs.push('--cookies', cookiesPath);
+  }
+
+  ytDlpArgs.push('-o', destPath, youtubeUrl);
+
+  const binDir = path.resolve(process.cwd(), 'bin');
+  const pythonBinDir = runtimeStatus.pythonPath ? path.dirname(runtimeStatus.pythonPath) : '';
+  const customEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${binDir}:${pythonBinDir ? pythonBinDir + ':' : ''}${process.env.PATH || ''}`,
+    PYTHON: runtimeStatus.pythonPath || process.env.PYTHON || 'python3',
+  };
+
   try {
-    await execFileAsync(ytDlpExecutable, ytDlpArgs, { timeout: 180000 });
+    await execFileAsync(ytDlpExecutable, ytDlpArgs, {
+      timeout: 180000,
+      env: customEnv,
+    });
   } catch (dlErr: any) {
-    const errorMsg = dlErr?.stderr || dlErr?.message || 'yt-dlp execution failed';
-    console.error('[YouTubeDownloader] Download error:', errorMsg);
-    throw new Error(`YouTube download failed: ${errorMsg.slice(0, 300)}`);
+    const stderrMsg = dlErr?.stderr?.toString() || '';
+    const errorMsg = stderrMsg || dlErr?.message || 'yt-dlp execution failed';
+    console.error('[YouTubeDownloader] Real download error:', errorMsg);
+
+    // Provide clear error message without hiding stderr
+    throw new Error(`YouTube download failed: ${errorMsg.trim()}`);
+  } finally {
+    if (tmpCookiesPath && fs.existsSync(tmpCookiesPath)) {
+      try { fs.unlinkSync(tmpCookiesPath); } catch {}
+    }
   }
 
   if (!fs.existsSync(destPath) || fs.statSync(destPath).size < 1000) {
