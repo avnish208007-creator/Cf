@@ -4,7 +4,9 @@ import { DiscoveredVideo, DiscoveryQueryContext, IDiscoveryProvider } from './ty
 /**
  * RSS Discovery Provider for YouTube Channel Feeds
  * Fetches https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID
- * Extracts real video entries, IDs, titles, and timestamps without requiring an API key.
+ * Extracts real video entries, IDs, titles, publication timestamps, and thumbnails.
+ * Does not fabricate duration, view counts, or relevance scores.
+ * Only returns videos when the channel matches the niche.
  */
 export class RssDiscoveryProvider implements IDiscoveryProvider {
   public readonly name = 'rss-channel-feed';
@@ -14,7 +16,11 @@ export class RssDiscoveryProvider implements IDiscoveryProvider {
   }
 
   public async search(context: DiscoveryQueryContext & { channelIds?: string[] }): Promise<DiscoveredVideo[]> {
-    const channelIds = context.channelIds || this.getDefaultChannelIdsForNiche(context.niche);
+    const channelIds = context.channelIds || this.getChannelIdsForNiche(context.niche);
+    if (!channelIds || channelIds.length === 0) {
+      return []; // Return empty if niche has no mapped channels, avoiding cross-contamination
+    }
+
     const discoveredVideos: DiscoveredVideo[] = [];
 
     for (const channelId of channelIds) {
@@ -30,15 +36,15 @@ export class RssDiscoveryProvider implements IDiscoveryProvider {
             id: entry.videoId,
             title: entry.title || 'YouTube Creator Video',
             channelTitle: entry.channelTitle || 'YouTube Creator',
-            duration: '10:00',
-            durationSeconds: 600,
-            viewCount: 10000,
+            duration: '',
+            durationSeconds: 0,
+            viewCount: 0,
             publishedAt: entry.published || 'Recently Published',
             youtubeUrl: `https://www.youtube.com/watch?v=${entry.videoId}`,
             summary: `Latest video feed release from channel ${entry.channelTitle || channelId}.`,
             description: `RSS feed discovered release for ${entry.title}`,
             niche: context.niche,
-            relevanceScore: 88,
+            relevanceScore: 0,
             thumbnailUrl: `https://i.ytimg.com/vi/${entry.videoId}/hqdefault.jpg`,
             thumbnailGradient: 'from-slate-900 via-indigo-950 to-slate-900',
             isSyntheticData: false,
@@ -54,20 +60,29 @@ export class RssDiscoveryProvider implements IDiscoveryProvider {
     return discoveredVideos;
   }
 
-  private getDefaultChannelIdsForNiche(niche: string): string[] {
+  private getChannelIdsForNiche(niche: string): string[] {
     const n = (niche || '').toLowerCase();
-    if (n.includes('ai') || n.includes('tech') || n.includes('coding')) {
+    if (n.includes('ai') || n.includes('tech') || n.includes('coding') || n.includes('software') || n.includes('developer')) {
       return [
         'UCWOA1ZGywLbqmigxE4Qlvuw', // Two Minute Papers
         'UCWN3xxRkmTPmbKwht9FuEKA', // Fireship
         'UCvjgXvBlbQiydffZU7m1_aw', // Lex Fridman
       ];
     }
-    // Default popular creator channels
-    return [
-      'UCWN3xxRkmTPmbKwht9FuEKA', // Fireship
-      'UCvjgXvBlbQiydffZU7m1_aw', // Lex Fridman
-    ];
+    if (n.includes('fitness') || n.includes('gym') || n.includes('workout') || n.includes('health') || n.includes('bodybuilding')) {
+      return [
+        'UCqjwF8rxRsihXgqKxlq1M1g', // Athlean-X
+        'UC7sDT8jZt6VLVYZI_wG6N6Q', // Jeff Nippard
+      ];
+    }
+    if (n.includes('finance') || n.includes('money') || n.includes('crypto') || n.includes('investing') || n.includes('stocks')) {
+      return [
+        'UCCJQpAc3vuqWpA9pB_H9Qdw', // Graham Stephan
+        'UCGyET_adtNNn1A3P03q54_w', // Meet Kevin
+      ];
+    }
+    // Unrelated or unspecified niche returns empty array (no fabricated cross-niche feeds)
+    return [];
   }
 
   private fetchUrl(url: string): Promise<string> {
