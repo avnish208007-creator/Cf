@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 
 export const VideoTestPage: React.FC = () => {
-  const testUrl = 'https://qrmigdcylrbqinaofcqo.supabase.co/storage/v1/object/public/clips/a0000000-0000-4000-a000-000000000001/clip_9e37e864-4ff_1790174509898.mp4';
+  const testUrl = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4';
   
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [diag, setDiag] = useState({

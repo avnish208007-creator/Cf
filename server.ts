@@ -36,6 +36,13 @@ async function startServer() {
     next();
   });
 
+  // Serve processed uploads statically
+  const uploadsDir = path.resolve(process.cwd(), 'uploads');
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  app.use('/uploads', express.static(uploadsDir));
+
   // Discovery server endpoints
   app.options('/api/discover', (req, res) => res.sendStatus(204));
   app.post('/api/discover', handleDiscoveryRequest);
