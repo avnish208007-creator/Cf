@@ -1,5 +1,5 @@
 /**
- * Test script for Piped Resolver
+ * Test script for Multi-Provider Resolver (Piped + Invidious)
  * Usage: node worker/testPipedResolver.js <videoId>
  * Example: node worker/testPipedResolver.js KSOxkhWs2Ic
  */
@@ -9,11 +9,12 @@ async function main() {
   const args = process.argv.slice(2);
   const videoId = args[0] || 'KSOxkhWs2Ic';
 
-  console.log(`[testPipedResolver] Testing Piped stream resolution for video ID: ${videoId}...`);
+  console.log(`[testPipedResolver] Testing multi-provider stream resolution for video ID: ${videoId}...`);
 
   try {
     const result = await resolveStream(videoId);
     console.log('\n================ RESOLUTION SUCCESS ================');
+    console.log('Provider:       ', result.provider);
     console.log('Video ID:       ', result.sourceVideoId);
     console.log('Title:          ', result.title);
     console.log('Instance Used:  ', result.instanceUsed);
