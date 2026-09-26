@@ -5,7 +5,7 @@ export interface PipedStreamResult {
   sourceUrl: string;
   videoStreamUrl: string | null;
   audioStreamUrl: string | null;
-  combinedStreamUrl: string | null;
+  combinedUrl: string | null;
   durationSeconds: number;
   title: string;
   thumbnailUrl: string;
@@ -17,147 +17,243 @@ export interface PipedInstanceHealth {
   consecutiveFailures: number;
   lastChecked: number;
   isHealthy: boolean;
+  latencyMs: number;
 }
 
-const DEFAULT_PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
+const EMERGENCY_FALLBACK_INSTANCES = [
+  'https://pipedapi.ducks.party',
+  'https://pipedapi.mha.fi',
+  'https://pipedapi.palvelu.org',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.colossal.systems',
+  'https://pipedapi.us.projectsegfau.lt',
   'https://pipedapi.in.projectsegfau.lt',
   'https://pipedapi.privacy.com.de',
   'https://api.piped.privacydev.net',
-  'https://pipedapi.ducks.party',
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.rht.bz',
+  'https://pipedapi.lunar.icu',
+  'https://pipedapi.projectsegfau.lt',
+  'https://pipedapi.nosearch.org',
+  'https://api.piped.yt',
+  'https://pipedapi.smnz.de',
+  'https://piped-api.garudalinux.org',
+  'https://pipedapi.drgns.space',
+  'https://pipedapi.freetube.video',
+  'https://pipedapi.sync.bz',
+  'https://pipedapi.darkness.services',
 ];
 
-const INSTANCE_SOURCES = [
+const DYNAMIC_DISCOVERY_SOURCES = [
   'https://piped-instances.kavin.rocks/',
   'https://raw.githubusercontent.com/TeamPiped/Piped-Frontend/main/src/assets/instances.json',
+  'https://raw.githubusercontent.com/fediverse/piped-instances/main/instances.json',
 ];
 
-class PipedInstanceManager {
-  private instances: string[] = [];
+export class PipedInstanceManager {
+  private candidatePool: string[] = [];
+  private validatedHealthyInstances: string[] = [];
   private healthMap: Map<string, PipedInstanceHealth> = new Map();
-  private lastRefreshTime: number = 0;
-  private refreshIntervalMs: number = 3600000; // 1 hour
-  private discoveryPromise: Promise<string[]> | null = null;
+  private lastValidationTime: number = 0;
+  private validationIntervalMs: number = 900000; // 15 minutes
 
   constructor() {
-    this.instances = [...DEFAULT_PIPED_INSTANCES];
+    this.candidatePool = [...EMERGENCY_FALLBACK_INSTANCES];
   }
 
-  public async getHealthyInstances(forceRefresh = false): Promise<string[]> {
-    const now = Date.now();
-    if (forceRefresh || this.instances.length === 0 || now - this.lastRefreshTime > this.refreshIntervalMs) {
-      await this.discoverInstances();
+  /**
+   * Normalizes and cleans an instance URL.
+   */
+  public normalizeUrl(rawUrl: string): string | null {
+    if (!rawUrl || typeof rawUrl !== 'string') return null;
+    let trimmed = rawUrl.trim();
+    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+      return null;
     }
-
-    // Sort instances: healthy first, fewest consecutive failures first
-    const sorted = [...this.instances].sort((a, b) => {
-      const ha = this.healthMap.get(a);
-      const hb = this.healthMap.get(b);
-      const fa = ha?.consecutiveFailures || 0;
-      const fb = hb?.consecutiveFailures || 0;
-      return fa - fb;
-    });
-
-    return sorted;
+    trimmed = trimmed.replace(/\/+$/, '');
+    if (trimmed.endsWith('/watch') || trimmed.endsWith('/channel')) {
+      return null;
+    }
+    return trimmed;
   }
 
-  private async discoverInstances(): Promise<string[]> {
-    if (this.discoveryPromise) {
-      return this.discoveryPromise;
+  /**
+   * Dynamically discovers candidate Piped API instance URLs.
+   */
+  public async discoverCandidates(): Promise<string[]> {
+    console.log('[PipedManager] Discovering current Piped instances...');
+    const discovered = new Set<string>();
+
+    if (process.env.PIPED_INSTANCES) {
+      process.env.PIPED_INSTANCES.split(',').forEach((s) => {
+        const norm = this.normalizeUrl(s);
+        if (norm) discovered.add(norm);
+      });
     }
 
-    this.discoveryPromise = (async () => {
-      const discovered = new Set<string>();
-
-      // Add environment instances first if configured
-      if (process.env.PIPED_INSTANCES) {
-        process.env.PIPED_INSTANCES.split(',').forEach((s) => {
-          const trimmed = s.trim().replace(/\/$/, '');
-          if (trimmed) discovered.add(trimmed);
+    for (const source of DYNAMIC_DISCOVERY_SOURCES) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4000);
+        const res = await fetch(source, {
+          headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+          signal: controller.signal as any,
         });
-      }
+        clearTimeout(timeout);
 
-      // Try fetching from public instance sources
-      for (const source of INSTANCE_SOURCES) {
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 5000);
-          const res = await fetch(source, {
-            headers: { 'User-Agent': 'ClipFlow/1.0' },
-            signal: controller.signal as any,
-          });
-          clearTimeout(timeout);
-
-          if (res.ok) {
+        if (res.ok) {
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('json')) {
             const data: any = await res.json();
-            // Handle different json schemas (array of objects or array of strings)
             const list = Array.isArray(data) ? data : data.instances || data.api_servers || [];
             for (const item of list) {
-              const url = typeof item === 'string' ? item : item.api_url || item.url || item.name;
-              if (url && typeof url === 'string') {
-                const normalized = url.trim().replace(/\/$/, '');
-                if (normalized.startsWith('http')) {
-                  discovered.add(normalized);
+              const url = typeof item === 'string' ? item : item.api_url || item.apiUrl || item.url || item.name;
+              const norm = this.normalizeUrl(url);
+              if (norm) {
+                if (typeof item === 'object' && item !== null && item.up === false) {
+                  continue;
                 }
+                discovered.add(norm);
               }
             }
           }
-        } catch (err) {
-          console.warn(`[PipedManager] Failed to fetch instances from source ${source}:`, err);
         }
+      } catch {
+        // Skip unavailable discovery endpoint
       }
+    }
 
-      // Fall back to defaults if nothing discovered
-      for (const def of DEFAULT_PIPED_INSTANCES) {
-        discovered.add(def);
-      }
+    for (const fallback of EMERGENCY_FALLBACK_INSTANCES) {
+      const norm = this.normalizeUrl(fallback);
+      if (norm) discovered.add(norm);
+    }
 
-      const list = Array.from(discovered);
-      if (list.length > 0) {
-        this.instances = list;
-        this.lastRefreshTime = Date.now();
-        console.log(`[PipedManager] Successfully refreshed Piped instances pool. Total: ${list.length}`);
-      }
-
-      this.discoveryPromise = null;
-      return this.instances;
-    })();
-
-    return this.discoveryPromise;
+    this.candidatePool = Array.from(discovered);
+    console.log(`[PipedManager] Discovered ${this.candidatePool.length} candidate Piped instances.`);
+    return this.candidatePool;
   }
 
-  public recordFailure(instanceUrl: string) {
+  /**
+   * Performs lightweight validation against candidate instance.
+   * Tests /trending?region=US with a 4-second timeout.
+   */
+  public async validateInstance(baseUrl: string): Promise<boolean> {
+    const start = Date.now();
+    const testEndpoint = `${baseUrl}/trending?region=US`;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(testEndpoint, {
+        headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+        signal: controller.signal as any,
+      });
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        this.recordFailure(baseUrl, `HTTP ${res.status}`);
+        return false;
+      }
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('json')) {
+        this.recordFailure(baseUrl, `Non-JSON response (${contentType})`);
+        return false;
+      }
+
+      const text = await res.text();
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        this.recordFailure(baseUrl, 'Invalid JSON body');
+        return false;
+      }
+
+      if (!Array.isArray(data) || data.length === 0 || !data[0]?.title) {
+        this.recordFailure(baseUrl, 'JSON response missing stream array');
+        return false;
+      }
+
+      const latencyMs = Date.now() - start;
+      this.recordSuccess(baseUrl, latencyMs);
+      return true;
+    } catch (err: any) {
+      this.recordFailure(baseUrl, err.message || 'Network/timeout error');
+      return false;
+    }
+  }
+
+  /**
+   * Validates all candidates concurrently and returns sorted healthy instances.
+   */
+  public async getValidatedHealthyInstances(forceRefresh = false): Promise<string[]> {
+    const now = Date.now();
+    if (
+      forceRefresh ||
+      this.validatedHealthyInstances.length === 0 ||
+      now - this.lastValidationTime > this.validationIntervalMs
+    ) {
+      await this.discoverCandidates();
+      console.log(`[PipedManager] Validating ${this.candidatePool.length} candidate instances...`);
+
+      const results = await Promise.all(
+        this.candidatePool.map(async (candidate) => {
+          const isValid = await this.validateInstance(candidate);
+          return { candidate, isValid };
+        })
+      );
+
+      this.validatedHealthyInstances = results
+        .filter((r) => r.isValid)
+        .map((r) => r.candidate)
+        .sort((a, b) => {
+          const ha = this.healthMap.get(a);
+          const hb = this.healthMap.get(b);
+          const fa = ha?.consecutiveFailures || 0;
+          const fb = hb?.consecutiveFailures || 0;
+          if (fa !== fb) return fa - fb;
+          return (ha?.latencyMs || 9999) - (hb?.latencyMs || 9999);
+        });
+
+      this.lastValidationTime = Date.now();
+      console.log(
+        `[PipedManager] ${this.validatedHealthyInstances.length}/${this.candidatePool.length} instances passed validation.`
+      );
+    }
+
+    return [...this.validatedHealthyInstances];
+  }
+
+  public recordFailure(instanceUrl: string, reason?: string) {
     const current = this.healthMap.get(instanceUrl) || {
       url: instanceUrl,
       consecutiveFailures: 0,
       lastChecked: Date.now(),
       isHealthy: true,
+      latencyMs: 9999,
     };
     current.consecutiveFailures += 1;
     current.lastChecked = Date.now();
-    current.isHealthy = current.consecutiveFailures < 3;
+    current.isHealthy = false;
     this.healthMap.set(instanceUrl, current);
   }
 
-  public recordSuccess(instanceUrl: string) {
-    const current = this.healthMap.get(instanceUrl) || {
+  public recordSuccess(instanceUrl: string, latencyMs: number = 0) {
+    this.healthMap.set(instanceUrl, {
       url: instanceUrl,
       consecutiveFailures: 0,
       lastChecked: Date.now(),
       isHealthy: true,
-    };
-    current.consecutiveFailures = 0;
-    current.lastChecked = Date.now();
-    current.isHealthy = true;
-    this.healthMap.set(instanceUrl, current);
+      latencyMs,
+    });
   }
 
   public getStatus() {
     return {
-      discoveredCount: this.instances.length,
-      healthyCount: this.instances.filter((url) => this.healthMap.get(url)?.isHealthy ?? true).length,
-      lastRefreshTime: new Date(this.lastRefreshTime).toISOString(),
-      instances: this.instances,
+      discoveredCount: this.candidatePool.length,
+      healthyCount: this.validatedHealthyInstances.length,
+      lastValidationTime: new Date(this.lastValidationTime).toISOString(),
+      validatedInstances: this.validatedHealthyInstances,
     };
   }
 }
@@ -181,17 +277,24 @@ export async function resolvePipedStream(youtubeUrlOrId: string): Promise<PipedS
     throw new Error(`[PIPED_INVALID_RESPONSE] Invalid YouTube video ID extracted from "${youtubeUrlOrId}"`);
   }
 
-  let instances = await pipedInstanceManager.getHealthyInstances();
+  let healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances();
   let lastError: any = null;
   let attempts = 0;
 
   while (attempts < 2) {
-    for (const instance of instances) {
+    if (healthyInstances.length === 0) {
+      console.warn(`[PipedResolver] No validated healthy instances in pool. Force refreshing discovery...`);
+      healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances(true);
+    }
+
+    for (let i = 0; i < healthyInstances.length; i++) {
+      const instance = healthyInstances[i];
       const endpoint = `${instance}/streams/${videoId}`;
+      console.log(`[PipedResolver] Trying instance ${i + 1}/${healthyInstances.length}: ${instance} for video ${videoId}...`);
+
       try {
-        console.log(`[PipedResolver] Trying Piped instance "${instance}" for video ${videoId}...`);
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000); // 6s short timeout
+        const timeout = setTimeout(() => controller.abort(), 8000);
 
         const res = await fetch(endpoint, {
           headers: {
@@ -203,12 +306,28 @@ export async function resolvePipedStream(youtubeUrlOrId: string): Promise<PipedS
         clearTimeout(timeout);
 
         if (!res.ok) {
-          throw new Error(`HTTP status ${res.status}`);
+          throw new Error(`HTTP ${res.status}`);
         }
 
-        const data: any = await res.json();
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('json')) {
+          throw new Error(`Non-JSON content-type (${contentType})`);
+        }
+
+        const text = await res.text();
+        let data: any;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error('Invalid JSON response body');
+        }
+
+        if (data.error || data.message) {
+          throw new Error(data.error || data.message);
+        }
+
         if (!data || (!data.videoStreams && !data.url)) {
-          throw new Error(`Invalid or empty response JSON`);
+          throw new Error('Response JSON missing videoStreams or url');
         }
 
         pipedInstanceManager.recordSuccess(instance);
@@ -222,7 +341,7 @@ export async function resolvePipedStream(youtubeUrlOrId: string): Promise<PipedS
 
         let videoStreamUrl: string | null = null;
         let audioStreamUrl: string | null = null;
-        let combinedStreamUrl: string | null = null;
+        let combinedUrl: string | null = null;
 
         const bestVideo = videoStreams.find((s: any) => s.url && s.mimeType?.includes('video/mp4')) || videoStreams[0];
         if (bestVideo && bestVideo.url) {
@@ -235,53 +354,52 @@ export async function resolvePipedStream(youtubeUrlOrId: string): Promise<PipedS
         }
 
         if (data.url && typeof data.url === 'string') {
-          combinedStreamUrl = data.url;
+          combinedUrl = data.url;
         }
 
-        if (!videoStreamUrl && !combinedStreamUrl) {
-          throw new Error(`No valid video streams found in Piped response`);
+        if (!videoStreamUrl && !combinedUrl) {
+          throw new Error('No valid video or combined stream URLs found in response');
         }
 
-        console.log(`[PipedResolver] Successfully resolved stream from instance "${instance}"`);
+        console.log(`[PipedResolver] Stream resolution succeeded from instance ${instance}`);
         return {
           sourceVideoId: videoId,
           sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
           videoStreamUrl,
           audioStreamUrl,
-          combinedStreamUrl,
+          combinedUrl,
           durationSeconds,
           title,
           thumbnailUrl,
           instanceUsed: instance,
         };
       } catch (err: any) {
-        console.warn(`[PipedResolver] Instance "${instance}" failed: ${err.message}`);
-        pipedInstanceManager.recordFailure(instance);
+        console.warn(`[PipedResolver] Instance ${instance} failed: ${err.message}`);
+        pipedInstanceManager.recordFailure(instance, err.message);
         lastError = err;
       }
     }
 
-    // If first attempt across all instances failed, force refresh instance list once and retry
     if (attempts === 0) {
-      console.log(`[PipedResolver] All instances failed on first pass. Forcing instance list refresh...`);
-      instances = await pipedInstanceManager.getHealthyInstances(true);
+      console.log(`[PipedResolver] All validated instances failed on first pass. Refreshing discovery & re-validating...`);
+      healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances(true);
     }
     attempts++;
   }
 
   throw new Error(
-    `[PIPED_INSTANCE_UNAVAILABLE] All Piped instances failed for video ${videoId}. Last error: ${lastError?.message || 'Unknown error'}`
+    `[PIPED_INSTANCE_UNAVAILABLE] No healthy Piped API instance could resolve this video after discovery and retry. Last error: ${lastError?.message || 'Unknown error'}`
   );
 }
 
-export async function checkPipedHealth(): Promise<{ configured: boolean; reachable: boolean; details: string; status: any }> {
+export async function checkPipedHealth() {
   try {
     const status = pipedInstanceManager.getStatus();
     const healthy = status.healthyCount > 0;
     return {
       configured: true,
       reachable: healthy,
-      details: `${status.healthyCount}/${status.discoveredCount} Piped instances healthy`,
+      details: `${status.healthyCount}/${status.discoveredCount} Piped instances validated healthy`,
       status,
     };
   } catch (err: any) {

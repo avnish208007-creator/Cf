@@ -2,8 +2,8 @@
  * GitHub Actions Runner Worker for ClipFlow V1 (Plain JavaScript)
  * Runs inside GitHub Actions runner:
  * 1. Validates required Firebase configuration (including named Firestore database).
- * 2. Resolves stream via automatic Piped discovery & failover immediately before downloading.
- * 3. Streams media directly to disk, combining separate audio/video if necessary via FFmpeg muxing.
+ * 2. Resolves stream via dynamic Piped discovery & health check validation immediately before downloading.
+ * 3. Streams media directly to disk, re-resolving streams if URLs expire, combining separate audio/video if necessary via FFmpeg muxing.
  * 4. Verifies using FFprobe that media contains valid video AND audio streams.
  * 5. Transcribes audio with local CPU Whisper.
  * 6. Detects candidate moments from transcript timestamps.
@@ -18,6 +18,7 @@ import fetch from 'node-fetch';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, collection, addDoc } from 'firebase/firestore';
 import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { resolvePipedStream, pipedInstanceManager } from '../src/server/providers/pipedResolver.ts';
 
 // 1. STARTUP CONFIGURATION VALIDATION
 const requiredEnvVars = [
@@ -54,157 +55,6 @@ const jobId = process.env.JOB_ID;
 const sourceVideoId = process.env.VIDEO_ID || process.env.SOURCE_VIDEO_ID;
 const youtubeUrl = process.env.VIDEO_URL || process.env.YOUTUBE_URL;
 const workspaceId = process.env.WORKSPACE_ID || 'default-workspace';
-
-const DEFAULT_PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.in.projectsegfau.lt',
-  'https://pipedapi.privacy.com.de',
-  'https://api.piped.privacydev.net',
-  'https://pipedapi.ducks.party',
-];
-
-const INSTANCE_SOURCES = [
-  'https://piped-instances.kavin.rocks/',
-  'https://raw.githubusercontent.com/TeamPiped/Piped-Frontend/main/src/assets/instances.json',
-];
-
-/**
- * Worker Piped Instance Manager with Discovery & Failover
- */
-class WorkerPipedInstanceManager {
-  constructor() {
-    this.instances = [];
-    this.healthMap = new Map();
-  }
-
-  async getHealthyInstances(forceRefresh = false) {
-    if (forceRefresh || this.instances.length === 0) {
-      await this.discoverInstances();
-    }
-    return [...this.instances].sort((a, b) => {
-      const fa = this.healthMap.get(a)?.consecutiveFailures || 0;
-      const fb = this.healthMap.get(b)?.consecutiveFailures || 0;
-      return fa - fb;
-    });
-  }
-
-  async discoverInstances() {
-    const discovered = new Set();
-    if (process.env.PIPED_INSTANCES) {
-      process.env.PIPED_INSTANCES.split(',').forEach((s) => {
-        const trimmed = s.trim().replace(/\/$/, '');
-        if (trimmed) discovered.add(trimmed);
-      });
-    }
-
-    for (const source of INSTANCE_SOURCES) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000);
-        const res = await fetch(source, { headers: { 'User-Agent': 'ClipFlow-Worker/1.0' }, signal: controller.signal });
-        clearTimeout(timeout);
-        if (res.ok) {
-          const data = await res.json();
-          const list = Array.isArray(data) ? data : data.instances || data.api_servers || [];
-          for (const item of list) {
-            const url = typeof item === 'string' ? item : item.api_url || item.url || item.name;
-            if (url && typeof url === 'string') {
-              const normalized = url.trim().replace(/\/$/, '');
-              if (normalized.startsWith('http')) discovered.add(normalized);
-            }
-          }
-        }
-      } catch {}
-    }
-
-    for (const def of DEFAULT_PIPED_INSTANCES) discovered.add(def);
-
-    this.instances = Array.from(discovered);
-    console.log(`[WorkerPipedManager] Discovered ${this.instances.length} Piped API instances.`);
-  }
-
-  recordFailure(url) {
-    const cur = this.healthMap.get(url) || { consecutiveFailures: 0 };
-    cur.consecutiveFailures += 1;
-    this.healthMap.set(url, cur);
-  }
-
-  recordSuccess(url) {
-    this.healthMap.set(url, { consecutiveFailures: 0 });
-  }
-}
-
-const pipedManager = new WorkerPipedInstanceManager();
-
-function extractYouTubeVideoId(input) {
-  if (!input) return '';
-  const trimmed = input.trim();
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
-  const match = trimmed.match(/^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/);
-  return match && match[2].length === 11 ? match[2] : trimmed;
-}
-
-async function resolveStream(urlOrId) {
-  const videoId = extractYouTubeVideoId(urlOrId);
-  if (!videoId || videoId.length !== 11) {
-    throw new Error(`[PIPED_INVALID_RESPONSE] Invalid YouTube video ID extracted from "${urlOrId}"`);
-  }
-
-  let instances = await pipedManager.getHealthyInstances();
-  let attempts = 0;
-  let lastError = null;
-
-  while (attempts < 2) {
-    for (const instance of instances) {
-      try {
-        console.log(`[GitHubRunnerWorker] Resolving stream from Piped instance "${instance}" for video ${videoId}...`);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000);
-        const res = await fetch(`${instance}/streams/${videoId}`, {
-          headers: { 'User-Agent': 'ClipFlow-Worker/1.0', 'Accept': 'application/json' },
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-
-        if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-        const data = await res.json();
-        if (!data || (!data.videoStreams && !data.url)) throw new Error('Invalid response JSON');
-
-        pipedManager.recordSuccess(instance);
-
-        const videoStreams = data.videoStreams || [];
-        const audioStreams = data.audioStreams || [];
-        const bestVideo = videoStreams.find((s) => s.url && s.mimeType?.includes('video/mp4')) || videoStreams[0];
-        const bestAudio = audioStreams.find((s) => s.url && s.mimeType?.includes('audio/')) || audioStreams[0];
-        const combinedUrl = data.url;
-
-        if (bestVideo?.url || combinedUrl) {
-          console.log(`[GitHubRunnerWorker] Stream successfully resolved from ${instance}`);
-          return {
-            combinedUrl,
-            videoStreamUrl: bestVideo?.url || null,
-            audioStreamUrl: bestAudio?.url || null,
-            durationSeconds: Number(data.duration) || 0,
-            title: data.title || 'YouTube Source Video',
-            instanceUsed: instance,
-          };
-        }
-      } catch (e) {
-        console.warn(`[GitHubRunnerWorker] Piped instance "${instance}" failed:`, e.message);
-        pipedManager.recordFailure(instance);
-        lastError = e;
-      }
-    }
-
-    if (attempts === 0) {
-      console.log(`[GitHubRunnerWorker] All instances failed. Refreshing Piped pool and retrying...`);
-      instances = await pipedManager.getHealthyInstances(true);
-    }
-    attempts++;
-  }
-
-  throw new Error(`[PIPED_INSTANCE_UNAVAILABLE] All Piped instances failed for video ${videoId}. Last error: ${lastError?.message || 'Unknown'}`);
-}
 
 async function updateStatus(stage, progress, status = 'processing', error = null, errorCode = null) {
   if (!jobId) {
@@ -366,62 +216,76 @@ async function run() {
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    // 1. RESOLVING STREAM
+    // 1. RESOLVING STREAM VIA DYNAMIC PIPED DISCOVERY & VALIDATION
     await updateStatus('resolving', 10, 'processing');
-    const streamInfo = await resolveStream(youtubeUrl);
+    let streamInfo = await resolvePipedStream(youtubeUrl);
 
-    // 2. DOWNLOADING MEDIA
+    // 2. DOWNLOADING MEDIA (WITH EXPIRED STREAM RE-RESOLUTION RETRY)
     await updateStatus('downloading', 25, 'processing');
     const sourceVideoPath = path.resolve(tmpDir, 'source.mp4');
     const audioPath = path.resolve(tmpDir, 'audio.mp3');
 
     let acquisitionSuccess = false;
 
-    // Try downloading combined stream if present
-    if (streamInfo.combinedUrl) {
-      try {
-        console.log(`[GitHubRunnerWorker] Downloading combined video+audio stream from ${streamInfo.instanceUsed}...`);
-        await downloadFileStream(streamInfo.combinedUrl, sourceVideoPath);
-        const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
-        if (hasVideo && hasAudio) {
-          acquisitionSuccess = true;
-          console.log('[GitHubRunnerWorker] Verified combined stream has both video and audio.');
-        } else {
-          console.warn(`[GitHubRunnerWorker] Combined stream check failed (video: ${hasVideo}, audio: ${hasAudio}). Falling back to separate stream acquisition.`);
-          if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
+    for (let downloadAttempt = 0; downloadAttempt < 2 && !acquisitionSuccess; downloadAttempt++) {
+      if (downloadAttempt > 0) {
+        console.log('[GitHubRunnerWorker] Re-resolving stream due to download failure or expired URL...');
+        streamInfo = await resolvePipedStream(youtubeUrl);
+      }
+
+      // Try downloading combined stream if present
+      if (streamInfo.combinedUrl) {
+        try {
+          console.log(`[GitHubRunnerWorker] Downloading combined video+audio stream from ${streamInfo.instanceUsed}...`);
+          await downloadFileStream(streamInfo.combinedUrl, sourceVideoPath);
+          const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
+          if (hasVideo && hasAudio) {
+            acquisitionSuccess = true;
+            console.log('[GitHubRunnerWorker] Verified combined stream has both video and audio.');
+          } else {
+            console.warn(`[GitHubRunnerWorker] Combined stream check failed (video: ${hasVideo}, audio: ${hasAudio}). Falling back to separate streams.`);
+            if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
+          }
+        } catch (err) {
+          console.warn(`[GitHubRunnerWorker] Combined stream download failed (${err.message}).`);
+          pipedInstanceManager.recordFailure(streamInfo.instanceUsed, `Download failed: ${err.message}`);
         }
-      } catch (err) {
-        console.warn(`[GitHubRunnerWorker] Combined stream download failed: ${err.message}. Falling back to separate streams.`);
+      }
+
+      // Mux separate video and audio streams if combined stream was not available or invalid
+      if (!acquisitionSuccess && streamInfo.videoStreamUrl && streamInfo.audioStreamUrl) {
+        try {
+          const videoOnlyPath = path.resolve(tmpDir, 'video_only.mp4');
+          const audioOnlyPath = path.resolve(tmpDir, 'audio_only.m4a');
+
+          console.log('[GitHubRunnerWorker] Downloading separate video stream...');
+          await downloadFileStream(streamInfo.videoStreamUrl, videoOnlyPath);
+
+          console.log('[GitHubRunnerWorker] Downloading separate audio stream...');
+          await downloadFileStream(streamInfo.audioStreamUrl, audioOnlyPath);
+
+          console.log('[GitHubRunnerWorker] Muxing video and audio streams into source.mp4 with FFmpeg...');
+          execFileSync('ffmpeg', ['-y', '-i', videoOnlyPath, '-i', audioOnlyPath, '-c:v', 'copy', '-c:a', 'aac', '-shortest', sourceVideoPath], { stdio: 'inherit' });
+
+          try { fs.unlinkSync(videoOnlyPath); } catch {}
+          try { fs.unlinkSync(audioOnlyPath); } catch {}
+
+          const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
+          if (hasVideo && hasAudio) {
+            acquisitionSuccess = true;
+            console.log('[GitHubRunnerWorker] Successfully acquired and verified media with video and audio streams.');
+          } else {
+            if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
+          }
+        } catch (err) {
+          console.warn(`[GitHubRunnerWorker] Separate stream download/mux failed (${err.message}).`);
+          pipedInstanceManager.recordFailure(streamInfo.instanceUsed, `Separate download failed: ${err.message}`);
+        }
       }
     }
 
-    // Mux separate video and audio streams if combined stream was not available or invalid
     if (!acquisitionSuccess) {
-      if (!streamInfo.videoStreamUrl || !streamInfo.audioStreamUrl) {
-        throw new Error('[MEDIA_ACQUISITION_FAILED] Piped did not return both video and audio streams.');
-      }
-
-      const videoOnlyPath = path.resolve(tmpDir, 'video_only.mp4');
-      const audioOnlyPath = path.resolve(tmpDir, 'audio_only.m4a');
-
-      console.log('[GitHubRunnerWorker] Downloading separate video stream...');
-      await downloadFileStream(streamInfo.videoStreamUrl, videoOnlyPath);
-
-      console.log('[GitHubRunnerWorker] Downloading separate audio stream...');
-      await downloadFileStream(streamInfo.audioStreamUrl, audioOnlyPath);
-
-      console.log('[GitHubRunnerWorker] Muxing video and audio streams into source.mp4 with FFmpeg...');
-      execFileSync('ffmpeg', ['-y', '-i', videoOnlyPath, '-i', audioOnlyPath, '-c:v', 'copy', '-c:a', 'aac', '-shortest', sourceVideoPath], { stdio: 'inherit' });
-
-      // Clean up temp separate streams
-      try { fs.unlinkSync(videoOnlyPath); } catch {}
-      try { fs.unlinkSync(audioOnlyPath); } catch {}
-
-      const { hasVideo, hasAudio } = verifyMediaHasVideoAndAudio(sourceVideoPath);
-      if (!hasVideo || !hasAudio) {
-        throw new Error(`[MEDIA_ACQUISITION_FAILED] Muxed media verification failed (hasVideo: ${hasVideo}, hasAudio: ${hasAudio}).`);
-      }
-      console.log('[GitHubRunnerWorker] Successfully acquired and verified media with video and audio streams.');
+      throw new Error('[MEDIA_ACQUISITION_FAILED] Failed to download usable video and audio streams from Piped.');
     }
 
     // 3. TRANSCRIBING WITH LOCAL WHISPER
