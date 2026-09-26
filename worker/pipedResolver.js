@@ -341,28 +341,25 @@ function updateStatsFromError(err, stats) {
 async function readJsonResponse(res, provider, instance, stats) {
   const status = res.status;
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  const contentLength = res.headers.get('content-length') || 'unknown';
-
+  
   if (!res.ok) {
     updateStatsFromStatus(status, stats);
-    return null;
+    return { data: null, isError: true };
   }
 
-  if (!contentType.includes('json')) {
-    stats.nonJsonSuccessfulResponses++;
-  }
+  stats.jsonResponses++;
 
   let text = '';
   try {
     text = await res.text();
   } catch (err) {
     stats.invalidResponses++;
-    return null;
+    return { data: null, isError: false };
   }
 
   if (!text || text.trim().length === 0) {
     stats.emptyBodies++;
-    return null;
+    return { data: null, isError: false };
   }
 
   let data;
@@ -382,40 +379,60 @@ async function readJsonResponse(res, provider, instance, stats) {
         `  instance=${instance}\n` +
         `  status=${status}\n` +
         `  contentType=${contentType}\n` +
-        `  contentLength=${contentLength}\n` +
         `  bodyPreview=${bodyPreview}\n` +
         `  reason=JSON_PARSE_FAILED`
       );
     }
-    return null;
+    return { data: null, isError: false };
   }
 
-  // Safe structural logging for first successful JSON response
-  if (provider === 'piped' && !stats.pipedShapeLogged && data) {
-    stats.pipedShapeLogged = true;
-    console.log(
-      `[PipedResponseShape]\n` +
-      `  instance=${instance}\n` +
-      `  keys=${Object.keys(data).join(',')}\n` +
-      `  videoStreams=${Array.isArray(data.videoStreams) ? data.videoStreams.length : 0}\n` +
-      `  audioStreams=${Array.isArray(data.audioStreams) ? data.audioStreams.length : 0}\n` +
-      `  hasUrl=${!!data.url}\n` +
-      `  error=${data.error || 'none'}\n` +
-      `  message=${data.message || 'none'}`
-    );
-  } else if (provider === 'invidious' && !stats.invidiousShapeLogged && data) {
-    stats.invidiousShapeLogged = true;
-    console.log(
-      `[InvidiousResponseShape]\n` +
-      `  instance=${instance}\n` +
-      `  keys=${Object.keys(data).join(',')}\n` +
-      `  formatStreams=${Array.isArray(data.formatStreams) ? data.formatStreams.length : 0}\n` +
-      `  adaptiveFormats=${Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats.length : 0}\n` +
-      `  hasError=${!!data.error}`
-    );
+  // Detect error object
+  if (data && (data.error || data.message || data.code)) {
+    stats.providerJsonErrors++;
+    const logCounterKey = provider === 'piped' ? 'pipedErrorLogCount' : 'invidiousErrorLogCount';
+    if (stats[logCounterKey] < 5) {
+        stats[logCounterKey]++;
+        console.warn(
+            `[ProviderJsonError]\n` +
+            `  provider=${provider}\n` +
+            `  instance=${instance}\n` +
+            `  status=${status}\n` +
+            `  error=${data.error || 'none'}\n` +
+            `  message=${data.message || 'none'}`
+        );
+    }
+    return { data, isError: true };
   }
 
-  return data;
+  // Structural Logging (First 5)
+  const logCounterKey = provider === 'piped' ? 'pipedShapeLogCount' : 'invidiousShapeLogCount';
+  if (stats[logCounterKey] < 5) {
+      stats[logCounterKey]++;
+      if (provider === 'piped') {
+          console.log(
+            `[PipedResponseShape]\n` +
+            `  instance=${instance}\n` +
+            `  status=${status}\n` +
+            `  keys=${Object.keys(data).join(',')}\n` +
+            `  videoStreams=${Array.isArray(data.videoStreams) ? data.videoStreams.length : 0}\n` +
+            `  audioStreams=${Array.isArray(data.audioStreams) ? data.audioStreams.length : 0}\n` +
+            `  combinedStreams=${Array.isArray(data.videoStreams) ? data.videoStreams.filter(s => s.videoOnly !== true).length : 0}\n` +
+            `  hasAnyUrl=${!!(data.url || (data.videoStreams && data.videoStreams.length > 0))}`
+          );
+      } else {
+          console.log(
+            `[InvidiousResponseShape]\n` +
+            `  instance=${instance}\n` +
+            `  status=${status}\n` +
+            `  keys=${Object.keys(data).join(',')}\n` +
+            `  formatStreams=${Array.isArray(data.formatStreams) ? data.formatStreams.length : 0}\n` +
+            `  adaptiveFormats=${Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats.length : 0}\n` +
+            `  hasAnyUrl=${!!(data.formatStreams && data.formatStreams.length > 0)}`
+          );
+      }
+  }
+
+  return { data, isError: false };
 }
 
 /**
@@ -693,23 +710,31 @@ async function tryPipedProvider(videoId, stats) {
             });
             const latencyMs = Date.now() - start;
 
-            const data = await readJsonResponse(res, 'piped', instance, stats);
-            if (!data) {
+            const { data, isError } = await readJsonResponse(res, 'piped', instance, stats);
+            if (!data || isError) {
               pipedInstanceManager.recordFailure(instance, `HTTP ${res.status} or invalid JSON body`);
-              return null;
-            }
-
-            if ((data.error || data.message) && !data.videoStreams && !data.url) {
-              stats.providerApiErrors++;
-              pipedInstanceManager.recordFailure(instance, `API Error: ${data.error || data.message}`);
               return null;
             }
 
             const normalizedCandidates = normalizePipedCandidates(data, instance);
             if (normalizedCandidates.length === 0) {
+              stats.responsesWithoutStreams++;
               stats.noUsableStreams++;
               pipedInstanceManager.recordFailure(instance, 'No stream candidates found in JSON');
+              
+              const logCounterKey = 'pipedNormLogCount';
+              if (stats[logCounterKey] < 5) {
+                stats[logCounterKey]++;
+                console.log(`[ProviderNormalization]\n  provider=piped\n  instance=${instance}\n  result=NO_STREAMS\n  reason=UNSUPPORTED_RESPONSE_SHAPE`);
+              }
               return null;
+            }
+            
+            stats.responsesWithStreams++;
+            const logCounterKey = 'pipedNormLogCount';
+            if (stats[logCounterKey] < 5) {
+              stats[logCounterKey]++;
+              console.log(`[ProviderNormalization]\n  provider=piped\n  instance=${instance}\n  result=HAS_STREAMS\n  candidateCount=${normalizedCandidates.length}`);
             }
 
             const selected = await probeAndSelectCandidate(normalizedCandidates, instance, stats);
@@ -781,20 +806,29 @@ async function tryInvidiousProvider(videoId, stats) {
           });
           const latencyMs = Date.now() - start;
 
-          const data = await readJsonResponse(res, 'invidious', instance, stats);
-          if (!data) {
-            return null;
-          }
-
-          if (data.error) {
-            stats.providerApiErrors++;
+          const { data, isError } = await readJsonResponse(res, 'invidious', instance, stats);
+          if (!data || isError) {
             return null;
           }
 
           const normalizedCandidates = normalizeInvidiousCandidates(data, instance, videoId);
           if (normalizedCandidates.length === 0) {
+            stats.responsesWithoutStreams++;
             stats.noUsableStreams++;
+            
+            const logCounterKey = 'invidiousNormLogCount';
+            if (stats[logCounterKey] < 5) {
+              stats[logCounterKey]++;
+              console.log(`[ProviderNormalization]\n  provider=invidious\n  instance=${instance}\n  result=NO_STREAMS\n  reason=UNSUPPORTED_RESPONSE_SHAPE`);
+            }
             return null;
+          }
+          
+          stats.responsesWithStreams++;
+          const logCounterKey = 'invidiousNormLogCount';
+          if (stats[logCounterKey] < 5) {
+            stats[logCounterKey]++;
+            console.log(`[ProviderNormalization]\n  provider=invidious\n  instance=${instance}\n  result=HAS_STREAMS\n  candidateCount=${normalizedCandidates.length}`);
           }
 
           const selected = await probeAndSelectCandidate(normalizedCandidates, instance, stats);
@@ -852,8 +886,12 @@ export async function resolveStream(youtubeUrlOrId) {
     candidatesResolved: 0,
     candidatesProbed: 0,
     candidatesDownloadable: 0,
-    providerApiErrors: 0,
+    jsonResponses: 0,
     jsonParseFailures: 0,
+    providerJsonErrors: 0,
+    responsesWithStreams: 0,
+    responsesWithoutStreams: 0,
+    providerApiErrors: 0,
     nonJsonSuccessfulResponses: 0,
     emptyBodies: 0,
     invalidResponses: 0,
@@ -868,8 +906,12 @@ export async function resolveStream(youtubeUrlOrId) {
     tlsFailures: 0,
     pipedInvalidLogCount: 0,
     invidiousInvalidLogCount: 0,
-    pipedShapeLogged: false,
-    invidiousShapeLogged: false,
+    pipedErrorLogCount: 0,
+    invidiousErrorLogCount: 0,
+    pipedShapeLogCount: 0,
+    invidiousShapeLogCount: 0,
+    pipedNormLogCount: 0,
+    invidiousNormLogCount: 0,
   };
 
   // STEP 1: PIPED PROVIDER
@@ -903,12 +945,20 @@ export async function resolveStream(youtubeUrlOrId) {
     `[STREAM_RESOLUTION_FAILED] Neither Piped nor Invidious providers could resolve a downloadable stream for YouTube video ${videoId}.\n` +
     `Diagnostics:\n` +
     `  videoId=${stats.videoId}\n` +
-    `  pipedDiscovered=${stats.pipedDiscovered}, pipedAttempted=${stats.pipedAttempted}, pipedSuccess=${stats.pipedSuccess}\n` +
-    `  invidiousDiscovered=${stats.invidiousDiscovered}, invidiousAttempted=${stats.invidiousAttempted}, invidiousSuccess=${stats.invidiousSuccess}\n` +
-    `  candidatesResolved=${stats.candidatesResolved}, candidatesProbed=${stats.candidatesProbed}, candidatesDownloadable=${stats.candidatesDownloadable}\n` +
-    `  providerApiErrors=${stats.providerApiErrors}, jsonParseFailures=${stats.jsonParseFailures}, nonJsonSuccessfulResponses=${stats.nonJsonSuccessfulResponses}, emptyBodies=${stats.emptyBodies}, invalidResponses=${stats.invalidResponses}, noUsableStreams=${stats.noUsableStreams}\n` +
-    `  timeouts=${stats.timeouts}, http401=${stats.http401}, http403=${stats.http403}, http404=${stats.http404}, http429=${stats.http429}, http5xx=${stats.http5xx}\n` +
-    `  dnsFailures=${stats.dnsFailures}, tlsFailures=${stats.tlsFailures}`;
+    `  piped:\n` +
+    `    discovered=${stats.pipedDiscovered}, attempted=${stats.pipedAttempted}\n` +
+    `    jsonResponses=${stats.jsonResponses}, jsonParseFailures=${stats.jsonParseFailures}, providerJsonErrors=${stats.providerJsonErrors}\n` +
+    `    responsesWithStreams=${stats.responsesWithStreams}, responsesWithoutStreams=${stats.responsesWithoutStreams}\n` +
+    `    candidatesResolved=${stats.candidatesResolved}, candidatesProbed=${stats.candidatesProbed}, candidatesDownloadable=${stats.candidatesDownloadable}\n` +
+    `  invidious:\n` +
+    `    discovered=${stats.invidiousDiscovered}, attempted=${stats.invidiousAttempted}\n` +
+    `    jsonResponses=${stats.jsonResponses}, jsonParseFailures=${stats.jsonParseFailures}, providerJsonErrors=${stats.providerJsonErrors}\n` +
+    `    responsesWithStreams=${stats.responsesWithStreams}, responsesWithoutStreams=${stats.responsesWithoutStreams}\n` +
+    `    candidatesResolved=${stats.candidatesResolved}, candidatesProbed=${stats.candidatesProbed}, candidatesDownloadable=${stats.candidatesDownloadable}\n` +
+    `  common:\n` +
+    `    providerApiErrors=${stats.providerApiErrors}, nonJsonSuccessfulResponses=${stats.nonJsonSuccessfulResponses}, emptyBodies=${stats.emptyBodies}, invalidResponses=${stats.invalidResponses}\n` +
+    `    timeouts=${stats.timeouts}, http401=${stats.http401}, http403=${stats.http403}, http404=${stats.http404}, http429=${stats.http429}, http5xx=${stats.http5xx}\n` +
+    `    dnsFailures=${stats.dnsFailures}, tlsFailures=${stats.tlsFailures}`;
 
   console.error(diagnosticMsg);
   throw new Error(diagnosticMsg);
