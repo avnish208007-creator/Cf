@@ -18,7 +18,7 @@ import fetch from 'node-fetch';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, collection, addDoc } from 'firebase/firestore';
 import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { resolvePipedStream, pipedInstanceManager } from './pipedResolver.js';
+import { resolveStream, pipedInstanceManager } from './pipedResolver.js';
 
 // 1. STARTUP CONFIGURATION VALIDATION
 const requiredEnvVars = [
@@ -220,7 +220,7 @@ async function run() {
     await updateStatus('resolving', 10, 'processing');
     let streamInfo;
     try {
-      streamInfo = await resolvePipedStream(youtubeUrl);
+      streamInfo = await resolveStream(youtubeUrl);
     } catch (resolveErr) {
       console.error('[PIPED_STREAM_RESOLUTION_FAILED] Stream resolution failed:', resolveErr.message);
       throw resolveErr;
@@ -236,7 +236,7 @@ async function run() {
     for (let downloadAttempt = 0; downloadAttempt < 2 && !acquisitionSuccess; downloadAttempt++) {
       if (downloadAttempt > 0) {
         console.log('[GitHubRunnerWorker] Re-resolving stream due to download failure or expired URL...');
-        streamInfo = await resolvePipedStream(youtubeUrl);
+        streamInfo = await resolveStream(youtubeUrl);
       }
 
       // Try downloading combined stream if present

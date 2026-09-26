@@ -1,9 +1,7 @@
 /**
- * Standalone ES Module Piped Resolver for ClipFlow V1 Worker & Server
- * Pure JavaScript compatible with Node.js 18+ (no TypeScript or Vite transform required).
- * Direct video stream resolution (/streams/{videoId}) across candidate instances.
+ * Isolated Piped Stream Resolver for ClipFlow V1 Worker
+ * Pure Node.js 20+ JavaScript ES module. No TypeScript dependencies.
  */
-import fetch from 'node-fetch';
 
 const EMERGENCY_FALLBACK_INSTANCES = [
   'https://pipedapi.ducks.party',
@@ -35,37 +33,49 @@ const DYNAMIC_DISCOVERY_SOURCES = [
   'https://raw.githubusercontent.com/fediverse/piped-instances/main/instances.json',
 ];
 
+// Fallback fetch if global fetch is missing
+const httpFetch = globalThis.fetch || (await import('node-fetch')).default;
+
+export function normalizeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  let trimmed = rawUrl.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return null;
+  }
+  trimmed = trimmed.replace(/\/+$/, '');
+  if (
+    trimmed.endsWith('/watch') ||
+    trimmed.endsWith('/channel') ||
+    trimmed.endsWith('/user') ||
+    trimmed.endsWith('/c')
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function extractYouTubeVideoId(input) {
+  if (!input) return '';
+  const trimmed = input.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
+    return trimmed;
+  }
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+  const match = trimmed.match(regExp);
+  return match && match[2].length === 11 ? match[2] : trimmed;
+}
+
 export class PipedInstanceManager {
   constructor() {
-    this.candidatePool = [...EMERGENCY_FALLBACK_INSTANCES];
     this.healthMap = new Map();
   }
 
-  normalizeUrl(rawUrl) {
-    if (!rawUrl || typeof rawUrl !== 'string') return null;
-    let trimmed = rawUrl.trim();
-    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-      return null;
-    }
-    trimmed = trimmed.replace(/\/+$/, '');
-    if (
-      trimmed.endsWith('/watch') ||
-      trimmed.endsWith('/channel') ||
-      trimmed.endsWith('/user') ||
-      trimmed.endsWith('/c')
-    ) {
-      return null;
-    }
-    return trimmed;
-  }
-
   async discoverCandidates() {
-    console.log('[PipedManager] Discovering current Piped instances...');
     const discovered = new Set();
 
     if (process.env.PIPED_INSTANCES) {
       process.env.PIPED_INSTANCES.split(',').forEach((s) => {
-        const norm = this.normalizeUrl(s);
+        const norm = normalizeUrl(s);
         if (norm) discovered.add(norm);
       });
     }
@@ -74,7 +84,7 @@ export class PipedInstanceManager {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
       try {
-        const res = await fetch(source, {
+        const res = await httpFetch(source, {
           headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
           signal: controller.signal,
         });
@@ -86,7 +96,7 @@ export class PipedInstanceManager {
             const list = Array.isArray(data) ? data : data.instances || data.api_servers || [];
             for (const item of list) {
               const url = typeof item === 'string' ? item : item.api_url || item.apiUrl || item.url || item.name;
-              const norm = this.normalizeUrl(url);
+              const norm = normalizeUrl(url);
               if (norm) {
                 if (typeof item === 'object' && item !== null && item.up === false) {
                   continue;
@@ -104,11 +114,11 @@ export class PipedInstanceManager {
     }
 
     for (const fallback of EMERGENCY_FALLBACK_INSTANCES) {
-      const norm = this.normalizeUrl(fallback);
+      const norm = normalizeUrl(fallback);
       if (norm) discovered.add(norm);
     }
 
-    this.candidatePool = Array.from(discovered).sort((a, b) => {
+    const candidatePool = Array.from(discovered).sort((a, b) => {
       const ha = this.healthMap.get(a);
       const hb = this.healthMap.get(b);
       const fa = ha?.consecutiveFailures || 0;
@@ -117,8 +127,7 @@ export class PipedInstanceManager {
       return (ha?.latencyMs || 9999) - (hb?.latencyMs || 9999);
     });
 
-    console.log(`[PipedManager] Discovered ${this.candidatePool.length} candidate Piped instance(s).`);
-    return this.candidatePool;
+    return candidatePool;
   }
 
   recordFailure(instanceUrl, reason) {
@@ -150,7 +159,6 @@ export class PipedInstanceManager {
 
   getStatus() {
     return {
-      discoveredCount: this.candidatePool.length,
       healthMap: Array.from(this.healthMap.entries()),
     };
   }
@@ -158,35 +166,34 @@ export class PipedInstanceManager {
 
 export const pipedInstanceManager = new PipedInstanceManager();
 
-export function extractYouTubeVideoId(input) {
-  if (!input) return '';
-  const trimmed = input.trim();
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
-    return trimmed;
+function isAbsoluteHttpUrl(url) {
+  if (typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
   }
-  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
-  const match = trimmed.match(regExp);
-  return match && match[2].length === 11 ? match[2] : trimmed;
 }
 
-export async function resolvePipedStream(youtubeUrlOrId) {
+export async function resolveStream(youtubeUrlOrId) {
   const videoId = extractYouTubeVideoId(youtubeUrlOrId);
   if (!videoId || videoId.length !== 11) {
     throw new Error(`[PIPED_INVALID_RESPONSE] Invalid YouTube video ID extracted from "${youtubeUrlOrId}"`);
   }
 
-  console.log(`[PipedResolver] Beginning video stream resolution for video ID: ${videoId}...`);
+  console.log(`[PipedResolver] Resolving media stream for video ID: ${videoId}`);
 
   const stats = {
     discovered: 0,
-    streamAttempts: 0,
-    http500: 0,
+    attempted: 0,
+    dnsFailures: 0,
+    tlsFailures: 0,
+    timeouts: 0,
     http403: 0,
     http404: 0,
     http429: 0,
-    http502_503_504: 0,
-    timeouts: 0,
-    dnsFailures: 0,
+    http5xx: 0,
     invalidResponses: 0,
     noUsableStreams: 0,
   };
@@ -202,22 +209,22 @@ export async function resolvePipedStream(youtubeUrlOrId) {
       break;
     }
 
-    console.log(`[PipedResolver] Pass ${pass}: Testing ${remainingCandidates.length} candidate instance(s) for video ${videoId}...`);
+    console.log(`[PipedResolver] Pass ${pass}: Testing ${remainingCandidates.length} candidate instance(s)...`);
 
     for (let i = 0; i < remainingCandidates.length; i++) {
       const instance = remainingCandidates[i];
       triedInstances.add(instance);
-      stats.streamAttempts++;
+      stats.attempted++;
 
       const endpoint = `${instance}/streams/${videoId}`;
-      console.log(`[PipedResolver] Trying candidate ${stats.streamAttempts}/${stats.discovered}: ${instance}`);
+      console.log(`[PipedResolver] [${stats.attempted}/${stats.discovered}] GET ${endpoint}`);
 
       const start = Date.now();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000); // 12-second per-instance timeout
+      const timer = setTimeout(() => controller.abort(), 6000); // 6-second per-instance timeout
 
       try {
-        const res = await fetch(endpoint, {
+        const res = await httpFetch(endpoint, {
           headers: {
             'User-Agent': 'ClipFlow/1.0',
             'Accept': 'application/json',
@@ -227,13 +234,12 @@ export async function resolvePipedStream(youtubeUrlOrId) {
         const latencyMs = Date.now() - start;
 
         if (!res.ok) {
-          if (res.status === 500) stats.http500++;
-          else if (res.status === 403) stats.http403++;
+          if (res.status === 403) stats.http403++;
           else if (res.status === 404) stats.http404++;
           else if (res.status === 429) stats.http429++;
-          else if ([502, 503, 504].includes(res.status)) stats.http502_503_504++;
+          else if (res.status >= 500) stats.http5xx++;
 
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Endpoint: /streams/${videoId} | Status: HTTP ${res.status} (${latencyMs}ms)`);
+          console.warn(`[PipedResolver] -> HTTP ${res.status} (${latencyMs}ms)`);
           pipedInstanceManager.recordFailure(instance, `HTTP ${res.status}`);
           continue;
         }
@@ -241,7 +247,7 @@ export async function resolvePipedStream(youtubeUrlOrId) {
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('json')) {
           stats.invalidResponses++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Non-JSON content-type (${contentType})`);
+          console.warn(`[PipedResolver] -> Non-JSON response (${contentType})`);
           pipedInstanceManager.recordFailure(instance, `Non-JSON content-type (${contentType})`);
           continue;
         }
@@ -252,30 +258,33 @@ export async function resolvePipedStream(youtubeUrlOrId) {
           data = JSON.parse(text);
         } catch {
           stats.invalidResponses++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Invalid JSON syntax`);
+          console.warn(`[PipedResolver] -> Invalid JSON body`);
           pipedInstanceManager.recordFailure(instance, 'Invalid JSON body');
           continue;
         }
 
-        // Handle error payloads from Piped
         if ((data.error || data.message) && !data.videoStreams && !data.url) {
           stats.invalidResponses++;
           const msg = data.error || data.message;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Piped error response (${msg})`);
+          console.warn(`[PipedResolver] -> Piped error response (${msg})`);
           pipedInstanceManager.recordFailure(instance, `Piped API error: ${msg}`);
           continue;
         }
 
         if (!data) {
           stats.invalidResponses++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Empty JSON body`);
+          console.warn(`[PipedResolver] -> Empty JSON payload`);
           pipedInstanceManager.recordFailure(instance, 'Empty JSON body');
           continue;
         }
 
         const title = data.title || `YouTube Video ${videoId}`;
         const durationSeconds = Number(data.duration) || 0;
-        const thumbnailUrl = data.thumbnailUrl || data.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+        const thumbnailUrl = isAbsoluteHttpUrl(data.thumbnailUrl)
+          ? data.thumbnailUrl
+          : isAbsoluteHttpUrl(data.thumbnail)
+          ? data.thumbnail
+          : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
         const videoStreams = Array.isArray(data.videoStreams) ? data.videoStreams : [];
         const audioStreams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
@@ -284,35 +293,35 @@ export async function resolvePipedStream(youtubeUrlOrId) {
         let audioStreamUrl = null;
         let combinedUrl = null;
 
-        const bestVideo = videoStreams.find((s) => s.url && s.mimeType?.includes('video/mp4')) || videoStreams[0];
+        const bestVideo = videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('video/mp4')) ||
+          videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
         if (bestVideo && bestVideo.url) {
           videoStreamUrl = bestVideo.url;
         }
 
-        const bestAudio = audioStreams.find((s) => s.url && s.mimeType?.includes('audio/')) || audioStreams[0];
+        const bestAudio = audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('audio/')) ||
+          audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
         if (bestAudio && bestAudio.url) {
           audioStreamUrl = bestAudio.url;
         }
 
-        if (data.url && typeof data.url === 'string') {
+        if (data.url && typeof data.url === 'string' && isAbsoluteHttpUrl(data.url)) {
           combinedUrl = data.url;
         }
 
         if (!videoStreamUrl && !combinedUrl) {
           stats.noUsableStreams++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: No usable video or combined stream URLs in JSON`);
-          pipedInstanceManager.recordFailure(instance, 'No usable video or combined stream URLs');
+          console.warn(`[PipedResolver] -> Response JSON missing usable video or combined stream URLs`);
+          pipedInstanceManager.recordFailure(instance, 'No usable stream URLs');
           continue;
         }
 
         // SUCCESS!
-        console.log(`[PipedResolver] SUCCESS -> Video ID: ${videoId}`);
-        console.log(`  Instance: ${instance}`);
+        console.log(`[PipedResolver] SUCCESS resolved stream from instance: ${instance} (${latencyMs}ms)`);
         console.log(`  Title: "${title}"`);
         console.log(`  Combined Stream: ${combinedUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
         console.log(`  Video Stream: ${videoStreamUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
         console.log(`  Audio Stream: ${audioStreamUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
-        console.log(`  Latency: ${latencyMs}ms`);
 
         pipedInstanceManager.recordSuccess(instance, latencyMs);
 
@@ -326,20 +335,25 @@ export async function resolvePipedStream(youtubeUrlOrId) {
           title,
           thumbnailUrl,
           instanceUsed: instance,
+          latencyMs,
         };
       } catch (err) {
         const latencyMs = Date.now() - start;
         if (err.name === 'AbortError') {
           stats.timeouts++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Timeout (>12s) (${latencyMs}ms)`);
-          pipedInstanceManager.recordFailure(instance, 'Timeout (>12s)');
+          console.warn(`[PipedResolver] -> Timeout (>6s) (${latencyMs}ms)`);
+          pipedInstanceManager.recordFailure(instance, 'Timeout (>6s)');
+        } else if (err.message.includes('CERT_') || err.message.includes('SSL') || err.message.includes('tls') || err.message.includes('certificate')) {
+          stats.tlsFailures++;
+          console.warn(`[PipedResolver] -> TLS/SSL failure (${err.message})`);
+          pipedInstanceManager.recordFailure(instance, `TLS failure: ${err.message}`);
         } else if (err.message.includes('ENOTFOUND') || err.message.includes('EAI_AGAIN')) {
           stats.dnsFailures++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: DNS failure (${err.message})`);
+          console.warn(`[PipedResolver] -> DNS failure (${err.message})`);
           pipedInstanceManager.recordFailure(instance, `DNS failure: ${err.message}`);
         } else {
           stats.invalidResponses++;
-          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: ${err.message}`);
+          console.warn(`[PipedResolver] -> Error: ${err.message}`);
           pipedInstanceManager.recordFailure(instance, err.message);
         }
       } finally {
@@ -350,22 +364,25 @@ export async function resolvePipedStream(youtubeUrlOrId) {
 
   const diagnosticMsg =
     `[PIPED_STREAM_RESOLUTION_FAILED] No discovered Piped API instance could resolve YouTube video ${videoId}. ` +
-    `Diagnostics: discovered=${stats.discovered}, streamAttempts=${stats.streamAttempts}, http500=${stats.http500}, ` +
-    `http403=${stats.http403}, http404=${stats.http404}, http429=${stats.http429}, http5xx=${stats.http502_503_504}, ` +
-    `timeouts=${stats.timeouts}, dnsFailures=${stats.dnsFailures}, invalidResponses=${stats.invalidResponses}, noUsableStreams=${stats.noUsableStreams}.`;
+    `Totals: discovered=${stats.discovered}, attempted=${stats.attempted}, dnsFailures=${stats.dnsFailures}, ` +
+    `tlsFailures=${stats.tlsFailures}, timeouts=${stats.timeouts}, http403=${stats.http403}, http404=${stats.http404}, ` +
+    `http429=${stats.http429}, http5xx=${stats.http5xx}, invalidResponses=${stats.invalidResponses}, noUsableStreams=${stats.noUsableStreams}.`;
 
   console.error(diagnosticMsg);
   throw new Error(diagnosticMsg);
 }
 
+// Backward compatibility alias
+export const resolvePipedStream = resolveStream;
+
 export async function checkPipedHealth() {
   try {
-    const status = pipedInstanceManager.getStatus();
+    const candidates = await pipedInstanceManager.discoverCandidates();
     return {
       configured: true,
-      reachable: status.discoveredCount > 0,
-      details: `${status.discoveredCount} Piped instances available for stream resolution`,
-      status,
+      reachable: candidates.length > 0,
+      details: `${candidates.length} Piped instances available for stream resolution`,
+      status: pipedInstanceManager.getStatus(),
     };
   } catch (err) {
     return {
