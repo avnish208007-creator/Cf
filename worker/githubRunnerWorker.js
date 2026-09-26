@@ -18,7 +18,7 @@ import fetch from 'node-fetch';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, collection, addDoc } from 'firebase/firestore';
 import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { resolvePipedStream, pipedInstanceManager } from '../src/server/providers/pipedResolver.ts';
+import { resolvePipedStream, pipedInstanceManager } from './pipedResolver.js';
 
 // 1. STARTUP CONFIGURATION VALIDATION
 const requiredEnvVars = [
@@ -78,7 +78,7 @@ async function updateStatus(stage, progress, status = 'processing', error = null
     await setDoc(jobRef, statusData, { merge: true });
     console.log(`[GitHubRunnerWorker] Firestore job status updated -> Stage: ${stage}, Progress: ${progress}%, Status: ${status}`);
   } catch (err) {
-    console.error(`[GitHubRunnerWorker] FATAL: Failed to update Firestore job status for job ${jobId} (Stage: ${stage}, Code: ${err.code || 'UNKNOWN'}):`, err.message);
+    console.error(`[FIRESTORE_UPDATE_FAILED] Failed to update Firestore job status for job ${jobId} (Stage: ${stage}, Code: ${err.code || 'UNKNOWN'}):`, err.message);
     throw err;
   }
 }
@@ -94,7 +94,6 @@ async function downloadFileStream(url, destPath, timeoutMs = 90000) {
       headers: { 'User-Agent': 'ClipFlow-Worker/1.0' },
       signal: controller.signal,
     });
-    clearTimeout(timer);
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -108,11 +107,12 @@ async function downloadFileStream(url, destPath, timeoutMs = 90000) {
       throw new Error(`Downloaded file is empty or corrupted (<10KB) at ${destPath}`);
     }
   } catch (err) {
-    clearTimeout(timer);
     if (fs.existsSync(destPath)) {
       try { fs.unlinkSync(destPath); } catch {}
     }
     throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -130,7 +130,7 @@ function verifyMediaHasVideoAndAudio(filePath) {
     const hasAudio = streams.includes('audio');
     return { hasVideo, hasAudio };
   } catch (err) {
-    console.warn(`[GitHubRunnerWorker] FFprobe inspection failed for ${filePath}:`, err.message);
+    console.warn(`[MEDIA_VALIDATION_FAILED] FFprobe inspection failed for ${filePath}:`, err.message);
     return { hasVideo: false, hasAudio: false };
   }
 }
@@ -218,7 +218,13 @@ async function run() {
   try {
     // 1. RESOLVING STREAM VIA DYNAMIC PIPED DISCOVERY & VALIDATION
     await updateStatus('resolving', 10, 'processing');
-    let streamInfo = await resolvePipedStream(youtubeUrl);
+    let streamInfo;
+    try {
+      streamInfo = await resolvePipedStream(youtubeUrl);
+    } catch (resolveErr) {
+      console.error('[PIPED_STREAM_RESOLUTION_FAILED] Stream resolution failed:', resolveErr.message);
+      throw resolveErr;
+    }
 
     // 2. DOWNLOADING MEDIA (WITH EXPIRED STREAM RE-RESOLUTION RETRY)
     await updateStatus('downloading', 25, 'processing');
@@ -243,11 +249,11 @@ async function run() {
             acquisitionSuccess = true;
             console.log('[GitHubRunnerWorker] Verified combined stream has both video and audio.');
           } else {
-            console.warn(`[GitHubRunnerWorker] Combined stream check failed (video: ${hasVideo}, audio: ${hasAudio}). Falling back to separate streams.`);
+            console.warn(`[MEDIA_VALIDATION_FAILED] Combined stream check failed (video: ${hasVideo}, audio: ${hasAudio}). Falling back to separate streams.`);
             if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
           }
         } catch (err) {
-          console.warn(`[GitHubRunnerWorker] Combined stream download failed (${err.message}).`);
+          console.warn(`[MEDIA_DOWNLOAD_FAILED] Combined stream download failed (${err.message}).`);
           pipedInstanceManager.recordFailure(streamInfo.instanceUsed, `Download failed: ${err.message}`);
         }
       }
@@ -278,27 +284,35 @@ async function run() {
             if (fs.existsSync(sourceVideoPath)) fs.unlinkSync(sourceVideoPath);
           }
         } catch (err) {
-          console.warn(`[GitHubRunnerWorker] Separate stream download/mux failed (${err.message}).`);
+          console.warn(`[MEDIA_DOWNLOAD_FAILED] Separate stream download/mux failed (${err.message}).`);
           pipedInstanceManager.recordFailure(streamInfo.instanceUsed, `Separate download failed: ${err.message}`);
         }
       }
     }
 
     if (!acquisitionSuccess) {
-      throw new Error('[MEDIA_ACQUISITION_FAILED] Failed to download usable video and audio streams from Piped.');
+      throw new Error('[MEDIA_DOWNLOAD_FAILED] Failed to download usable video and audio streams from Piped.');
     }
 
     // 3. TRANSCRIBING WITH LOCAL WHISPER
     await updateStatus('transcribing', 45, 'processing');
     console.log('[GitHubRunnerWorker] Extracting audio for Whisper transcription...');
-    execSync(`ffmpeg -y -i "${sourceVideoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 "${audioPath}"`, { stdio: 'inherit' });
+    try {
+      execSync(`ffmpeg -y -i "${sourceVideoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 "${audioPath}"`, { stdio: 'inherit' });
+    } catch (audioErr) {
+      throw new Error(`[WHISPER_FAILED] Audio extraction for Whisper failed: ${audioErr.message}`);
+    }
 
     if (!fs.existsSync(audioPath) || fs.statSync(audioPath).size < 5000) {
-      throw new Error('[AUDIO_EXTRACTION_FAILED] Extracted audio file is empty or corrupted.');
+      throw new Error('[WHISPER_FAILED] Extracted audio file is empty or corrupted.');
     }
 
     console.log('[GitHubRunnerWorker] Running local Whisper transcription (base model)...');
-    execSync(`whisper "${audioPath}" --model base --output_dir "${tmpDir}" --output_format json`, { stdio: 'inherit' });
+    try {
+      execSync(`whisper "${audioPath}" --model base --output_dir "${tmpDir}" --output_format json`, { stdio: 'inherit' });
+    } catch (whisperErr) {
+      throw new Error(`[WHISPER_FAILED] Whisper execution failed: ${whisperErr.message}`);
+    }
 
     const jsonResultPath = path.resolve(tmpDir, 'audio.json');
     let transcriptSegments = [];
@@ -312,7 +326,7 @@ async function run() {
     }
 
     if (transcriptSegments.length === 0) {
-      throw new Error('[TRANSCRIPTION_FAILED] Whisper produced zero transcript segments.');
+      throw new Error('[WHISPER_FAILED] Whisper produced zero transcript segments.');
     }
 
     // 4. DETECTING MOMENTS
@@ -347,16 +361,20 @@ async function run() {
         '-c:a', 'aac', '-b:a', '128k',
         clipOutputPath,
       ];
-      execFileSync(ffmpegCmd[0], ffmpegCmd.slice(1), { stdio: 'inherit' });
+      try {
+        execFileSync(ffmpegCmd[0], ffmpegCmd.slice(1), { stdio: 'inherit' });
+      } catch (renderErr) {
+        throw new Error(`[FFMPEG_RENDER_FAILED] FFmpeg render failed for clip ${i + 1}: ${renderErr.message}`);
+      }
 
       // Verify rendered clip
       if (!fs.existsSync(clipOutputPath) || fs.statSync(clipOutputPath).size < 10000) {
-        throw new Error(`[RENDER_FAILED] Rendered clip ${i + 1} file is missing or corrupted.`);
+        throw new Error(`[FFMPEG_RENDER_FAILED] Rendered clip ${i + 1} file is missing or corrupted.`);
       }
 
       const clipMediaCheck = verifyMediaHasVideoAndAudio(clipOutputPath);
       if (!clipMediaCheck.hasVideo || !clipMediaCheck.hasAudio) {
-        throw new Error(`[RENDER_FAILED] Rendered clip ${i + 1} fails stream check (video: ${clipMediaCheck.hasVideo}, audio: ${clipMediaCheck.hasAudio}).`);
+        throw new Error(`[FFMPEG_RENDER_FAILED] Rendered clip ${i + 1} fails stream check (video: ${clipMediaCheck.hasVideo}, audio: ${clipMediaCheck.hasAudio}).`);
       }
 
       // Thumbnail generation from actual clip
@@ -377,10 +395,15 @@ async function run() {
       await updateStatus('uploading', 90, 'processing');
       console.log(`[GitHubRunnerWorker] Uploading clip ${i + 1} to Firebase Storage...`);
 
-      const clipBuffer = fs.readFileSync(clipOutputPath);
-      const clipStorageRef = ref(storage, `workspaces/${workspaceId}/clips/${jobId}_${cand.id}.mp4`);
-      await uploadBytes(clipStorageRef, clipBuffer, { contentType: 'video/mp4' });
-      const videoDownloadUrl = await getDownloadURL(clipStorageRef);
+      let videoDownloadUrl;
+      try {
+        const clipBuffer = fs.readFileSync(clipOutputPath);
+        const clipStorageRef = ref(storage, `workspaces/${workspaceId}/clips/${jobId}_${cand.id}.mp4`);
+        await uploadBytes(clipStorageRef, clipBuffer, { contentType: 'video/mp4' });
+        videoDownloadUrl = await getDownloadURL(clipStorageRef);
+      } catch (uploadErr) {
+        throw new Error(`[FIREBASE_UPLOAD_FAILED] Failed to upload clip ${i + 1} to Storage: ${uploadErr.message}`);
+      }
 
       let thumbDownloadUrl = null;
       if (fs.existsSync(thumbOutputPath)) {
@@ -390,25 +413,29 @@ async function run() {
           await uploadBytes(thumbStorageRef, thumbBuffer, { contentType: 'image/jpeg' });
           thumbDownloadUrl = await getDownloadURL(thumbStorageRef);
         } catch (thumbUploadErr) {
-          console.warn(`[GitHubRunnerWorker] Thumbnail upload warning for clip ${i + 1}:`, thumbUploadErr.message);
+          console.warn(`[FIREBASE_UPLOAD_FAILED] Thumbnail upload warning for clip ${i + 1}:`, thumbUploadErr.message);
         }
       }
 
       // Save clip metadata to Firestore
-      await addDoc(clipsColRef, {
-        sourceVideoId: sourceVideoId || 'source',
-        jobId,
-        title: cand.hook,
-        hookText: cand.hook,
-        startTime: cand.startTime,
-        endTime: cand.endTime,
-        duration: cand.duration,
-        videoUrl: videoDownloadUrl,
-        thumbnailUrl: thumbDownloadUrl,
-        viralityScore: cand.score,
-        status: 'ready',
-        createdAt: new Date().toISOString(),
-      });
+      try {
+        await addDoc(clipsColRef, {
+          sourceVideoId: sourceVideoId || 'source',
+          jobId,
+          title: cand.hook,
+          hookText: cand.hook,
+          startTime: cand.startTime,
+          endTime: cand.endTime,
+          duration: cand.duration,
+          videoUrl: videoDownloadUrl,
+          thumbnailUrl: thumbDownloadUrl,
+          viralityScore: cand.score,
+          status: 'ready',
+          createdAt: new Date().toISOString(),
+        });
+      } catch (firestoreErr) {
+        throw new Error(`[FIRESTORE_UPDATE_FAILED] Failed to record clip metadata in Firestore: ${firestoreErr.message}`);
+      }
 
       generatedClips.push(cand);
     }
@@ -421,7 +448,7 @@ async function run() {
     try {
       await updateStatus('failed', 100, 'failed', err.message, 'WORKER_EXECUTION_FAILED');
     } catch (statusErr) {
-      console.error('[GitHubRunnerWorker] Failed to record final failure status to Firestore:', statusErr.message);
+      console.error('[FIRESTORE_UPDATE_FAILED] Failed to record final failure status to Firestore:', statusErr.message);
     }
     process.exit(1);
   } finally {

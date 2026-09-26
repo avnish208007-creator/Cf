@@ -87,7 +87,7 @@ export async function handleStartProcessing(req: Request, res: Response) {
       success: true,
       jobId,
       status: 'queued',
-      message: 'Video processing job started via Piped + Hugging Face worker.',
+      message: 'Video processing job started via Piped worker.',
     });
   } catch (err: any) {
     console.error('[handleStartProcessing] Error starting processing:', err);
