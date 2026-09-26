@@ -446,7 +446,10 @@ async function run() {
   } catch (err) {
     console.error('[GitHubRunnerWorker] Job failed:', err);
     try {
-      await updateStatus('failed', 100, 'failed', err.message, 'WORKER_EXECUTION_FAILED');
+      const errorCode = err.message.includes('PIPED_STREAM_RESOLUTION_FAILED')
+        ? 'PIPED_STREAM_RESOLUTION_FAILED'
+        : 'WORKER_EXECUTION_FAILED';
+      await updateStatus('failed', 100, 'failed', err.message, errorCode);
     } catch (statusErr) {
       console.error('[FIRESTORE_UPDATE_FAILED] Failed to record final failure status to Firestore:', statusErr.message);
     }

@@ -1,6 +1,7 @@
 /**
  * Standalone ES Module Piped Resolver for ClipFlow V1 Worker & Server
  * Pure JavaScript compatible with Node.js 18+ (no TypeScript or Vite transform required).
+ * Direct video stream resolution (/streams/{videoId}) across candidate instances.
  */
 import fetch from 'node-fetch';
 
@@ -37,10 +38,7 @@ const DYNAMIC_DISCOVERY_SOURCES = [
 export class PipedInstanceManager {
   constructor() {
     this.candidatePool = [...EMERGENCY_FALLBACK_INSTANCES];
-    this.validatedHealthyInstances = [];
     this.healthMap = new Map();
-    this.lastValidationTime = 0;
-    this.validationIntervalMs = 900000; // 15 minutes
   }
 
   normalizeUrl(rawUrl) {
@@ -74,7 +72,7 @@ export class PipedInstanceManager {
 
     for (const source of DYNAMIC_DISCOVERY_SOURCES) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
+      const timer = setTimeout(() => controller.abort(), 5000);
       try {
         const res = await fetch(source, {
           headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
@@ -99,7 +97,7 @@ export class PipedInstanceManager {
           }
         }
       } catch {
-        // Skip unavailable discovery endpoint
+        // Skip unavailable discovery endpoint gracefully
       } finally {
         clearTimeout(timer);
       }
@@ -110,117 +108,17 @@ export class PipedInstanceManager {
       if (norm) discovered.add(norm);
     }
 
-    this.candidatePool = Array.from(discovered);
-    console.log(`[PipedManager] Discovered ${this.candidatePool.length} candidate Piped instances.`);
+    this.candidatePool = Array.from(discovered).sort((a, b) => {
+      const ha = this.healthMap.get(a);
+      const hb = this.healthMap.get(b);
+      const fa = ha?.consecutiveFailures || 0;
+      const fb = hb?.consecutiveFailures || 0;
+      if (fa !== fb) return fa - fb;
+      return (ha?.latencyMs || 9999) - (hb?.latencyMs || 9999);
+    });
+
+    console.log(`[PipedManager] Discovered ${this.candidatePool.length} candidate Piped instance(s).`);
     return this.candidatePool;
-  }
-
-  async validateInstance(baseUrl) {
-    const start = Date.now();
-
-    // 1. Primary lightweight check: /config
-    const configUrl = `${baseUrl}/config`;
-    const controller1 = new AbortController();
-    const timer1 = setTimeout(() => controller1.abort(), 4000);
-    try {
-      const res = await fetch(configUrl, {
-        headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
-        signal: controller1.signal,
-      });
-
-      if (res.ok) {
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('json')) {
-          const text = await res.text();
-          const data = JSON.parse(text);
-          if (data && typeof data === 'object') {
-            const latencyMs = Date.now() - start;
-            this.recordSuccess(baseUrl, latencyMs);
-            return true;
-          }
-        }
-      }
-    } catch {
-      // Fallback to /trending?region=US if /config fails or times out
-    } finally {
-      clearTimeout(timer1);
-    }
-
-    // 2. Secondary check: /trending?region=US
-    const trendingUrl = `${baseUrl}/trending?region=US`;
-    const controller2 = new AbortController();
-    const timer2 = setTimeout(() => controller2.abort(), 4000);
-    try {
-      const res = await fetch(trendingUrl, {
-        headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
-        signal: controller2.signal,
-      });
-
-      if (!res.ok) {
-        this.recordFailure(baseUrl, `HTTP ${res.status}`);
-        return false;
-      }
-
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('json')) {
-        this.recordFailure(baseUrl, `Non-JSON response (${contentType})`);
-        return false;
-      }
-
-      const text = await res.text();
-      const data = JSON.parse(text);
-      if (Array.isArray(data)) {
-        const latencyMs = Date.now() - start;
-        this.recordSuccess(baseUrl, latencyMs);
-        return true;
-      }
-
-      this.recordFailure(baseUrl, 'Response is not a JSON array');
-      return false;
-    } catch (err) {
-      this.recordFailure(baseUrl, err.message || 'Network/timeout error');
-      return false;
-    } finally {
-      clearTimeout(timer2);
-    }
-  }
-
-  async getValidatedHealthyInstances(forceRefresh = false) {
-    const now = Date.now();
-    if (
-      forceRefresh ||
-      this.validatedHealthyInstances.length === 0 ||
-      now - this.lastValidationTime > this.validationIntervalMs
-    ) {
-      await this.discoverCandidates();
-      console.log(`[PipedManager] Validating ${this.candidatePool.length} candidate instances...`);
-
-      const results = await Promise.all(
-        this.candidatePool.map(async (candidate) => {
-          const isValid = await this.validateInstance(candidate);
-          return { candidate, isValid };
-        })
-      );
-
-      this.validatedHealthyInstances = results
-        .filter((r) => r.isValid)
-        .map((r) => r.candidate)
-        .sort((a, b) => {
-          const ha = this.healthMap.get(a);
-          const hb = this.healthMap.get(b);
-          const fa = ha?.consecutiveFailures || 0;
-          const fb = hb?.consecutiveFailures || 0;
-          if (fa !== fb) return fa - fb;
-          return (ha?.latencyMs || 9999) - (hb?.latencyMs || 9999);
-        });
-
-      this.lastValidationTime = Date.now();
-      console.log(
-        `[PipedManager] ${this.validatedHealthyInstances.length}/${this.candidatePool.length} instances passed health validation.`
-      );
-    }
-
-    return [...this.validatedHealthyInstances];
   }
 
   recordFailure(instanceUrl, reason) {
@@ -230,10 +128,12 @@ export class PipedInstanceManager {
       lastChecked: Date.now(),
       isHealthy: true,
       latencyMs: 9999,
+      lastFailureReason: null,
     };
     current.consecutiveFailures += 1;
     current.lastChecked = Date.now();
     current.isHealthy = false;
+    current.lastFailureReason = reason;
     this.healthMap.set(instanceUrl, current);
   }
 
@@ -244,15 +144,14 @@ export class PipedInstanceManager {
       lastChecked: Date.now(),
       isHealthy: true,
       latencyMs,
+      lastFailureReason: null,
     });
   }
 
   getStatus() {
     return {
       discoveredCount: this.candidatePool.length,
-      healthyCount: this.validatedHealthyInstances.length,
-      lastValidationTime: new Date(this.lastValidationTime).toISOString(),
-      validatedInstances: this.validatedHealthyInstances,
+      healthMap: Array.from(this.healthMap.entries()),
     };
   }
 }
@@ -276,23 +175,46 @@ export async function resolvePipedStream(youtubeUrlOrId) {
     throw new Error(`[PIPED_INVALID_RESPONSE] Invalid YouTube video ID extracted from "${youtubeUrlOrId}"`);
   }
 
-  let healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances();
-  let lastError = null;
-  let attempts = 0;
+  console.log(`[PipedResolver] Beginning video stream resolution for video ID: ${videoId}...`);
 
-  while (attempts < 2) {
-    if (healthyInstances.length === 0) {
-      console.warn(`[PipedResolver] No validated healthy instances in pool. Force refreshing discovery...`);
-      healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances(true);
+  const stats = {
+    discovered: 0,
+    streamAttempts: 0,
+    http500: 0,
+    http403: 0,
+    http404: 0,
+    http429: 0,
+    http502_503_504: 0,
+    timeouts: 0,
+    dnsFailures: 0,
+    invalidResponses: 0,
+    noUsableStreams: 0,
+  };
+
+  const triedInstances = new Set();
+
+  for (let pass = 1; pass <= 2; pass++) {
+    const candidates = await pipedInstanceManager.discoverCandidates();
+    stats.discovered = candidates.length;
+
+    const remainingCandidates = candidates.filter((c) => !triedInstances.has(c));
+    if (remainingCandidates.length === 0 && pass > 1) {
+      break;
     }
 
-    for (let i = 0; i < healthyInstances.length; i++) {
-      const instance = healthyInstances[i];
-      const endpoint = `${instance}/streams/${videoId}`;
-      console.log(`[PipedResolver] Trying instance ${i + 1}/${healthyInstances.length}: ${instance} for video ${videoId}...`);
+    console.log(`[PipedResolver] Pass ${pass}: Testing ${remainingCandidates.length} candidate instance(s) for video ${videoId}...`);
 
+    for (let i = 0; i < remainingCandidates.length; i++) {
+      const instance = remainingCandidates[i];
+      triedInstances.add(instance);
+      stats.streamAttempts++;
+
+      const endpoint = `${instance}/streams/${videoId}`;
+      console.log(`[PipedResolver] Trying candidate ${stats.streamAttempts}/${stats.discovered}: ${instance}`);
+
+      const start = Date.now();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
+      const timer = setTimeout(() => controller.abort(), 12000); // 12-second per-instance timeout
 
       try {
         const res = await fetch(endpoint, {
@@ -302,14 +224,26 @@ export async function resolvePipedStream(youtubeUrlOrId) {
           },
           signal: controller.signal,
         });
+        const latencyMs = Date.now() - start;
 
         if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
+          if (res.status === 500) stats.http500++;
+          else if (res.status === 403) stats.http403++;
+          else if (res.status === 404) stats.http404++;
+          else if (res.status === 429) stats.http429++;
+          else if ([502, 503, 504].includes(res.status)) stats.http502_503_504++;
+
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Endpoint: /streams/${videoId} | Status: HTTP ${res.status} (${latencyMs}ms)`);
+          pipedInstanceManager.recordFailure(instance, `HTTP ${res.status}`);
+          continue;
         }
 
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('json')) {
-          throw new Error(`Non-JSON content-type (${contentType})`);
+          stats.invalidResponses++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Non-JSON content-type (${contentType})`);
+          pipedInstanceManager.recordFailure(instance, `Non-JSON content-type (${contentType})`);
+          continue;
         }
 
         const text = await res.text();
@@ -317,18 +251,27 @@ export async function resolvePipedStream(youtubeUrlOrId) {
         try {
           data = JSON.parse(text);
         } catch {
-          throw new Error('Invalid JSON response body');
+          stats.invalidResponses++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Invalid JSON syntax`);
+          pipedInstanceManager.recordFailure(instance, 'Invalid JSON body');
+          continue;
         }
 
-        if (data.error || data.message) {
-          throw new Error(data.error || data.message);
+        // Handle error payloads from Piped
+        if ((data.error || data.message) && !data.videoStreams && !data.url) {
+          stats.invalidResponses++;
+          const msg = data.error || data.message;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Piped error response (${msg})`);
+          pipedInstanceManager.recordFailure(instance, `Piped API error: ${msg}`);
+          continue;
         }
 
-        if (!data || (!data.videoStreams && !data.url)) {
-          throw new Error('Response JSON missing videoStreams or url');
+        if (!data) {
+          stats.invalidResponses++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Empty JSON body`);
+          pipedInstanceManager.recordFailure(instance, 'Empty JSON body');
+          continue;
         }
-
-        pipedInstanceManager.recordSuccess(instance);
 
         const title = data.title || `YouTube Video ${videoId}`;
         const durationSeconds = Number(data.duration) || 0;
@@ -356,10 +299,23 @@ export async function resolvePipedStream(youtubeUrlOrId) {
         }
 
         if (!videoStreamUrl && !combinedUrl) {
-          throw new Error('No valid video or combined stream URLs found in response');
+          stats.noUsableStreams++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: No usable video or combined stream URLs in JSON`);
+          pipedInstanceManager.recordFailure(instance, 'No usable video or combined stream URLs');
+          continue;
         }
 
-        console.log(`[PipedResolver] Stream resolution succeeded from instance ${instance}`);
+        // SUCCESS!
+        console.log(`[PipedResolver] SUCCESS -> Video ID: ${videoId}`);
+        console.log(`  Instance: ${instance}`);
+        console.log(`  Title: "${title}"`);
+        console.log(`  Combined Stream: ${combinedUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
+        console.log(`  Video Stream: ${videoStreamUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
+        console.log(`  Audio Stream: ${audioStreamUrl ? 'AVAILABLE' : 'UNAVAILABLE'}`);
+        console.log(`  Latency: ${latencyMs}ms`);
+
+        pipedInstanceManager.recordSuccess(instance, latencyMs);
+
         return {
           sourceVideoId: videoId,
           sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
@@ -372,34 +328,43 @@ export async function resolvePipedStream(youtubeUrlOrId) {
           instanceUsed: instance,
         };
       } catch (err) {
-        console.warn(`[PipedResolver] Instance ${instance} failed: ${err.message}`);
-        pipedInstanceManager.recordFailure(instance, err.message);
-        lastError = err;
+        const latencyMs = Date.now() - start;
+        if (err.name === 'AbortError') {
+          stats.timeouts++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: Timeout (>12s) (${latencyMs}ms)`);
+          pipedInstanceManager.recordFailure(instance, 'Timeout (>12s)');
+        } else if (err.message.includes('ENOTFOUND') || err.message.includes('EAI_AGAIN')) {
+          stats.dnsFailures++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: DNS failure (${err.message})`);
+          pipedInstanceManager.recordFailure(instance, `DNS failure: ${err.message}`);
+        } else {
+          stats.invalidResponses++;
+          console.warn(`[PipedResolver] FAILED -> Instance: ${instance} | Reason: ${err.message}`);
+          pipedInstanceManager.recordFailure(instance, err.message);
+        }
       } finally {
         clearTimeout(timer);
       }
     }
-
-    if (attempts === 0) {
-      console.log(`[PipedResolver] All validated instances failed on first pass. Refreshing discovery & re-validating...`);
-      healthyInstances = await pipedInstanceManager.getValidatedHealthyInstances(true);
-    }
-    attempts++;
   }
 
-  throw new Error(
-    `[PIPED_INSTANCE_UNAVAILABLE] No healthy Piped API instance could resolve this video after discovery and retry. Last error: ${lastError?.message || 'Unknown error'}`
-  );
+  const diagnosticMsg =
+    `[PIPED_STREAM_RESOLUTION_FAILED] No discovered Piped API instance could resolve YouTube video ${videoId}. ` +
+    `Diagnostics: discovered=${stats.discovered}, streamAttempts=${stats.streamAttempts}, http500=${stats.http500}, ` +
+    `http403=${stats.http403}, http404=${stats.http404}, http429=${stats.http429}, http5xx=${stats.http502_503_504}, ` +
+    `timeouts=${stats.timeouts}, dnsFailures=${stats.dnsFailures}, invalidResponses=${stats.invalidResponses}, noUsableStreams=${stats.noUsableStreams}.`;
+
+  console.error(diagnosticMsg);
+  throw new Error(diagnosticMsg);
 }
 
 export async function checkPipedHealth() {
   try {
     const status = pipedInstanceManager.getStatus();
-    const healthy = status.healthyCount > 0;
     return {
       configured: true,
-      reachable: healthy,
-      details: `${status.healthyCount}/${status.discoveredCount} Piped instances validated healthy`,
+      reachable: status.discoveredCount > 0,
+      details: `${status.discoveredCount} Piped instances available for stream resolution`,
       status,
     };
   } catch (err) {
