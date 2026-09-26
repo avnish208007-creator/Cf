@@ -16,22 +16,17 @@ const databaseId = process.env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.f
 
 const app: FirebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-function createFirestoreInstance(): Firestore {
+function getFirestoreInstance(): Firestore {
   try {
-    if (getApps().length > 0) {
-      // If already initialized, try getFirestore first
-      try {
-        return databaseId ? getFirestore(app, databaseId) : getFirestore(app);
-      } catch {}
-    }
-    const settings = { experimentalAutoDetectLongPolling: true };
-    return databaseId ? initializeFirestore(app, settings, databaseId) : initializeFirestore(app, settings);
+    return databaseId
+      ? initializeFirestore(app, { experimentalAutoDetectLongPolling: true }, databaseId)
+      : initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
   } catch {
     return databaseId ? getFirestore(app, databaseId) : getFirestore(app);
   }
 }
 
-export const db: Firestore = createFirestoreInstance();
+export const db: Firestore = getFirestoreInstance();
 export const storage: FirebaseStorage = getStorage(app);
 export const DEFAULT_WORKSPACE_ID = 'default-workspace';
 

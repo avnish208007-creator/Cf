@@ -1,13 +1,13 @@
 /**
  * Focused Resolver & Media Accessibility Test
  * Usage: node worker/testPipedResolver.js [videoId]
- * Example: node worker/testPipedResolver.js 7xTGNNLPyMI
+ * Example: node worker/testPipedResolver.js ZHH3sr234zY
  */
 import { resolveStream } from './pipedResolver.js';
 
 async function main() {
   const args = process.argv.slice(2);
-  const videoId = args[0] || '7xTGNNLPyMI';
+  const videoId = args[0] || 'ZHH3sr234zY';
 
   console.log(`[testResolver] Running multi-provider stream resolution & Range probe test for video ID: ${videoId}...`);
 
