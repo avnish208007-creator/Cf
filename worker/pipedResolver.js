@@ -1,8 +1,11 @@
 /**
- * Robust Multi-Provider YouTube Stream Resolver for ClipFlow V1 Worker
+ * Robust Multi-Provider YouTube Stream Resolver & Media Accessibility Prober
  * Pure Node.js 20+ ES module. Zero external package dependencies.
- * Fast Batched Resolution across Providers: 1. Piped (/streams/{videoId}) -> 2. Invidious (/api/v1/videos/{videoId})
+ * Providers: 1. Piped (/streams/{videoId}) -> 2. Invidious (/api/v1/videos/{videoId})
+ * Probing: Range: bytes=0-1023 probe validation before returning candidates.
  */
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const PIPED_FALLBACK_INSTANCES = [
   'https://pipedapi.ducks.party',
@@ -97,6 +100,64 @@ function isAbsoluteHttpUrl(url) {
   }
 }
 
+function getUrlHost(url) {
+  if (!url) return 'unknown';
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+/**
+ * LIGHTWEIGHT HTTP RANGE PROBE
+ * Verifies that the GitHub Actions runner can actually download the stream (HTTP 200/206, non-HTML).
+ */
+export async function probeMediaStreamUrl(url, timeoutMs = 6000) {
+  if (!url || !isAbsoluteHttpUrl(url)) {
+    return { ok: false, status: 0, host: 'invalid', reason: 'Invalid or non-absolute URL' };
+  }
+
+  const host = getUrlHost(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Range': 'bytes=0-1023',
+        'Accept': '*/*',
+      },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+
+    const status = res.status;
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      console.warn(`[MediaProbe] host=${host} status=${status} contentType=${contentType} -> REJECTED (Non-binary payload)`);
+      return { ok: false, status, host, reason: `Non-binary payload (${contentType})` };
+    }
+
+    if (status === 200 || status === 206) {
+      console.log(`[MediaProbe] host=${host} status=${status} contentType=${contentType} -> VERIFIED_ACCESSIBLE`);
+      return { ok: true, status, host, contentType };
+    }
+
+    console.warn(`[MediaProbe] host=${host} status=${status} contentType=${contentType} -> REJECTED (HTTP ${status})`);
+    return { ok: false, status, host, reason: `HTTP ${status}` };
+  } catch (err) {
+    const reason = err.name === 'AbortError' ? 'Timeout (>6s)' : err.message;
+    console.warn(`[MediaProbe] host=${host} -> REJECTED (${reason})`);
+    return { ok: false, status: 0, host, reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export class PipedInstanceManager {
   constructor() {
     this.healthMap = new Map();
@@ -117,7 +178,7 @@ export class PipedInstanceManager {
       const timer = setTimeout(() => controller.abort(), 3000);
       try {
         const res = await fetch(source, {
-          headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+          headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
           signal: controller.signal,
         });
 
@@ -139,7 +200,7 @@ export class PipedInstanceManager {
           }
         }
       } catch {
-        // Skip unavailable discovery endpoint gracefully
+        // Skip unavailable discovery source
       } finally {
         clearTimeout(timer);
       }
@@ -211,7 +272,7 @@ async function discoverInvidiousCandidates() {
     const timer = setTimeout(() => controller.abort(), 3000);
     try {
       const res = await fetch(source, {
-        headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+        headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
         signal: controller.signal,
       });
 
@@ -232,7 +293,7 @@ async function discoverInvidiousCandidates() {
         }
       }
     } catch {
-      // Skip unavailable Invidious discovery endpoint
+      // Skip unavailable discovery source
     } finally {
       clearTimeout(timer);
     }
@@ -248,7 +309,8 @@ async function discoverInvidiousCandidates() {
 
 function updateGlobalStats(err, res, stats) {
   if (res) {
-    if (res.status === 403) stats.http403++;
+    if (res.status === 401) stats.http401++;
+    else if (res.status === 403) stats.http403++;
     else if (res.status === 404) stats.http404++;
     else if (res.status === 429) stats.http429++;
     else if (res.status >= 500) stats.http5xx++;
@@ -261,18 +323,18 @@ function updateGlobalStats(err, res, stats) {
 }
 
 /**
- * Single candidate attempt for Piped
+ * Single PIPED candidate fetch + probe validation
  */
-async function fetchPipedCandidate(instance, videoId, globalStats) {
+async function fetchAndProbePipedCandidate(instance, videoId, globalStats) {
   globalStats.pipedAttempted++;
   const endpoint = `${instance}/streams/${videoId}`;
   const start = Date.now();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
+  const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
     const res = await fetch(endpoint, {
-      headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+      headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
       signal: controller.signal,
     });
     const latencyMs = Date.now() - start;
@@ -312,6 +374,8 @@ async function fetchPipedCandidate(instance, videoId, globalStats) {
       return null;
     }
 
+    globalStats.candidatesResolved++;
+
     const title = data.title || `YouTube Video ${videoId}`;
     const durationSeconds = Number(data.duration) || 0;
     const thumbnailUrl = isAbsoluteHttpUrl(data.thumbnailUrl)
@@ -323,9 +387,9 @@ async function fetchPipedCandidate(instance, videoId, globalStats) {
     const videoStreams = Array.isArray(data.videoStreams) ? data.videoStreams : [];
     const audioStreams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
 
+    let combinedUrl = data.url && isAbsoluteHttpUrl(data.url) ? data.url : null;
     let videoStreamUrl = null;
     let audioStreamUrl = null;
-    let combinedUrl = null;
 
     const bestVideo = videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('video/mp4')) ||
       videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
@@ -335,24 +399,52 @@ async function fetchPipedCandidate(instance, videoId, globalStats) {
       audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
     if (bestAudio?.url) audioStreamUrl = bestAudio.url;
 
-    if (data.url && typeof data.url === 'string' && isAbsoluteHttpUrl(data.url)) {
-      combinedUrl = data.url;
+    // --- LIGHTWEIGHT HTTP RANGE PROBE VERIFICATION ---
+    let verifiedCombinedUrl = null;
+    let verifiedVideoStreamUrl = null;
+    let verifiedAudioStreamUrl = null;
+
+    if (combinedUrl) {
+      globalStats.candidatesProbed++;
+      const combinedProbe = await probeMediaStreamUrl(combinedUrl);
+      if (combinedProbe.ok) {
+        verifiedCombinedUrl = combinedUrl;
+      } else {
+        updateGlobalStats(null, { status: combinedProbe.status }, globalStats);
+      }
     }
 
-    if (!videoStreamUrl && !combinedUrl) {
+    if (!verifiedCombinedUrl && videoStreamUrl && audioStreamUrl) {
+      globalStats.candidatesProbed += 2;
+      const [vProbe, aProbe] = await Promise.all([
+        probeMediaStreamUrl(videoStreamUrl),
+        probeMediaStreamUrl(audioStreamUrl),
+      ]);
+
+      if (vProbe.ok && aProbe.ok) {
+        verifiedVideoStreamUrl = videoStreamUrl;
+        verifiedAudioStreamUrl = audioStreamUrl;
+      } else {
+        if (!vProbe.ok) updateGlobalStats(null, { status: vProbe.status }, globalStats);
+        if (!aProbe.ok) updateGlobalStats(null, { status: aProbe.status }, globalStats);
+      }
+    }
+
+    if (!verifiedCombinedUrl && (!verifiedVideoStreamUrl || !verifiedAudioStreamUrl)) {
       globalStats.noUsableStreams++;
-      pipedInstanceManager.recordFailure(instance, 'No usable stream URLs');
+      pipedInstanceManager.recordFailure(instance, 'Candidate stream probe failed accessibility check');
       return null;
     }
 
+    globalStats.candidatesDownloadable++;
     pipedInstanceManager.recordSuccess(instance, latencyMs);
 
     return {
       sourceVideoId: videoId,
       sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      videoStreamUrl,
-      audioStreamUrl,
-      combinedUrl,
+      videoStreamUrl: verifiedVideoStreamUrl,
+      audioStreamUrl: verifiedAudioStreamUrl,
+      combinedUrl: verifiedCombinedUrl,
       durationSeconds,
       title,
       thumbnailUrl,
@@ -388,7 +480,7 @@ async function resolvePipedProvider(videoId, globalStats) {
       batch.forEach((c) => triedInstances.add(c));
 
       console.log(`[PipedProvider] Testing candidate batch ${Math.floor(i / batchSize) + 1} (${batch.length} instances)...`);
-      const results = await Promise.all(batch.map((inst) => fetchPipedCandidate(inst, videoId, globalStats)));
+      const results = await Promise.all(batch.map((inst) => fetchAndProbePipedCandidate(inst, videoId, globalStats)));
       const successful = results.find((r) => r !== null);
       if (successful) {
         return successful;
@@ -400,18 +492,44 @@ async function resolvePipedProvider(videoId, globalStats) {
 }
 
 /**
- * Single candidate attempt for Invidious
+ * Constructs Invidious proxied media URL (using local=true or server proxy path)
  */
-async function fetchInvidiousCandidate(instance, videoId, globalStats) {
+function buildInvidiousProxiedUrl(instance, rawUrl, itag = null, videoId = null) {
+  if (!rawUrl) return null;
+
+  // 1. If relative URL starting with /
+  if (rawUrl.startsWith('/')) {
+    const connector = rawUrl.includes('?') ? '&' : '?';
+    return `${instance}${rawUrl}${connector}local=true`;
+  }
+
+  // 2. If itag and videoId are present, construct standard Invidious proxy URL
+  if (itag && videoId) {
+    return `${instance}/latest_version?id=${videoId}&itag=${itag}&local=true`;
+  }
+
+  // 3. Append local=true to absolute URL if missing
+  if (rawUrl.includes('local=true')) {
+    return rawUrl;
+  }
+
+  const connector = rawUrl.includes('?') ? '&' : '?';
+  return `${rawUrl}${connector}local=true`;
+}
+
+/**
+ * Single INVIDIOUS candidate fetch + probe validation
+ */
+async function fetchAndProbeInvidiousCandidate(instance, videoId, globalStats) {
   globalStats.invidiousAttempted++;
   const endpoint = `${instance}/api/v1/videos/${videoId}`;
   const start = Date.now();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
+  const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
     const res = await fetch(endpoint, {
-      headers: { 'User-Agent': 'ClipFlow/1.0', 'Accept': 'application/json' },
+      headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
       signal: controller.signal,
     });
     const latencyMs = Date.now() - start;
@@ -441,6 +559,8 @@ async function fetchInvidiousCandidate(instance, videoId, globalStats) {
       return null;
     }
 
+    globalStats.candidatesResolved++;
+
     const title = data.title || `YouTube Video ${videoId}`;
     const durationSeconds = Number(data.lengthSeconds) || 0;
 
@@ -455,49 +575,84 @@ async function fetchInvidiousCandidate(instance, videoId, globalStats) {
     const formatStreams = Array.isArray(data.formatStreams) ? data.formatStreams : [];
     const adaptiveFormats = Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats : [];
 
-    let combinedUrl = null;
-    let videoStreamUrl = null;
-    let audioStreamUrl = null;
+    // Probe combined formats first
+    for (const stream of formatStreams) {
+      if (!stream.url) continue;
 
-    // Select combined stream
-    const bestCombined = formatStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && (s.container === 'mp4' || s.type?.includes('mp4'))) ||
-      formatStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
-    if (bestCombined?.url) {
-      combinedUrl = bestCombined.url;
+      // Construct proxied URL with local=true
+      const proxiedCombined = buildInvidiousProxiedUrl(instance, stream.url, stream.itag, videoId);
+      const rawCombined = isAbsoluteHttpUrl(stream.url) ? stream.url : `${instance}${stream.url}`;
+
+      // Probe proxied URL first, fallback to raw
+      globalStats.candidatesProbed++;
+      let probe = await probeMediaStreamUrl(proxiedCombined);
+      let targetUrl = proxiedCombined;
+
+      if (!probe.ok && rawCombined !== proxiedCombined) {
+        probe = await probeMediaStreamUrl(rawCombined);
+        targetUrl = rawCombined;
+      }
+
+      if (probe.ok) {
+        globalStats.candidatesDownloadable++;
+        return {
+          sourceVideoId: videoId,
+          sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
+          videoStreamUrl: null,
+          audioStreamUrl: null,
+          combinedUrl: targetUrl,
+          durationSeconds,
+          title,
+          thumbnailUrl,
+          provider: 'invidious',
+          instanceUsed: instance,
+          latencyMs,
+        };
+      } else {
+        updateGlobalStats(null, { status: probe.status }, globalStats);
+      }
     }
 
-    // Select video stream
-    const bestVideo = adaptiveFormats.find((s) => s.url && isAbsoluteHttpUrl(s.url) && (s.type?.includes('video/mp4') || s.mimeType?.includes('video/mp4'))) ||
-      adaptiveFormats.find((s) => s.url && isAbsoluteHttpUrl(s.url) && (s.type?.includes('video/') || s.mimeType?.includes('video/')));
-    if (bestVideo?.url) {
-      videoStreamUrl = bestVideo.url;
+    // Probe adaptive formats (separate video & audio)
+    const bestVideo = adaptiveFormats.find((s) => s.url && (s.type?.includes('video/mp4') || s.mimeType?.includes('video/mp4'))) ||
+      adaptiveFormats.find((s) => s.url && (s.type?.includes('video/') || s.mimeType?.includes('video/')));
+
+    const bestAudio = adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/mp4') || s.type?.includes('audio/m4a') || s.mimeType?.includes('audio/mp4'))) ||
+      adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/') || s.mimeType?.includes('audio/')));
+
+    if (bestVideo?.url && bestAudio?.url) {
+      const proxiedVideo = buildInvidiousProxiedUrl(instance, bestVideo.url, bestVideo.itag, videoId);
+      const proxiedAudio = buildInvidiousProxiedUrl(instance, bestAudio.url, bestAudio.itag, videoId);
+
+      globalStats.candidatesProbed += 2;
+      const [vProbe, aProbe] = await Promise.all([
+        probeMediaStreamUrl(proxiedVideo),
+        probeMediaStreamUrl(proxiedAudio),
+      ]);
+
+      if (vProbe.ok && aProbe.ok) {
+        globalStats.candidatesDownloadable++;
+        return {
+          sourceVideoId: videoId,
+          sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
+          videoStreamUrl: proxiedVideo,
+          audioStreamUrl: proxiedAudio,
+          combinedUrl: null,
+          durationSeconds,
+          title,
+          thumbnailUrl,
+          provider: 'invidious',
+          instanceUsed: instance,
+          latencyMs,
+        };
+      } else {
+        if (!vProbe.ok) updateGlobalStats(null, { status: vProbe.status }, globalStats);
+        if (!aProbe.ok) updateGlobalStats(null, { status: aProbe.status }, globalStats);
+      }
     }
 
-    // Select audio stream
-    const bestAudio = adaptiveFormats.find((s) => s.url && isAbsoluteHttpUrl(s.url) && (s.type?.includes('audio/mp4') || s.type?.includes('audio/m4a') || s.mimeType?.includes('audio/mp4'))) ||
-      adaptiveFormats.find((s) => s.url && isAbsoluteHttpUrl(s.url) && (s.type?.includes('audio/') || s.mimeType?.includes('audio/')));
-    if (bestAudio?.url) {
-      audioStreamUrl = bestAudio.url;
-    }
-
-    if (!combinedUrl && !videoStreamUrl) {
-      globalStats.noUsableStreams++;
-      return null;
-    }
-
-    return {
-      sourceVideoId: videoId,
-      sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      videoStreamUrl,
-      audioStreamUrl,
-      combinedUrl,
-      durationSeconds,
-      title,
-      thumbnailUrl,
-      provider: 'invidious',
-      instanceUsed: instance,
-      latencyMs,
-    };
+    globalStats.noUsableStreams++;
+    return null;
   } catch (err) {
     updateGlobalStats(err, null, globalStats);
     return null;
@@ -517,7 +672,7 @@ async function resolveInvidiousProvider(videoId, globalStats) {
   for (let i = 0; i < candidates.length; i += batchSize) {
     const batch = candidates.slice(i, i + batchSize);
     console.log(`[InvidiousProvider] Testing candidate batch ${Math.floor(i / batchSize) + 1} (${batch.length} instances)...`);
-    const results = await Promise.all(batch.map((inst) => fetchInvidiousCandidate(inst, videoId, globalStats)));
+    const results = await Promise.all(batch.map((inst) => fetchAndProbeInvidiousCandidate(inst, videoId, globalStats)));
     const successful = results.find((r) => r !== null);
     if (successful) {
       return successful;
@@ -541,7 +696,11 @@ export async function resolveStream(youtubeUrlOrId) {
     invidiousDiscovered: 0,
     invidiousAttempted: 0,
     invidiousSuccess: 0,
+    candidatesResolved: 0,
+    candidatesProbed: 0,
+    candidatesDownloadable: 0,
     timeouts: 0,
+    http401: 0,
     http403: 0,
     http404: 0,
     http429: 0,
@@ -553,7 +712,7 @@ export async function resolveStream(youtubeUrlOrId) {
   };
 
   // STEP 1: PIPED PROVIDER
-  console.log(`[MultiProviderResolver] Attempting Piped provider for video ID: ${videoId}...`);
+  console.log(`[MultiProviderResolver] Attempting Piped provider with Range stream probing for video ID: ${videoId}...`);
   try {
     const pipedResult = await resolvePipedProvider(videoId, globalStats);
     if (pipedResult) {
@@ -566,7 +725,7 @@ export async function resolveStream(youtubeUrlOrId) {
   }
 
   // STEP 2: INVIDIOUS PROVIDER
-  console.log(`[MultiProviderResolver] Falling back to Invidious provider for video ID: ${videoId}...`);
+  console.log(`[MultiProviderResolver] Falling back to Invidious provider with Range stream probing for video ID: ${videoId}...`);
   try {
     const invidiousResult = await resolveInvidiousProvider(videoId, globalStats);
     if (invidiousResult) {
@@ -580,10 +739,11 @@ export async function resolveStream(youtubeUrlOrId) {
 
   // STEP 3: FINAL DIAGNOSTIC ERROR
   const diagnosticMsg =
-    `[PIPED_STREAM_RESOLUTION_FAILED] Neither Piped nor Invidious providers could resolve YouTube video ${videoId}.\n` +
+    `[PIPED_STREAM_RESOLUTION_FAILED] Neither Piped nor Invidious providers could resolve a downloadable stream for YouTube video ${videoId}.\n` +
     `Diagnostics: videoId=${globalStats.videoId}, pipedDiscovered=${globalStats.pipedDiscovered}, pipedAttempted=${globalStats.pipedAttempted}, pipedSuccess=${globalStats.pipedSuccess}, ` +
     `invidiousDiscovered=${globalStats.invidiousDiscovered}, invidiousAttempted=${globalStats.invidiousAttempted}, invidiousSuccess=${globalStats.invidiousSuccess}, ` +
-    `timeouts=${globalStats.timeouts}, http403=${globalStats.http403}, http404=${globalStats.http404}, http429=${globalStats.http429}, http5xx=${globalStats.http5xx}, ` +
+    `candidatesResolved=${globalStats.candidatesResolved}, candidatesProbed=${globalStats.candidatesProbed}, candidatesDownloadable=${globalStats.candidatesDownloadable}, ` +
+    `timeouts=${globalStats.timeouts}, http401=${globalStats.http401}, http403=${globalStats.http403}, http404=${globalStats.http404}, http429=${globalStats.http429}, http5xx=${globalStats.http5xx}, ` +
     `dnsFailures=${globalStats.dnsFailures}, tlsFailures=${globalStats.tlsFailures}, invalidResponses=${globalStats.invalidResponses}, noUsableStreams=${globalStats.noUsableStreams}.`;
 
   console.error(diagnosticMsg);

@@ -91,12 +91,21 @@ async function downloadFileStream(url, destPath, timeoutMs = 90000) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: { 'User-Agent': 'ClipFlow-Worker/1.0' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+      },
+      redirect: 'follow',
       signal: controller.signal,
     });
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      throw new Error(`Server returned non-binary payload instead of media stream (${contentType})`);
     }
 
     const fileStream = fs.createWriteStream(destPath);
