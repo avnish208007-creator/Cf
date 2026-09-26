@@ -1,8 +1,18 @@
 /**
- * Robust Multi-Provider YouTube Stream Resolver & Media Accessibility Prober
- * Pure Node.js 20+ ES module. Zero external package dependencies.
- * Providers: 1. Piped (/streams/{videoId}) -> 2. Invidious (/api/v1/videos/{videoId})
- * Probing: Range: bytes=0-1023 probe validation before returning candidates.
+ * Robust Multi-Provider YouTube Stream Resolver & Range-Probed Media Acquisition
+ * Pure Node.js 20+ ES Module. Zero external package dependencies.
+ *
+ * Pipeline Architecture:
+ *   resolveStream(videoId)
+ *     ├── tryPipedProvider(videoId, stats)
+ *     │     ├── GET {instance}/streams/{videoId}
+ *     │     ├── normalizePipedCandidates(data, instance)
+ *     │     └── probeAndSelectCandidate(candidates, stats)
+ *     │
+ *     └── tryInvidiousProvider(videoId, stats) [Fallback]
+ *           ├── GET {instance}/api/v1/videos/{videoId}
+ *           ├── normalizeInvidiousCandidates(data, instance, videoId)
+ *           └── probeAndSelectCandidate(candidates, stats)
  */
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -111,7 +121,7 @@ function getUrlHost(url) {
 
 /**
  * LIGHTWEIGHT HTTP RANGE PROBE
- * Verifies that the GitHub Actions runner can actually download the stream (HTTP 200/206, non-HTML).
+ * Tests whether a stream URL is accessible and returns binary media bytes (200/206).
  */
 export async function probeMediaStreamUrl(url, timeoutMs = 6000) {
   if (!url || !isAbsoluteHttpUrl(url)) {
@@ -307,208 +317,120 @@ async function discoverInvidiousCandidates() {
   return Array.from(discovered);
 }
 
-function updateGlobalStats(err, res, stats) {
-  if (res) {
-    if (res.status === 401) stats.http401++;
-    else if (res.status === 403) stats.http403++;
-    else if (res.status === 404) stats.http404++;
-    else if (res.status === 429) stats.http429++;
-    else if (res.status >= 500) stats.http5xx++;
-  } else if (err) {
-    if (err.name === 'AbortError') stats.timeouts++;
-    else if (err.message?.includes('CERT_') || err.message?.includes('SSL') || err.message?.includes('tls') || err.message?.includes('certificate')) stats.tlsFailures++;
-    else if (err.message?.includes('ENOTFOUND') || err.message?.includes('EAI_AGAIN')) stats.dnsFailures++;
-    else stats.invalidResponses++;
-  }
+function updateStatsFromStatus(status, stats) {
+  if (status === 401) stats.http401++;
+  else if (status === 403) stats.http403++;
+  else if (status === 404) stats.http404++;
+  else if (status === 429) stats.http429++;
+  else if (status >= 500) stats.http5xx++;
+}
+
+function updateStatsFromError(err, stats) {
+  if (err.name === 'AbortError') stats.timeouts++;
+  else if (err.message?.includes('CERT_') || err.message?.includes('SSL') || err.message?.includes('tls') || err.message?.includes('certificate')) stats.tlsFailures++;
+  else if (err.message?.includes('ENOTFOUND') || err.message?.includes('EAI_AGAIN')) stats.dnsFailures++;
+  else stats.invalidResponses++;
 }
 
 /**
- * Single PIPED candidate fetch + probe validation
+ * NORMALIZATION LAYER - PIPED
  */
-async function fetchAndProbePipedCandidate(instance, videoId, globalStats) {
-  globalStats.pipedAttempted++;
-  const endpoint = `${instance}/streams/${videoId}`;
-  const start = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+function normalizePipedCandidates(data, instance) {
+  if (!data || typeof data !== 'object') return [];
 
-  try {
-    const res = await fetch(endpoint, {
-      headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
-      signal: controller.signal,
-    });
-    const latencyMs = Date.now() - start;
+  const title = data.title || `YouTube Video`;
+  const durationSeconds = Number(data.duration) || 0;
+  const thumbnailUrl = isAbsoluteHttpUrl(data.thumbnailUrl)
+    ? data.thumbnailUrl
+    : isAbsoluteHttpUrl(data.thumbnail)
+    ? data.thumbnail
+    : '';
 
-    if (!res.ok) {
-      updateGlobalStats(null, res, globalStats);
-      pipedInstanceManager.recordFailure(instance, `HTTP ${res.status}`);
-      return null;
-    }
+  const candidates = [];
 
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('json')) {
-      globalStats.invalidResponses++;
-      pipedInstanceManager.recordFailure(instance, `Non-JSON (${contentType})`);
-      return null;
-    }
-
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      globalStats.invalidResponses++;
-      pipedInstanceManager.recordFailure(instance, 'Invalid JSON body');
-      return null;
-    }
-
-    if ((data.error || data.message) && !data.videoStreams && !data.url) {
-      globalStats.invalidResponses++;
-      pipedInstanceManager.recordFailure(instance, `Piped error: ${data.error || data.message}`);
-      return null;
-    }
-
-    if (!data) {
-      globalStats.invalidResponses++;
-      pipedInstanceManager.recordFailure(instance, 'Empty JSON');
-      return null;
-    }
-
-    globalStats.candidatesResolved++;
-
-    const title = data.title || `YouTube Video ${videoId}`;
-    const durationSeconds = Number(data.duration) || 0;
-    const thumbnailUrl = isAbsoluteHttpUrl(data.thumbnailUrl)
-      ? data.thumbnailUrl
-      : isAbsoluteHttpUrl(data.thumbnail)
-      ? data.thumbnail
-      : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
-    const videoStreams = Array.isArray(data.videoStreams) ? data.videoStreams : [];
-    const audioStreams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
-
-    let combinedUrl = data.url && isAbsoluteHttpUrl(data.url) ? data.url : null;
-    let videoStreamUrl = null;
-    let audioStreamUrl = null;
-
-    const bestVideo = videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('video/mp4')) ||
-      videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
-    if (bestVideo?.url) videoStreamUrl = bestVideo.url;
-
-    const bestAudio = audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('audio/')) ||
-      audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
-    if (bestAudio?.url) audioStreamUrl = bestAudio.url;
-
-    // --- LIGHTWEIGHT HTTP RANGE PROBE VERIFICATION ---
-    let verifiedCombinedUrl = null;
-    let verifiedVideoStreamUrl = null;
-    let verifiedAudioStreamUrl = null;
-
-    if (combinedUrl) {
-      globalStats.candidatesProbed++;
-      const combinedProbe = await probeMediaStreamUrl(combinedUrl);
-      if (combinedProbe.ok) {
-        verifiedCombinedUrl = combinedUrl;
-      } else {
-        updateGlobalStats(null, { status: combinedProbe.status }, globalStats);
-      }
-    }
-
-    if (!verifiedCombinedUrl && videoStreamUrl && audioStreamUrl) {
-      globalStats.candidatesProbed += 2;
-      const [vProbe, aProbe] = await Promise.all([
-        probeMediaStreamUrl(videoStreamUrl),
-        probeMediaStreamUrl(audioStreamUrl),
-      ]);
-
-      if (vProbe.ok && aProbe.ok) {
-        verifiedVideoStreamUrl = videoStreamUrl;
-        verifiedAudioStreamUrl = audioStreamUrl;
-      } else {
-        if (!vProbe.ok) updateGlobalStats(null, { status: vProbe.status }, globalStats);
-        if (!aProbe.ok) updateGlobalStats(null, { status: aProbe.status }, globalStats);
-      }
-    }
-
-    if (!verifiedCombinedUrl && (!verifiedVideoStreamUrl || !verifiedAudioStreamUrl)) {
-      globalStats.noUsableStreams++;
-      pipedInstanceManager.recordFailure(instance, 'Candidate stream probe failed accessibility check');
-      return null;
-    }
-
-    globalStats.candidatesDownloadable++;
-    pipedInstanceManager.recordSuccess(instance, latencyMs);
-
-    return {
-      sourceVideoId: videoId,
-      sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      videoStreamUrl: verifiedVideoStreamUrl,
-      audioStreamUrl: verifiedAudioStreamUrl,
-      combinedUrl: verifiedCombinedUrl,
-      durationSeconds,
-      title,
-      thumbnailUrl,
+  // Combined stream from data.url
+  if (data.url && typeof data.url === 'string' && isAbsoluteHttpUrl(data.url)) {
+    candidates.push({
       provider: 'piped',
-      instanceUsed: instance,
-      latencyMs,
-    };
-  } catch (err) {
-    updateGlobalStats(err, null, globalStats);
-    pipedInstanceManager.recordFailure(instance, err.message);
-    return null;
-  } finally {
-    clearTimeout(timer);
+      instance,
+      type: 'combined',
+      url: data.url,
+      videoUrl: null,
+      audioUrl: null,
+      title,
+      durationSeconds,
+      thumbnailUrl,
+      mimeType: 'video/mp4',
+      container: 'mp4',
+      quality: 'default',
+    });
   }
-}
 
-/**
- * PIPED PROVIDER RESOLVER
- */
-async function resolvePipedProvider(videoId, globalStats) {
-  const triedInstances = new Set();
-  const batchSize = 5;
+  const videoStreams = Array.isArray(data.videoStreams) ? data.videoStreams : [];
+  const audioStreams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
 
-  for (let pass = 1; pass <= 2; pass++) {
-    const candidates = await pipedInstanceManager.discoverCandidates();
-    globalStats.pipedDiscovered = candidates.length;
-
-    const remaining = candidates.filter((c) => !triedInstances.has(c));
-    if (remaining.length === 0 && pass > 1) break;
-
-    for (let i = 0; i < remaining.length; i += batchSize) {
-      const batch = remaining.slice(i, i + batchSize);
-      batch.forEach((c) => triedInstances.add(c));
-
-      console.log(`[PipedProvider] Testing candidate batch ${Math.floor(i / batchSize) + 1} (${batch.length} instances)...`);
-      const results = await Promise.all(batch.map((inst) => fetchAndProbePipedCandidate(inst, videoId, globalStats)));
-      const successful = results.find((r) => r !== null);
-      if (successful) {
-        return successful;
-      }
+  // Combined streams from videoStreams array where videoOnly is false
+  for (const stream of videoStreams) {
+    if (stream.url && isAbsoluteHttpUrl(stream.url) && stream.videoOnly !== true) {
+      candidates.push({
+        provider: 'piped',
+        instance,
+        type: 'combined',
+        url: stream.url,
+        videoUrl: null,
+        audioUrl: null,
+        title,
+        durationSeconds,
+        thumbnailUrl,
+        mimeType: stream.mimeType || 'video/mp4',
+        container: stream.format || 'mp4',
+        quality: stream.quality || 'default',
+      });
     }
   }
 
-  return null;
+  // Separate video + audio streams
+  const bestVideo = videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('video/mp4')) ||
+    videoStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
+
+  const bestAudio = audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url) && s.mimeType?.includes('audio/')) ||
+    audioStreams.find((s) => s.url && isAbsoluteHttpUrl(s.url));
+
+  if (bestVideo?.url && bestAudio?.url) {
+    candidates.push({
+      provider: 'piped',
+      instance,
+      type: 'separate',
+      url: null,
+      videoUrl: bestVideo.url,
+      audioUrl: bestAudio.url,
+      title,
+      durationSeconds,
+      thumbnailUrl,
+      mimeType: bestVideo.mimeType || 'video/mp4',
+      container: 'mp4',
+      quality: bestVideo.quality || 'default',
+    });
+  }
+
+  return candidates;
 }
 
 /**
- * Constructs Invidious proxied media URL (using local=true or server proxy path)
+ * Construct Invidious proxied media URL
  */
 function buildInvidiousProxiedUrl(instance, rawUrl, itag = null, videoId = null) {
   if (!rawUrl) return null;
 
-  // 1. If relative URL starting with /
   if (rawUrl.startsWith('/')) {
     const connector = rawUrl.includes('?') ? '&' : '?';
     return `${instance}${rawUrl}${connector}local=true`;
   }
 
-  // 2. If itag and videoId are present, construct standard Invidious proxy URL
   if (itag && videoId) {
     return `${instance}/latest_version?id=${videoId}&itag=${itag}&local=true`;
   }
 
-  // 3. Append local=true to absolute URL if missing
   if (rawUrl.includes('local=true')) {
     return rawUrl;
   }
@@ -518,164 +440,343 @@ function buildInvidiousProxiedUrl(instance, rawUrl, itag = null, videoId = null)
 }
 
 /**
- * Single INVIDIOUS candidate fetch + probe validation
+ * NORMALIZATION LAYER - INVIDIOUS
  */
-async function fetchAndProbeInvidiousCandidate(instance, videoId, globalStats) {
-  globalStats.invidiousAttempted++;
-  const endpoint = `${instance}/api/v1/videos/${videoId}`;
-  const start = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+function normalizeInvidiousCandidates(data, instance, videoId) {
+  if (!data || typeof data !== 'object') return [];
 
-  try {
-    const res = await fetch(endpoint, {
-      headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
-      signal: controller.signal,
-    });
-    const latencyMs = Date.now() - start;
+  const title = data.title || `YouTube Video ${videoId}`;
+  const durationSeconds = Number(data.lengthSeconds) || 0;
 
-    if (!res.ok) {
-      updateGlobalStats(null, res, globalStats);
-      return null;
+  let thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  if (Array.isArray(data.videoThumbnails) && data.videoThumbnails.length > 0) {
+    const bestThumb = data.videoThumbnails.find((t) => t.url && isAbsoluteHttpUrl(t.url)) || data.videoThumbnails[0];
+    if (bestThumb?.url && isAbsoluteHttpUrl(bestThumb.url)) {
+      thumbnailUrl = bestThumb.url;
     }
-
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('json')) {
-      globalStats.invalidResponses++;
-      return null;
-    }
-
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      globalStats.invalidResponses++;
-      return null;
-    }
-
-    if (data.error || !data || (!data.formatStreams && !data.adaptiveFormats)) {
-      globalStats.invalidResponses++;
-      return null;
-    }
-
-    globalStats.candidatesResolved++;
-
-    const title = data.title || `YouTube Video ${videoId}`;
-    const durationSeconds = Number(data.lengthSeconds) || 0;
-
-    let thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-    if (Array.isArray(data.videoThumbnails) && data.videoThumbnails.length > 0) {
-      const bestThumb = data.videoThumbnails.find((t) => t.url && isAbsoluteHttpUrl(t.url)) || data.videoThumbnails[0];
-      if (bestThumb?.url && isAbsoluteHttpUrl(bestThumb.url)) {
-        thumbnailUrl = bestThumb.url;
-      }
-    }
-
-    const formatStreams = Array.isArray(data.formatStreams) ? data.formatStreams : [];
-    const adaptiveFormats = Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats : [];
-
-    // Probe combined formats first
-    for (const stream of formatStreams) {
-      if (!stream.url) continue;
-
-      // Construct proxied URL with local=true
-      const proxiedCombined = buildInvidiousProxiedUrl(instance, stream.url, stream.itag, videoId);
-      const rawCombined = isAbsoluteHttpUrl(stream.url) ? stream.url : `${instance}${stream.url}`;
-
-      // Probe proxied URL first, fallback to raw
-      globalStats.candidatesProbed++;
-      let probe = await probeMediaStreamUrl(proxiedCombined);
-      let targetUrl = proxiedCombined;
-
-      if (!probe.ok && rawCombined !== proxiedCombined) {
-        probe = await probeMediaStreamUrl(rawCombined);
-        targetUrl = rawCombined;
-      }
-
-      if (probe.ok) {
-        globalStats.candidatesDownloadable++;
-        return {
-          sourceVideoId: videoId,
-          sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
-          videoStreamUrl: null,
-          audioStreamUrl: null,
-          combinedUrl: targetUrl,
-          durationSeconds,
-          title,
-          thumbnailUrl,
-          provider: 'invidious',
-          instanceUsed: instance,
-          latencyMs,
-        };
-      } else {
-        updateGlobalStats(null, { status: probe.status }, globalStats);
-      }
-    }
-
-    // Probe adaptive formats (separate video & audio)
-    const bestVideo = adaptiveFormats.find((s) => s.url && (s.type?.includes('video/mp4') || s.mimeType?.includes('video/mp4'))) ||
-      adaptiveFormats.find((s) => s.url && (s.type?.includes('video/') || s.mimeType?.includes('video/')));
-
-    const bestAudio = adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/mp4') || s.type?.includes('audio/m4a') || s.mimeType?.includes('audio/mp4'))) ||
-      adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/') || s.mimeType?.includes('audio/')));
-
-    if (bestVideo?.url && bestAudio?.url) {
-      const proxiedVideo = buildInvidiousProxiedUrl(instance, bestVideo.url, bestVideo.itag, videoId);
-      const proxiedAudio = buildInvidiousProxiedUrl(instance, bestAudio.url, bestAudio.itag, videoId);
-
-      globalStats.candidatesProbed += 2;
-      const [vProbe, aProbe] = await Promise.all([
-        probeMediaStreamUrl(proxiedVideo),
-        probeMediaStreamUrl(proxiedAudio),
-      ]);
-
-      if (vProbe.ok && aProbe.ok) {
-        globalStats.candidatesDownloadable++;
-        return {
-          sourceVideoId: videoId,
-          sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
-          videoStreamUrl: proxiedVideo,
-          audioStreamUrl: proxiedAudio,
-          combinedUrl: null,
-          durationSeconds,
-          title,
-          thumbnailUrl,
-          provider: 'invidious',
-          instanceUsed: instance,
-          latencyMs,
-        };
-      } else {
-        if (!vProbe.ok) updateGlobalStats(null, { status: vProbe.status }, globalStats);
-        if (!aProbe.ok) updateGlobalStats(null, { status: aProbe.status }, globalStats);
-      }
-    }
-
-    globalStats.noUsableStreams++;
-    return null;
-  } catch (err) {
-    updateGlobalStats(err, null, globalStats);
-    return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  const formatStreams = Array.isArray(data.formatStreams) ? data.formatStreams : [];
+  const adaptiveFormats = Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats : [];
+
+  const candidates = [];
+
+  // Combined streams from formatStreams
+  for (const stream of formatStreams) {
+    if (!stream.url) continue;
+
+    const proxiedUrl = buildInvidiousProxiedUrl(instance, stream.url, stream.itag, videoId);
+    const rawUrl = isAbsoluteHttpUrl(stream.url) ? stream.url : `${instance}${stream.url}`;
+
+    // Add proxied candidate first (higher reliability on cloud runners)
+    if (proxiedUrl && isAbsoluteHttpUrl(proxiedUrl)) {
+      candidates.push({
+        provider: 'invidious',
+        instance,
+        type: 'combined',
+        url: proxiedUrl,
+        videoUrl: null,
+        audioUrl: null,
+        title,
+        durationSeconds,
+        thumbnailUrl,
+        mimeType: 'video/mp4',
+        container: stream.container || 'mp4',
+        quality: stream.quality || 'default',
+      });
+    }
+
+    if (rawUrl && isAbsoluteHttpUrl(rawUrl) && rawUrl !== proxiedUrl) {
+      candidates.push({
+        provider: 'invidious',
+        instance,
+        type: 'combined',
+        url: rawUrl,
+        videoUrl: null,
+        audioUrl: null,
+        title,
+        durationSeconds,
+        thumbnailUrl,
+        mimeType: 'video/mp4',
+        container: stream.container || 'mp4',
+        quality: stream.quality || 'default',
+      });
+    }
+  }
+
+  // Separate video + audio streams from adaptiveFormats
+  const bestVideo = adaptiveFormats.find((s) => s.url && (s.type?.includes('video/mp4') || s.mimeType?.includes('video/mp4'))) ||
+    adaptiveFormats.find((s) => s.url && (s.type?.includes('video/') || s.mimeType?.includes('video/')));
+
+  const bestAudio = adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/mp4') || s.type?.includes('audio/m4a') || s.mimeType?.includes('audio/mp4'))) ||
+    adaptiveFormats.find((s) => s.url && (s.type?.includes('audio/') || s.mimeType?.includes('audio/')));
+
+  if (bestVideo?.url && bestAudio?.url) {
+    const proxiedVideo = buildInvidiousProxiedUrl(instance, bestVideo.url, bestVideo.itag, videoId);
+    const proxiedAudio = buildInvidiousProxiedUrl(instance, bestAudio.url, bestAudio.itag, videoId);
+
+    if (proxiedVideo && proxiedAudio && isAbsoluteHttpUrl(proxiedVideo) && isAbsoluteHttpUrl(proxiedAudio)) {
+      candidates.push({
+        provider: 'invidious',
+        instance,
+        type: 'separate',
+        url: null,
+        videoUrl: proxiedVideo,
+        audioUrl: proxiedAudio,
+        title,
+        durationSeconds,
+        thumbnailUrl,
+        mimeType: 'video/mp4',
+        container: 'mp4',
+        quality: bestVideo.qualityLabel || 'default',
+      });
+    }
+  }
+
+  return candidates;
 }
 
 /**
- * INVIDIOUS PROVIDER RESOLVER
+ * CANDIDATE PROBING & SELECTION LAYER
  */
-async function resolveInvidiousProvider(videoId, globalStats) {
+async function probeAndSelectCandidate(candidates, instance, stats) {
+  if (!candidates || candidates.length === 0) return null;
+
+  stats.candidatesResolved += candidates.length;
+
+  for (const candidate of candidates) {
+    if (candidate.type === 'combined') {
+      stats.candidatesProbed++;
+      const probe = await probeMediaStreamUrl(candidate.url);
+      if (probe.ok) {
+        stats.candidatesDownloadable++;
+        return candidate;
+      }
+      updateStatsFromStatus(probe.status, stats);
+    } else if (candidate.type === 'separate') {
+      stats.candidatesProbed += 2;
+      const [vProbe, aProbe] = await Promise.all([
+        probeMediaStreamUrl(candidate.videoUrl),
+        probeMediaStreamUrl(candidate.audioUrl),
+      ]);
+
+      if (vProbe.ok && aProbe.ok) {
+        stats.candidatesDownloadable++;
+        return candidate;
+      }
+
+      if (!vProbe.ok) updateStatsFromStatus(vProbe.status, stats);
+      if (!aProbe.ok) updateStatsFromStatus(aProbe.status, stats);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * PIPED PROVIDER ENGINE
+ */
+async function tryPipedProvider(videoId, stats) {
+  const triedInstances = new Set();
+  const batchSize = 10;
+
+  for (let pass = 1; pass <= 2; pass++) {
+    const candidates = await pipedInstanceManager.discoverCandidates();
+    stats.pipedDiscovered = candidates.length;
+
+    const remaining = candidates.filter((c) => !triedInstances.has(c));
+    if (remaining.length === 0 && pass > 1) break;
+
+    for (let i = 0; i < remaining.length; i += batchSize) {
+      const batch = remaining.slice(i, i + batchSize);
+      batch.forEach((c) => triedInstances.add(c));
+
+      console.log(`[PipedProvider] Testing candidate batch ${Math.floor(i / batchSize) + 1} (${batch.length} instances)...`);
+
+      const settled = await Promise.allSettled(
+        batch.map(async (instance) => {
+          stats.pipedAttempted++;
+          const endpoint = `${instance}/streams/${videoId}`;
+          const start = Date.now();
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 5000);
+
+          try {
+            const res = await fetch(endpoint, {
+              headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
+              signal: controller.signal,
+            });
+            const latencyMs = Date.now() - start;
+
+            if (!res.ok) {
+              updateStatsFromStatus(res.status, stats);
+              pipedInstanceManager.recordFailure(instance, `HTTP ${res.status}`);
+              return null;
+            }
+
+            const contentType = (res.headers.get('content-type') || '').toLowerCase();
+            if (!contentType.includes('json')) {
+              stats.invalidResponses++;
+              pipedInstanceManager.recordFailure(instance, `Non-JSON payload (${contentType})`);
+              return null;
+            }
+
+            const text = await res.text();
+            let data;
+            try {
+              data = JSON.parse(text);
+            } catch {
+              stats.invalidResponses++;
+              pipedInstanceManager.recordFailure(instance, 'Invalid JSON body');
+              return null;
+            }
+
+            // Differentiate explicit Piped API errors from invalid syntax
+            if ((data.error || data.message) && !data.videoStreams && !data.url) {
+              stats.providerApiErrors++;
+              pipedInstanceManager.recordFailure(instance, `API Error: ${data.error || data.message}`);
+              return null;
+            }
+
+            const normalizedCandidates = normalizePipedCandidates(data, instance);
+            if (normalizedCandidates.length === 0) {
+              stats.noUsableStreams++;
+              pipedInstanceManager.recordFailure(instance, 'No stream candidates found in JSON');
+              return null;
+            }
+
+            const selected = await probeAndSelectCandidate(normalizedCandidates, instance, stats);
+            if (selected) {
+              pipedInstanceManager.recordSuccess(instance, latencyMs);
+              return { selected, latencyMs };
+            }
+
+            pipedInstanceManager.recordFailure(instance, 'Probing failed for candidate streams');
+            return null;
+          } catch (err) {
+            updateStatsFromError(err, stats);
+            pipedInstanceManager.recordFailure(instance, err.message);
+            return null;
+          } finally {
+            clearTimeout(timer);
+          }
+        })
+      );
+
+      for (const item of settled) {
+        if (item.status === 'fulfilled' && item.value?.selected) {
+          const { selected, latencyMs } = item.value;
+          return {
+            sourceVideoId: videoId,
+            sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
+            videoStreamUrl: selected.videoUrl,
+            audioStreamUrl: selected.audioUrl,
+            combinedUrl: selected.url,
+            durationSeconds: selected.durationSeconds,
+            title: selected.title,
+            thumbnailUrl: selected.thumbnailUrl,
+            provider: 'piped',
+            instanceUsed: selected.instance,
+            latencyMs,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * INVIDIOUS PROVIDER ENGINE
+ */
+async function tryInvidiousProvider(videoId, stats) {
   const candidates = await discoverInvidiousCandidates();
-  globalStats.invidiousDiscovered = candidates.length;
-  const batchSize = 5;
+  stats.invidiousDiscovered = candidates.length;
+  const batchSize = 10;
 
   for (let i = 0; i < candidates.length; i += batchSize) {
     const batch = candidates.slice(i, i + batchSize);
     console.log(`[InvidiousProvider] Testing candidate batch ${Math.floor(i / batchSize) + 1} (${batch.length} instances)...`);
-    const results = await Promise.all(batch.map((inst) => fetchAndProbeInvidiousCandidate(inst, videoId, globalStats)));
-    const successful = results.find((r) => r !== null);
-    if (successful) {
-      return successful;
+
+    const settled = await Promise.allSettled(
+      batch.map(async (instance) => {
+        stats.invidiousAttempted++;
+        const endpoint = `${instance}/api/v1/videos/${videoId}`;
+        const start = Date.now();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+
+        try {
+          const res = await fetch(endpoint, {
+            headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
+            signal: controller.signal,
+          });
+          const latencyMs = Date.now() - start;
+
+          if (!res.ok) {
+            updateStatsFromStatus(res.status, stats);
+            return null;
+          }
+
+          const contentType = (res.headers.get('content-type') || '').toLowerCase();
+          if (!contentType.includes('json')) {
+            stats.invalidResponses++;
+            return null;
+          }
+
+          const text = await res.text();
+          let data;
+          try {
+            data = JSON.parse(text);
+          } catch {
+            stats.invalidResponses++;
+            return null;
+          }
+
+          if (data.error) {
+            stats.providerApiErrors++;
+            return null;
+          }
+
+          const normalizedCandidates = normalizeInvidiousCandidates(data, instance, videoId);
+          if (normalizedCandidates.length === 0) {
+            stats.noUsableStreams++;
+            return null;
+          }
+
+          const selected = await probeAndSelectCandidate(normalizedCandidates, instance, stats);
+          if (selected) {
+            return { selected, latencyMs };
+          }
+
+          return null;
+        } catch (err) {
+          updateStatsFromError(err, stats);
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      })
+    );
+
+    for (const item of settled) {
+      if (item.status === 'fulfilled' && item.value?.selected) {
+        const { selected, latencyMs } = item.value;
+        return {
+          sourceVideoId: videoId,
+          sourceUrl: `https://www.youtube.com/watch?v=${videoId}`,
+          videoStreamUrl: selected.videoUrl,
+          audioStreamUrl: selected.audioUrl,
+          combinedUrl: selected.url,
+          durationSeconds: selected.durationSeconds,
+          title: selected.title,
+          thumbnailUrl: selected.thumbnailUrl,
+          provider: 'invidious',
+          instanceUsed: selected.instance,
+          latencyMs,
+        };
+      }
     }
   }
 
@@ -685,10 +786,10 @@ async function resolveInvidiousProvider(videoId, globalStats) {
 export async function resolveStream(youtubeUrlOrId) {
   const videoId = extractYouTubeVideoId(youtubeUrlOrId);
   if (!videoId || videoId.length !== 11) {
-    throw new Error(`[PIPED_INVALID_RESPONSE] Invalid YouTube video ID extracted from "${youtubeUrlOrId}"`);
+    throw new Error(`[STREAM_RESOLUTION_FAILED] Invalid YouTube video ID extracted from "${youtubeUrlOrId}"`);
   }
 
-  const globalStats = {
+  const stats = {
     videoId,
     pipedDiscovered: 0,
     pipedAttempted: 0,
@@ -699,6 +800,9 @@ export async function resolveStream(youtubeUrlOrId) {
     candidatesResolved: 0,
     candidatesProbed: 0,
     candidatesDownloadable: 0,
+    providerApiErrors: 0,
+    invalidResponses: 0,
+    noUsableStreams: 0,
     timeouts: 0,
     http401: 0,
     http403: 0,
@@ -707,16 +811,14 @@ export async function resolveStream(youtubeUrlOrId) {
     http5xx: 0,
     dnsFailures: 0,
     tlsFailures: 0,
-    invalidResponses: 0,
-    noUsableStreams: 0,
   };
 
   // STEP 1: PIPED PROVIDER
-  console.log(`[MultiProviderResolver] Attempting Piped provider with Range stream probing for video ID: ${videoId}...`);
+  console.log(`[MultiProviderResolver] Attempting Piped provider for video ID: ${videoId}...`);
   try {
-    const pipedResult = await resolvePipedProvider(videoId, globalStats);
+    const pipedResult = await tryPipedProvider(videoId, stats);
     if (pipedResult) {
-      globalStats.pipedSuccess = 1;
+      stats.pipedSuccess = 1;
       console.log(`[MultiProviderResolver] SUCCESS via PIPED instance: ${pipedResult.instanceUsed} (${pipedResult.latencyMs}ms)`);
       return pipedResult;
     }
@@ -725,11 +827,11 @@ export async function resolveStream(youtubeUrlOrId) {
   }
 
   // STEP 2: INVIDIOUS PROVIDER
-  console.log(`[MultiProviderResolver] Falling back to Invidious provider with Range stream probing for video ID: ${videoId}...`);
+  console.log(`[MultiProviderResolver] Falling back to Invidious provider for video ID: ${videoId}...`);
   try {
-    const invidiousResult = await resolveInvidiousProvider(videoId, globalStats);
+    const invidiousResult = await tryInvidiousProvider(videoId, stats);
     if (invidiousResult) {
-      globalStats.invidiousSuccess = 1;
+      stats.invidiousSuccess = 1;
       console.log(`[MultiProviderResolver] SUCCESS via INVIDIOUS instance: ${invidiousResult.instanceUsed} (${invidiousResult.latencyMs}ms)`);
       return invidiousResult;
     }
@@ -739,12 +841,15 @@ export async function resolveStream(youtubeUrlOrId) {
 
   // STEP 3: FINAL DIAGNOSTIC ERROR
   const diagnosticMsg =
-    `[PIPED_STREAM_RESOLUTION_FAILED] Neither Piped nor Invidious providers could resolve a downloadable stream for YouTube video ${videoId}.\n` +
-    `Diagnostics: videoId=${globalStats.videoId}, pipedDiscovered=${globalStats.pipedDiscovered}, pipedAttempted=${globalStats.pipedAttempted}, pipedSuccess=${globalStats.pipedSuccess}, ` +
-    `invidiousDiscovered=${globalStats.invidiousDiscovered}, invidiousAttempted=${globalStats.invidiousAttempted}, invidiousSuccess=${globalStats.invidiousSuccess}, ` +
-    `candidatesResolved=${globalStats.candidatesResolved}, candidatesProbed=${globalStats.candidatesProbed}, candidatesDownloadable=${globalStats.candidatesDownloadable}, ` +
-    `timeouts=${globalStats.timeouts}, http401=${globalStats.http401}, http403=${globalStats.http403}, http404=${globalStats.http404}, http429=${globalStats.http429}, http5xx=${globalStats.http5xx}, ` +
-    `dnsFailures=${globalStats.dnsFailures}, tlsFailures=${globalStats.tlsFailures}, invalidResponses=${globalStats.invalidResponses}, noUsableStreams=${globalStats.noUsableStreams}.`;
+    `[STREAM_RESOLUTION_FAILED] Neither Piped nor Invidious providers could resolve a downloadable stream for YouTube video ${videoId}.\n` +
+    `Diagnostics:\n` +
+    `  videoId=${stats.videoId}\n` +
+    `  pipedDiscovered=${stats.pipedDiscovered}, pipedAttempted=${stats.pipedAttempted}, pipedSuccess=${stats.pipedSuccess}\n` +
+    `  invidiousDiscovered=${stats.invidiousDiscovered}, invidiousAttempted=${stats.invidiousAttempted}, invidiousSuccess=${stats.invidiousSuccess}\n` +
+    `  candidatesResolved=${stats.candidatesResolved}, candidatesProbed=${stats.candidatesProbed}, candidatesDownloadable=${stats.candidatesDownloadable}\n` +
+    `  providerApiErrors=${stats.providerApiErrors}, invalidResponses=${stats.invalidResponses}, noUsableStreams=${stats.noUsableStreams}\n` +
+    `  timeouts=${stats.timeouts}, http401=${stats.http401}, http403=${stats.http403}, http404=${stats.http404}, http429=${stats.http429}, http5xx=${stats.http5xx}\n` +
+    `  dnsFailures=${stats.dnsFailures}, tlsFailures=${stats.tlsFailures}`;
 
   console.error(diagnosticMsg);
   throw new Error(diagnosticMsg);

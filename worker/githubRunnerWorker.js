@@ -231,7 +231,7 @@ async function run() {
     try {
       streamInfo = await resolveStream(youtubeUrl);
     } catch (resolveErr) {
-      console.error('[PIPED_STREAM_RESOLUTION_FAILED] Stream resolution failed:', resolveErr.message);
+      console.error('[STREAM_RESOLUTION_FAILED] Stream resolution failed:', resolveErr.message);
       throw resolveErr;
     }
 
@@ -455,9 +455,8 @@ async function run() {
   } catch (err) {
     console.error('[GitHubRunnerWorker] Job failed:', err);
     try {
-      const errorCode = err.message.includes('PIPED_STREAM_RESOLUTION_FAILED')
-        ? 'PIPED_STREAM_RESOLUTION_FAILED'
-        : 'WORKER_EXECUTION_FAILED';
+      const isStreamError = err.message.includes('STREAM_RESOLUTION_FAILED') || err.message.includes('PIPED_STREAM_RESOLUTION_FAILED');
+      const errorCode = isStreamError ? 'STREAM_RESOLUTION_FAILED' : 'WORKER_EXECUTION_FAILED';
       await updateStatus('failed', 100, 'failed', err.message, errorCode);
     } catch (statusErr) {
       console.error('[FIRESTORE_UPDATE_FAILED] Failed to record final failure status to Firestore:', statusErr.message);
