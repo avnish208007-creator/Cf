@@ -1,13 +1,14 @@
 /**
  * GitHub Actions Runner Worker for ClipFlow V1 (Plain JavaScript)
  * Runs inside GitHub Actions runner:
- * 1. Resolves stream via automatic Piped discovery & failover immediately before downloading.
- * 2. Streams media directly to disk (no buffer in memory), combining separate audio/video if necessary via FFmpeg muxing.
- * 3. Verifies using FFprobe that media contains valid video AND audio streams.
- * 4. Transcribes audio with local CPU Whisper.
- * 5. Detects candidate moments from transcript timestamps.
- * 6. Renders 9:16 vertical shorts with FFmpeg and verifies rendered clips contain valid video/audio.
- * 7. Uploads to Firebase Storage & Firestore with strict error handling.
+ * 1. Validates required Firebase configuration (including named Firestore database).
+ * 2. Resolves stream via automatic Piped discovery & failover immediately before downloading.
+ * 3. Streams media directly to disk, combining separate audio/video if necessary via FFmpeg muxing.
+ * 4. Verifies using FFprobe that media contains valid video AND audio streams.
+ * 5. Transcribes audio with local CPU Whisper.
+ * 6. Detects candidate moments from transcript timestamps.
+ * 7. Renders 9:16 vertical shorts with FFmpeg and verifies rendered clips contain valid video/audio.
+ * 8. Uploads to Firebase Storage & Firestore with strict error handling and merge upserts.
  */
 import fs from 'fs';
 import path from 'path';
@@ -15,8 +16,25 @@ import { pipeline } from 'node:stream/promises';
 import { execSync, execFileSync } from 'child_process';
 import fetch from 'node-fetch';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, updateDoc, collection, addDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, collection, addDoc } from 'firebase/firestore';
 import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+
+// 1. STARTUP CONFIGURATION VALIDATION
+const requiredEnvVars = [
+  'FIREBASE_API_KEY',
+  'FIREBASE_AUTH_DOMAIN',
+  'FIREBASE_PROJECT_ID',
+  'FIREBASE_STORAGE_BUCKET',
+  'FIREBASE_MESSAGING_SENDER_ID',
+  'FIREBASE_APP_ID',
+  'FIREBASE_DATABASE_ID',
+];
+
+const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
+if (missingEnvVars.length > 0) {
+  console.error(`[GitHubRunnerWorker] FATAL CONFIGURATION ERROR: Missing required environment variable(s): ${missingEnvVars.join(', ')}`);
+  process.exit(1);
+}
 
 const firebaseConfig = {
   apiKey: process.env.FIREBASE_API_KEY,
@@ -27,8 +45,9 @@ const firebaseConfig = {
   appId: process.env.FIREBASE_APP_ID,
 };
 
+const databaseId = process.env.FIREBASE_DATABASE_ID;
 const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+const db = getFirestore(app, databaseId);
 const storage = getStorage(app);
 
 const jobId = process.env.JOB_ID;
@@ -188,21 +207,29 @@ async function resolveStream(urlOrId) {
 }
 
 async function updateStatus(stage, progress, status = 'processing', error = null, errorCode = null) {
-  if (!jobId) return;
+  if (!jobId) {
+    throw new Error('[CONFIGURATION_ERROR] Cannot update status: JOB_ID environment variable is missing.');
+  }
+
+  const jobRef = doc(db, 'workspaces', workspaceId, 'jobs', jobId);
+  const statusData = {
+    id: jobId,
+    workspaceId,
+    status,
+    stage,
+    progress,
+    error: error || null,
+    errorCode: errorCode || null,
+    updatedAt: new Date().toISOString(),
+    ...(status === 'completed' || status === 'failed' ? { completedAt: new Date().toISOString() } : {}),
+  };
+
   try {
-    const jobRef = doc(db, 'workspaces', workspaceId, 'jobs', jobId);
-    await updateDoc(jobRef, {
-      stage,
-      progress,
-      status,
-      error,
-      errorCode,
-      updatedAt: new Date().toISOString(),
-      ...(status === 'completed' || status === 'failed' ? { completedAt: new Date().toISOString() } : {}),
-    });
-    console.log(`[GitHubRunnerWorker] Firestore job status -> Stage: ${stage}, Progress: ${progress}%, Status: ${status}`);
+    await setDoc(jobRef, statusData, { merge: true });
+    console.log(`[GitHubRunnerWorker] Firestore job status updated -> Stage: ${stage}, Progress: ${progress}%, Status: ${status}`);
   } catch (err) {
-    console.error('[GitHubRunnerWorker] Failed to update Firestore job status:', err);
+    console.error(`[GitHubRunnerWorker] FATAL: Failed to update Firestore job status for job ${jobId} (Stage: ${stage}, Code: ${err.code || 'UNKNOWN'}):`, err.message);
+    throw err;
   }
 }
 
@@ -468,7 +495,7 @@ async function run() {
         throw new Error(`[RENDER_FAILED] Rendered clip ${i + 1} fails stream check (video: ${clipMediaCheck.hasVideo}, audio: ${clipMediaCheck.hasAudio}).`);
       }
 
-      // Thumbnail generation
+      // Thumbnail generation from actual clip
       const thumbCmd = [
         'ffmpeg', '-y',
         '-ss', '2',
@@ -478,9 +505,11 @@ async function run() {
       ];
       try {
         execFileSync(thumbCmd[0], thumbCmd.slice(1), { stdio: 'ignore' });
-      } catch {}
+      } catch (thumbGenErr) {
+        console.warn(`[GitHubRunnerWorker] Thumbnail extraction warning for clip ${i + 1}:`, thumbGenErr.message);
+      }
 
-      // Upload to Firebase Storage
+      // Upload clip to Firebase Storage
       await updateStatus('uploading', 90, 'processing');
       console.log(`[GitHubRunnerWorker] Uploading clip ${i + 1} to Firebase Storage...`);
 
@@ -489,17 +518,19 @@ async function run() {
       await uploadBytes(clipStorageRef, clipBuffer, { contentType: 'video/mp4' });
       const videoDownloadUrl = await getDownloadURL(clipStorageRef);
 
-      let thumbDownloadUrl = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&auto=format&fit=crop&q=60';
+      let thumbDownloadUrl = null;
       if (fs.existsSync(thumbOutputPath)) {
         try {
           const thumbBuffer = fs.readFileSync(thumbOutputPath);
           const thumbStorageRef = ref(storage, `workspaces/${workspaceId}/thumbnails/${jobId}_${cand.id}.jpg`);
           await uploadBytes(thumbStorageRef, thumbBuffer, { contentType: 'image/jpeg' });
           thumbDownloadUrl = await getDownloadURL(thumbStorageRef);
-        } catch {}
+        } catch (thumbUploadErr) {
+          console.warn(`[GitHubRunnerWorker] Thumbnail upload warning for clip ${i + 1}:`, thumbUploadErr.message);
+        }
       }
 
-      // Save metadata to Firestore
+      // Save clip metadata to Firestore
       await addDoc(clipsColRef, {
         sourceVideoId: sourceVideoId || 'source',
         jobId,
@@ -523,7 +554,11 @@ async function run() {
     console.log(`[GitHubRunnerWorker] Job ${jobId} successfully completed with ${generatedClips.length} verified clips.`);
   } catch (err) {
     console.error('[GitHubRunnerWorker] Job failed:', err);
-    await updateStatus('failed', 100, 'failed', err.message, 'WORKER_EXECUTION_FAILED');
+    try {
+      await updateStatus('failed', 100, 'failed', err.message, 'WORKER_EXECUTION_FAILED');
+    } catch (statusErr) {
+      console.error('[GitHubRunnerWorker] Failed to record final failure status to Firestore:', statusErr.message);
+    }
     process.exit(1);
   } finally {
     try {
